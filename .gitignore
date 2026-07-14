@@ -1,0 +1,33 @@
+# Runtime secrets / local environment
+.env
+.env.*
+live_api_secret.json
+live_api_secret.tmp
+*.key
+*.pem
+
+# Local databases and generated runtime state
+*.sqlite3
+*.db
+positive_ev_journal.csv
+
+# Python cache / virtualenv
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Logs and temp files
+*.log
+*.tmp
+tmp/
+logs/
+reports/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
