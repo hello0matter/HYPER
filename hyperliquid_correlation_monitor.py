@@ -1,33 +1,34 @@
 #!/usr/bin/env python3
-"""Hyperliquid 价差、相关性与时延监控（只读，不包含下单逻辑）。"""
+"""Hyperliquid 行情研究、模拟交易与可选真实双腿策略服务。"""
 
 import argparse
-import json
-import math
-import statistics
-import threading
-import time
-import csv
-import concurrent.futures
-import itertools
-import os
-import re
-import sqlite3
-import subprocess
-import hmac
 import base64
+import concurrent.futures
+import csv
 import getpass
 import hashlib
+import hmac
+import itertools
+import json
+import math
+import os
+import re
 import secrets
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-import websocket
+import sqlite3
+import statistics
+import subprocess
+import threading
+import time
 from collections import deque
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import URLError, HTTPError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
+
+import websocket
 
 try:
     import tkinter as tk
@@ -1363,24 +1364,36 @@ def live_expected_edge_bps(row, config):
     return gross - estimated_cost
 
 
-def live_candidate_reject_reason(row, config):
+def live_candidate_reject_reasons(row, config):
+    """Return every basic signal filter that blocks a real entry.
+
+    This deliberately excludes account/order-book state.  Keeping the pure
+    signal checks here makes the trading loop, API diagnostics and UI use the
+    exact same rules instead of each reimplementing a slightly different set.
+    """
     z = abs(float(row.get("zscore") or 0))
     corr = float(row.get("corr") or 0)
-    spread = float(row.get("spread_bps") or 999)
+    spread = float(row.get("spread_bps")) if row.get("spread_bps") is not None else 999.0
     min_z = float(config.get("live_min_entry_z", 3.0) or 3.0)
     min_corr = float(config.get("live_min_corr", 0.75) or 0.75)
     max_spread = float(config.get("live_max_entry_spread_bps", 2.5) or 2.5)
     min_edge = float(config.get("live_min_expected_edge_bps", 25.0) or 25.0)
     edge = live_expected_edge_bps(row, config)
+    reasons = []
     if z < min_z:
-        return f"|Z| {z:.2f} < 实盘最低 {min_z:.2f}"
+        reasons.append(("z", f"|Z| {z:.2f} < 实盘最低 {min_z:.2f}"))
     if corr < min_corr:
-        return f"相关 {corr:.3f} < 实盘最低 {min_corr:.3f}"
+        reasons.append(("corr", f"相关 {corr:.3f} < 实盘最低 {min_corr:.3f}"))
     if spread > max_spread:
-        return f"点差 {spread:.2f}bps > 实盘最高 {max_spread:.2f}bps"
+        reasons.append(("spread", f"点差 {spread:.2f}bps > 实盘最高 {max_spread:.2f}bps"))
     if edge < min_edge:
-        return f"预期边际 {edge:.1f}bps < 实盘最低 {min_edge:.1f}bps"
-    return ""
+        reasons.append(("edge", f"预期边际 {edge:.1f}bps < 实盘最低 {min_edge:.1f}bps"))
+    return reasons
+
+
+def live_candidate_reject_reason(row, config):
+    reasons = live_candidate_reject_reasons(row, config)
+    return reasons[0][1] if reasons else ""
 
 
 def realtime_row_from_l2book(row, l2book):
@@ -1403,7 +1416,7 @@ def realtime_row_from_l2book(row, l2book):
         residual = (asset_ret - float(rt.get("mean_asset_return") or 0)) - beta * (hedge_ret - float(rt.get("mean_hedge_return") or 0))
         z = (residual - float(rt.get("residual_mean") or 0)) / sigma
         out = dict(row)
-        out["kline_zscore"] = row.get("zscore")
+        out["kline_zscore"] = row.get("kline_zscore", row.get("zscore"))
         out["zscore"] = z
         out["realtime_zscore"] = z
         out["realtime"] = True
@@ -1419,6 +1432,99 @@ def realtime_row_from_l2book(row, l2book):
 
 def realtime_rows_from_l2book(rows, l2book):
     return [realtime_row_from_l2book(row, l2book) for row in rows]
+
+
+def prepare_live_rows(rows, config, l2book=None):
+    """Build the rows used by real trading and by its diagnostics.
+
+    The scan's candidate/watch tag is based on the last completed 5-minute
+    candle.  When WS Z is enabled the Z value can change every tick, so the
+    real direction must be recalculated from the current Z instead of reusing
+    that old candle tag/action.
+    """
+    prepared = realtime_rows_from_l2book(rows, l2book) if config.get("live_use_realtime_z", True) and l2book else [dict(row) for row in rows]
+    min_z = float(config.get("live_min_entry_z", 3.0) or 3.0)
+    result = []
+    for source in prepared:
+        row = dict(source)
+        z = float(row.get("zscore") or 0)
+        row["scan_tag"] = row.get("tag")
+        row["scan_action"] = row.get("action")
+        if z > 0:
+            row["action"] = "short_asset_long_hedge"
+            row["plan"] = f"实盘方向：做空 {row.get('asset')}；做多约 {abs(float(row.get('beta') or 0)):.2f} 倍 {row.get('leader')}"
+        elif z < 0:
+            row["action"] = "long_asset_short_hedge"
+            row["plan"] = f"实盘方向：做多 {row.get('asset')}；做空约 {abs(float(row.get('beta') or 0)):.2f} 倍 {row.get('leader')}"
+        else:
+            row["action"] = "watch"
+            row["plan"] = "实时偏离接近 0，只观察"
+        reasons = live_candidate_reject_reasons(row, config)
+        row["live_status"] = "pass" if not reasons else "blocked"
+        row["live_reject_reason"] = reasons[0][1] if reasons else "基础过滤通过，等待实时盘口与账户校验"
+        row["live_reject_all"] = [text for _key, text in reasons]
+        row["live_expected_edge_bps"] = live_expected_edge_bps(row, config)
+        row["live_min_z_met"] = abs(z) >= min_z
+        result.append(row)
+    return result
+
+
+def live_opportunity_diagnostics(state, rows, account=None, open_trades=None, limit=20):
+    """Explain, in machine- and human-readable form, why no real order opened."""
+    config = state.config
+    prepared = prepare_live_rows(rows, config, state.l2book)
+    counts = {"pass": 0, "z": 0, "corr": 0, "spread": 0, "edge": 0, "l2": 0}
+    opportunities = []
+    for row in prepared:
+        reasons = live_candidate_reject_reasons(row, config)
+        reason_key = reasons[0][0] if reasons else "pass"
+        reason_text = reasons[0][1] if reasons else "基础过滤通过"
+        l2_reason = ""
+        if not reasons and config.get("live_use_l2book", True):
+            try:
+                available = float((account or {}).get("spot_available_usdc") or (account or {}).get("account_value") or 0)
+                asset_notional, hedge_notional = _live_sized_notionals(
+                    row, config.get("live_notional_usdc", 10.0), available,
+                    auto_min_notional=bool(config.get("live_auto_min_notional", False)),
+                )
+                l2_reason, _books = live_l2book_reject_reason(state, row, asset_notional, hedge_notional)
+            except (ValueError, RuntimeError, TypeError) as exc:
+                l2_reason = str(exc)
+            if l2_reason:
+                reason_key, reason_text = "l2", l2_reason
+        counts[reason_key] = counts.get(reason_key, 0) + 1
+        opportunities.append({
+            "asset": row.get("asset"), "leader": row.get("leader"),
+            "zscore": row.get("zscore"), "kline_zscore": row.get("kline_zscore", row.get("zscore")),
+            "corr": row.get("corr"), "beta": row.get("beta"), "spread_bps": row.get("spread_bps"),
+            "expected_edge_bps": live_expected_edge_bps(row, config), "action": row.get("action"),
+            "status": "pass" if reason_key == "pass" else "blocked", "reason_key": reason_key,
+            "reason": "可以进入下单阶段" if reason_key == "pass" else reason_text,
+        })
+    opportunities.sort(key=lambda row: (0 if row["status"] == "pass" else 1, -abs(float(row.get("zscore") or 0))))
+
+    open_trades = list(open_trades or [])
+    global_reasons = []
+    public = live_config_public(config)
+    if not config.get("live_enabled"):
+        global_reasons.append("真实下单总开关已关闭")
+    if not config.get("live_strategy_enabled"):
+        global_reasons.append("真实策略开关已关闭")
+    if not public.get("execution_ready"):
+        global_reasons.append(public.get("blocker") or "真实交易配置未就绪")
+    if len(open_trades) >= int(config.get("live_max_open", 1) or 1):
+        global_reasons.append(f"已达到最多真实仓位 {int(config.get('live_max_open', 1) or 1)} 组")
+    if not config.get("live_auto_min_notional", False) and float(config.get("live_notional_usdc") or 0) < LIVE_MIN_ORDER_USDC:
+        global_reasons.append(f"每笔小币腿低于交易所单腿最低约 {LIVE_MIN_ORDER_USDC:.0f}U")
+    positions = list((account or {}).get("positions") or [])
+    if positions and not open_trades:
+        global_reasons.append("官方账户存在程序数据库未跟踪的仓位，为避免净仓冲突暂停新开仓")
+    return {
+        "ts": time.time(), "total": len(prepared), "counts": counts,
+        "pass_count": counts.get("pass", 0), "global_reasons": global_reasons,
+        "can_open_now": not global_reasons and counts.get("pass", 0) > 0,
+        "opportunities": opportunities[:max(1, int(limit))],
+    }
 
 
 def l2book_subscription_coins(rows, open_trades=None, leaders=None, limit=80):
@@ -1700,7 +1806,7 @@ def update_live_trading(state, payload, scan_id):
         return load_live_trades_snapshot(state.db_path, current_rows=payload.get("rows", []), config=config)
     if not live_config_public(config).get("execution_ready"):
         return load_live_trades_snapshot(state.db_path, current_rows=payload.get("rows", []), config=config)
-    rows = realtime_rows_from_l2book(payload.get("rows", []), state.l2book) if config.get("live_use_realtime_z", True) else payload.get("rows", [])
+    rows = prepare_live_rows(payload.get("rows", []), config, state.l2book)
     row_by_pair = {paper_pair_key(row): row for row in rows}
     init_alt_db(state.db_path)
     with sqlite3.connect(state.db_path) as db:
@@ -1762,7 +1868,10 @@ def update_live_trading(state, payload, scan_id):
         coin = str(pos.get("coin") or "").upper()
         if coin:
             used_coins.add(coin)
-    candidates = [row for row in rows if row.get("tag") == "candidate" and row.get("action") in ("short_asset_long_hedge", "long_asset_short_hedge")]
+    # Do not reuse the scan's 5-minute candidate tag here.  WS Z is updated
+    # between candles, so every row must be evaluated with the current live
+    # thresholds and current direction or valid tick-level signals get missed.
+    candidates = [row for row in rows if row.get("action") in ("short_asset_long_hedge", "long_asset_short_hedge")]
     candidates.sort(key=lambda r: abs(float(r.get("zscore") or 0)), reverse=True)
     rejected_live = 0
     for row in candidates:
@@ -2554,6 +2663,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 .helpHead{display:flex;justify-content:space-between;align-items:center;background:#111827;color:white;padding:12px 16px}.helpHead h2{margin:0;color:white}
 .helpBody{padding:14px 18px;max-height:72vh;overflow:auto;line-height:1.65;font-size:14px}.helpBody h3{margin:16px 0 6px}.helpBody p{margin:6px 0}.helpBody code{background:#f1f5f9;padding:2px 4px;border-radius:4px}
 .pill{display:inline-block;padding:2px 6px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px}
+.passChip{color:#15803d;font-weight:600}.blockChip{color:#b45309}.reasonCell{text-align:left;white-space:normal;min-width:260px}
 @media(max-width:1000px){main{grid-template-columns:1fr}th,td{font-size:12px;padding:6px 4px}}
 </style>
 </head>
@@ -2605,7 +2715,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <span class="muted">点击行弹出完整详情；动作列可横向滚动查看</span>
 </div>
 <div class="tableWrap">
-<table id="tbl" class="mainTable"><thead><tr><th onclick="sortBy('tag')">状态</th><th onclick="sortBy('asset')">小币</th><th onclick="sortBy('leader')">保护腿</th><th onclick="sortBy('corr')">相关</th><th onclick="sortBy('beta')">Beta</th><th onclick="sortBy('zscore')">WS实时Z</th><th onclick="sortBy('kline_zscore')">K线Z</th><th onclick="sortBy('asset_15m_bps')">小币15m</th><th onclick="sortBy('hedge_15m_bps')">保护15m</th><th onclick="sortBy('spread_bps')">点差</th><th onclick="sortBy('funding_hourly')">资金费/小时</th><th>动作</th></tr></thead><tbody></tbody></table>
+<table id="tbl" class="mainTable"><thead><tr><th onclick="sortBy('tag')">K线状态</th><th>实盘判断</th><th onclick="sortBy('asset')">小币</th><th onclick="sortBy('leader')">保护腿</th><th onclick="sortBy('corr')">相关</th><th onclick="sortBy('beta')">Beta</th><th onclick="sortBy('zscore')">WS实时Z</th><th onclick="sortBy('kline_zscore')">K线Z</th><th onclick="sortBy('asset_15m_bps')">小币15m</th><th onclick="sortBy('hedge_15m_bps')">保护15m</th><th onclick="sortBy('spread_bps')">点差</th><th onclick="sortBy('funding_hourly')">资金费/小时</th><th>动作</th></tr></thead><tbody></tbody></table>
 </div>
 </section>
 </main>
@@ -2654,6 +2764,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">真实已实现</div><div id="liveRealized">-</div></div>
     <div class="metric"><div class="muted">真实平均 / 最差</div><div id="liveAvgWorst">-</div></div>
     <div class="metric"><div class="muted">l2Book WS 盘口</div><div id="liveL2Status">-</div></div>
+    <div class="metric"><div class="muted">本轮真实机会</div><div id="liveOpportunityStatus">-</div></div>
   </div>
   <p id="liveBlocker" class="scoreMid"></p>
   <div class="paperActions"><button onclick="saveLiveConfig()">保存真实交易参数</button><button onclick="loadLive()">刷新真实账户</button><span id="liveSaveStatus" class="subtle">管理口令在“全局设置”里填写</span></div>
@@ -2678,6 +2789,9 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <label>WS实时Z<select id="cfg_live_use_realtime_z"><option value="true">开启（默认）</option><option value="false">关闭</option></select></label>
     <label>真实策略开关<select id="cfg_live_strategy_enabled"><option value="false">关闭（默认）</option><option value="true">开启</option></select></label>
   </div>
+  <h3>为什么这一轮没有交易</h3>
+  <div id="liveDiagnosticSummary" class="detailText">读取服务器当前过滤结果中...</div>
+  <div class="paperTableWrap" style="max-height:360px"><table id="liveDiagnosticTbl"><thead><tr><th>结果</th><th>币对</th><th>WS Z</th><th>K线Z</th><th>相关</th><th>点差</th><th>预期边际</th><th>方向</th><th>具体原因</th></tr></thead><tbody></tbody></table></div>
   <h3>实时 l2Book 盘口</h3>
   <div class="paperActions">
     <label style="display:flex;align-items:center;gap:6px"><input id="liveAutoRefresh" type="checkbox" checked> 自动刷新盘口</label>
@@ -2897,7 +3011,8 @@ function renderTable(){
   rows.forEach(row=>{
     const tr=document.createElement('tr');
     if(selectedRow && selectedRow.asset===row.asset && selectedRow.leader===row.leader) tr.className='selectedRow';
-    tr.innerHTML=`<td class="${row.tag}">${tagText(row.tag)}</td><td>${row.asset}</td><td>${row.leader}</td><td>${fmt(row.corr,3)}</td><td>${fmt(row.beta,2)}</td><td>${row.realtime?fmt(row.zscore,2):'-'}</td><td>${fmt(row.kline_zscore??row.zscore,2)}</td><td>${fmt(row.asset_15m_bps,1)} bps</td><td>${fmt(row.hedge_15m_bps,1)} bps</td><td>${fmt(row.spread_bps,2)}</td><td>${fmt((row.funding_hourly||0)*10000,3)} bps</td><td class="actionCell">${row.plan||''}</td>`;
+    const livePass=row.live_status==='pass';
+    tr.innerHTML=`<td class="${row.tag}">${tagText(row.tag)}</td><td class="${livePass?'passChip':'blockChip'}" title="${esc(row.live_reject_reason||'')}">${livePass?'可进入盘口校验':'过滤'}</td><td>${row.asset}</td><td>${row.leader}</td><td>${fmt(row.corr,3)}</td><td>${fmt(row.beta,2)}</td><td>${row.realtime?fmt(row.zscore,2):'-'}</td><td>${fmt(row.kline_zscore??row.zscore,2)}</td><td>${fmt(row.asset_15m_bps,1)} bps</td><td>${fmt(row.hedge_15m_bps,1)} bps</td><td>${fmt(row.spread_bps,2)}</td><td>${fmt((row.funding_hourly||0)*10000,3)} bps</td><td class="actionCell">${row.plan||''}</td>`;
     tr.onclick=()=>selectRow(row,true);
     tb.appendChild(tr);
   });
@@ -3442,6 +3557,35 @@ function renderL2Book(l2){
   });
   if(!sorted.length)tb.innerHTML='<tr><td colspan="7" class="muted">等待 l2Book WebSocket 盘口数据</td></tr>';
 }
+function renderLiveDiagnostics(diag){
+  diag=diag||{};
+  const counts=diag.counts||{}, total=Number(diag.total||0), pass=Number(diag.pass_count||0);
+  const globalReasons=diag.global_reasons||[];
+  const status=document.getElementById('liveOpportunityStatus');
+  if(status){
+    status.textContent=`${pass} 个可进入下单 / 扫描 ${total} 个`;
+    status.className=pass>0&&!globalReasons.length?'scoreGood':'scoreMid';
+  }
+  const labels=[];
+  if(Number(counts.z||0))labels.push(`Z不足 ${counts.z}`);
+  if(Number(counts.corr||0))labels.push(`相关不足 ${counts.corr}`);
+  if(Number(counts.spread||0))labels.push(`点差过大 ${counts.spread}`);
+  if(Number(counts.edge||0))labels.push(`预期边际不足 ${counts.edge}`);
+  if(Number(counts.l2||0))labels.push(`实时盘口未通过 ${counts.l2}`);
+  const summary=document.getElementById('liveDiagnosticSummary');
+  if(summary){
+    const gate=globalReasons.length?`全局暂停原因：${globalReasons.join('；')}。`:'全局开关、资金与仓位状态允许检查新机会。';
+    summary.textContent=`本轮扫描 ${total} 组，最终可进入下单阶段 ${pass} 组。${labels.length?' 首要过滤统计：'+labels.join('；')+'。':''}\n${gate}\n这里按“第一个拦截原因”计数；表格列出最接近开仓的组合。没有通过时不下单是正常风控，不是程序卡死。`;
+  }
+  const tb=document.querySelector('#liveDiagnosticTbl tbody');if(!tb)return;tb.innerHTML='';
+  (diag.opportunities||[]).forEach(row=>{
+    const tr=document.createElement('tr');
+    const ok=row.status==='pass';
+    tr.innerHTML=`<td class="${ok?'passChip':'blockChip'}">${ok?'可下单':'被过滤'}</td><td>${esc(row.asset)} vs ${esc(row.leader)}</td><td>${fmt(row.zscore,2)}</td><td>${fmt(row.kline_zscore,2)}</td><td>${fmt(row.corr,3)}</td><td>${fmt(row.spread_bps,2)} bps</td><td>${fmt(row.expected_edge_bps,1)} bps</td><td>${liveActionText(row.action)}</td><td class="reasonCell">${esc(row.reason||'-')}</td>`;
+    tb.appendChild(tr);
+  });
+  if(!(diag.opportunities||[]).length)tb.innerHTML='<tr><td colspan="9" class="muted">当前还没有扫描数据</td></tr>';
+}
 async function refreshLiveL2Only(){
   if(!liveDlg.open || liveL2RefreshBusy) return;
   const auto=document.getElementById('liveAutoRefresh');
@@ -3498,6 +3642,7 @@ function renderLive(data){
   });
   if(!positions.length)tb.innerHTML='<tr><td colspan="7" class="muted">当前没有读取到真实持仓</td></tr>';
   renderL2Book(data.l2book||{});
+  renderLiveDiagnostics(data.diagnostics||{});
   drawLivePerformance(liveSnapshot);
   renderLiveTrades(liveSnapshot);
 }
@@ -4016,8 +4161,7 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                     json_response(self, {"ok": False, "error": error or "还没有采集结果"}, status=503)
             else:
                 payload = dict(latest)
-                if state.config.get("live_use_realtime_z", True):
-                    payload["rows"] = realtime_rows_from_l2book(payload.get("rows", []), state.l2book)
+                payload["rows"] = prepare_live_rows(payload.get("rows", []), state.config, state.l2book)
                 json_response(self, {"ok": True, "source": "memory", **payload})
             return
         if parsed.path == "/paper":
@@ -4054,8 +4198,7 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                 account = state.live_account
                 live_error = state.live_error
                 latest_rows = list((state.latest or {}).get("rows", []))
-            if state.config.get("live_use_realtime_z", True):
-                latest_rows = realtime_rows_from_l2book(latest_rows, state.l2book)
+            latest_rows = prepare_live_rows(latest_rows, state.config, state.l2book)
             if (query.get("fresh") or [""])[0] in ("1", "true", "yes") and valid_evm_address(state.config.get("live_account_address")):
                 try:
                     account = fetch_live_account_snapshot(state.config["live_account_address"])
@@ -4073,12 +4216,17 @@ class AltRequestHandler(BaseHTTPRequestHandler):
             l2_snapshot = state.l2book.snapshot(l2_coins)
             l2_snapshot.setdefault("status", {})["scan_rows"] = len(latest_rows)
             l2_snapshot["status"]["subscribe_limit"] = int(state.config.get("live_l2_subscribe_limit", 80) or 80)
+            live_trades = load_live_trades_snapshot(state.db_path, 200, current_rows=latest_rows, config=state.config)
+            diagnostics = live_opportunity_diagnostics(
+                state, latest_rows, account=account, open_trades=live_trades.get("open", []), limit=20,
+            )
             json_response(self, {
                 "ok": True,
                 "config": live_config_public(state.config),
                 "account": account,
                 "account_error": live_error,
-                "live_trades": load_live_trades_snapshot(state.db_path, 200, current_rows=latest_rows, config=state.config),
+                "live_trades": live_trades,
+                "diagnostics": diagnostics,
                 "l2book": l2_snapshot,
                 "admin_enabled": bool(state.config.get("admin_token")),
             })

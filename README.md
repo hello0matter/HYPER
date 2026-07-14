@@ -14,7 +14,7 @@
 6. **历史回测**：对单个“小币 vs 保护腿”做粗略残差回归回测，查看过去是否经常回归、胜率和最大单次亏损。
 7. **全局 API**：集中配置自定义 JSON 数据源、请求头、字段路径和 FFD 测试入口。
 
-使用 Hyperliquid 公开只读 WebSocket 行情；不需要 API Key，也没有下单、钱包或私钥功能。初始配置监控 `xyz:GOLD`：DEX 最优买卖价对比同一市场的 `oraclePx`，用来验证数据流、盘口价差与本地接收延迟。
+行情监控部分使用 Hyperliquid 公开 WebSocket，不需要 API Key。服务器还包含一个默认关闭的真实交易模块；只有服务器已加密配置 API 钱包、网页总开关与策略开关都开启、并且全部风控通过时才会下单。初始锚定页监控 `xyz:GOLD`：DEX 最优买卖价对比同一市场的 `oraclePx`，用来验证数据流、盘口价差与本地接收延迟。
 
 ## 服务器采集模式
 
@@ -37,6 +37,7 @@ python hyperliquid_correlation_monitor.py --server
 - `GET /backtest?asset=SOL&leader=ETH&hours=168`：粗略残差回归回测；
 - `GET /history?asset=SOL&limit=200`：某个币的历史记录。
 - `GET /paper?limit=200`：模拟盘持仓、历史平仓、权益曲线和当前模拟参数。
+- `GET /live?fresh=1`：真实账户、真实交易记录、l2Book 状态，以及本轮每个候选被哪条规则过滤的诊断结果。
 
 ### 模拟盘 / 纸面交易
 
@@ -72,6 +73,10 @@ python hyperliquid_correlation_monitor.py --server --paper-notional 500 --paper-
 
 Dashboard 顶部“真实交易”会弹出独立面板：它读取主钱包的真实余额和仓位，并把快照存入同一个 SQLite 数据库的独立 `live_account_snapshots` 表，不与模拟盘交易混在一起。真实下单开关默认关闭，网页中不会接收、显示或保存私钥。
 
+真实信号链路统一为：5 分钟历史 K 线计算相关性、beta 和波动基准 → l2Book WebSocket 更新当前 Z 与真实方向 → 实盘 Z/相关/点差/预期边际过滤 → l2Book 年龄、点差和深度校验 → IOC 双腿订单。真实策略不会再依赖上一根 5 分钟 K 线留下的“候选/观察”标签，因此 WS 中途新出现的有效偏离不会被旧标签漏掉。
+
+真实交易面板的“为什么这一轮没有交易”会显示：扫描总数、当前可进入下单阶段的数量、Z 不足/相关不足/点差过大/边际不足/l2Book 未通过的计数，以及最接近开仓的组合。没有通过条件时保持空仓属于正常风控，不代表服务卡死。
+
 Hyperliquid 的 API 钱包私钥只可从 SSH 终端交互配置（不进入 shell 历史）：
 
 ```bash
@@ -87,6 +92,17 @@ cd /opt/hyperliquid-monitor
 ```
 
 私钥使用服务器 `.env` 中的独立主密钥加密后保存在 `live_api_secret.json`，文件权限为仅服务账户可读；数据库、网页接口和日志均不会包含私钥。该加密保护的是静态文件，不能替代 HTTPS、服务器权限管理或 API 钱包权限控制。
+
+### 代码验证
+
+修改真实策略后至少执行：
+
+```powershell
+python -m py_compile hyperliquid_correlation_monitor.py
+python -m unittest discover -s tests -v
+```
+
+测试覆盖“旧扫描标签不得阻止当前 WS 信号”“Z 变号后必须重算双腿方向”和“网页诊断与真实交易循环共用同一套过滤规则”。
 
 ### 钉钉推送
 
