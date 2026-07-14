@@ -2819,6 +2819,7 @@ button,input{font-size:13px;padding:6px 8px}button{cursor:pointer}
 .topPanel{width:auto}
 .tableWrap{overflow:auto;max-height:76vh;border:1px solid #edf0f3;border-radius:6px}
 .mainTable{min-width:1500px}
+#liveTradeTbl{min-width:2200px}
 .mainTable th{position:sticky;top:0;background:#f8fafc;z-index:2}
 .actionCell{text-align:left;min-width:420px;max-width:680px;overflow:hidden;text-overflow:ellipsis}
 .paperTop{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}
@@ -2988,7 +2989,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <h3>紧急风控</h3>
     <div class="paperActions"><input id="emergencyConfirm" placeholder="输入 CLOSE"><button class="dangerBtn" onclick="runEmergencyClose()">紧急全部平仓</button><span id="emergencyStatus" class="subtle">只发送 reduce-only 平仓单，不会主动开反向仓。</span></div>
   </div>
-  <div class="paperTableWrap"><table id="liveTradeTbl"><thead><tr><th>状态</th><th>币对</th><th>方向</th><th>相关</th><th>Beta</th><th>入场Z</th><th>当前/出场Z</th><th>小币15m</th><th>保护15m</th><th>点差</th><th>资金费/小时</th><th>名义金额</th><th>盈亏</th><th>原因</th></tr></thead><tbody></tbody></table></div>
+  <div class="paperTableWrap"><table id="liveTradeTbl"><thead><tr><th>状态</th><th>币对</th><th>方向</th><th>开仓时间</th><th>平仓时间</th><th>持仓时长</th><th>相关</th><th>Beta</th><th>入场Z</th><th>当前/出场Z</th><th>小币15m</th><th>保护15m</th><th>点差</th><th>资金费/小时</th><th>名义金额</th><th>盈亏</th><th>原因</th></tr></thead><tbody></tbody></table></div>
   <p id="liveStatsNote" class="subtle">真实统计只计算已平仓真实策略记录；真实盈亏按成交价粗算，未扣交易所手续费与资金费；最终以 Hyperliquid 官方记录为准。点击行查看原始成交回执。</p>
   <h3>真实账户仓位（只读快照）</h3>
   <div class="tableWrap"><table id="livePosTbl"><thead><tr><th>合约</th><th>方向/数量</th><th>开仓价</th><th>仓位价值</th><th>未实现盈亏</th><th>杠杆</th><th>强平价</th></tr></thead><tbody></tbody></table></div>
@@ -3110,6 +3111,8 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>自动刷新盘口</code>：只刷新网页显示，不改变服务器交易逻辑。后台 WS 本来就是实时收数据，网页每 1 秒拿一次服务器内存快照。</p>
 
 <h3>真实交易走势图怎么读</h3>
+<p><code>开仓时间/平仓时间</code>：真实策略表统一按北京时间显示到秒；持仓中的平仓时间显示“持仓中”。</p>
+<p><code>持仓时长</code>：从真实开仓成交到平仓成交的时间；持仓中会随页面自动刷新继续计时。</p>
 <p><code>累计收益/回撤</code>：蓝线看真实成交后累计盈亏，红线看从高点回落多少。</p>
 <p><code>滚动10笔胜率</code>：最近 10 笔表现，能看策略近期有没有改善。</p>
 <p><code>每笔 bps/平均 bps</code>：看收益分布。平均 bps 长期为正，才说明策略有真实边际。</p>
@@ -3159,6 +3162,21 @@ const charts={};
 let liveL2Coins=[];
 let liveL2RefreshBusy=false;
 function fmt(n,d=2){return n===null||n===undefined||isNaN(Number(n))?'-':Number(n).toFixed(d)}
+function fmtBeijingDateTime(ts){
+  if(ts===null||ts===undefined||isNaN(Number(ts)))return '-';
+  return new Date(Number(ts)*1000).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+}
+function fmtDuration(startTs,endTs){
+  if(!startTs)return '-';
+  let seconds=Math.max(0,Math.round(Number(endTs||Date.now()/1000)-Number(startTs)));
+  const days=Math.floor(seconds/86400);seconds%=86400;
+  const hours=Math.floor(seconds/3600);seconds%=3600;
+  const minutes=Math.floor(seconds/60);seconds%=60;
+  if(days)return `${days}天 ${hours}时 ${minutes}分`;
+  if(hours)return `${hours}时 ${minutes}分 ${seconds}秒`;
+  if(minutes)return `${minutes}分 ${seconds}秒`;
+  return `${seconds}秒`;
+}
 function tagText(t){return t==='candidate'?'候选':(t==='caution'?'谨慎':'观察')}
 function val(row,key){return row[key]===null||row[key]===undefined?'':row[key]}
 function dirText(action){
@@ -3843,11 +3861,14 @@ function renderLiveTrades(snapshot){
     const beta=row.status==='open'?(row.current_beta??row.beta):row.beta;
     const spread=row.status==='open'?(row.current_spread_bps??row.entry_spread_bps):row.exit_spread_bps??row.entry_spread_bps;
     const fundingBps=Number(row.current_funding_hourly||0)*10000;
-    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${liveActionText(row.action)}</td><td>${fmt(corr,3)}</td><td>${fmt(beta,2)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td>${fmt(row.current_asset_15m_bps,1)} bps</td><td>${fmt(row.current_hedge_15m_bps,1)} bps</td><td>${fmt(spread,2)}</td><td>${fmt(fundingBps,3)} bps</td><td>${fmt(row.asset_notional_usdc,1)}U / ${fmt(row.hedge_notional_usdc,1)}U</td><td class="${Number(pnl)>=0?'scoreGood':'scoreBad'}">${row.status==='open'?'信号 ':''}${fmt(pnlBps,1)} bps / ${fmt(pnl,4)}U</td><td style="text-align:left">${row.close_reason||row.current_plan||row.note||''}</td>`;
+    const entryTime=fmtBeijingDateTime(row.entry_ts);
+    const exitTime=row.status==='open'?'持仓中':fmtBeijingDateTime(row.exit_ts);
+    const holdTime=fmtDuration(row.entry_ts,row.status==='open'?null:row.exit_ts);
+    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${liveActionText(row.action)}</td><td>${entryTime}</td><td>${exitTime}</td><td>${holdTime}</td><td>${fmt(corr,3)}</td><td>${fmt(beta,2)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td>${fmt(row.current_asset_15m_bps,1)} bps</td><td>${fmt(row.current_hedge_15m_bps,1)} bps</td><td>${fmt(spread,2)}</td><td>${fmt(fundingBps,3)} bps</td><td>${fmt(row.asset_notional_usdc,1)}U / ${fmt(row.hedge_notional_usdc,1)}U</td><td class="${Number(pnl)>=0?'scoreGood':'scoreBad'}">${row.status==='open'?'信号 ':''}${fmt(pnlBps,1)} bps / ${fmt(pnl,4)}U</td><td style="text-align:left">${row.close_reason||row.current_plan||row.note||''}</td>`;
     tr.onclick=()=>showLiveTradeDetail(row);
     tb.appendChild(tr);
   });
-  if(!rows.length)tb.innerHTML='<tr><td colspan="14" class="muted">还没有真实策略持仓或平仓记录</td></tr>';
+  if(!rows.length)tb.innerHTML='<tr><td colspan="17" class="muted">还没有真实策略持仓或平仓记录</td></tr>';
 }
 function safeJson(value){try{return typeof value==='string'?JSON.parse(value):(value||{});}catch(e){return {parse_error:String(value)}}}
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -3863,6 +3884,9 @@ function showLiveTradeDetail(row){
   document.getElementById('detailBody').innerHTML=`
     <div class="detailGrid">
       <div class="detailBox"><div class="muted">结果</div><div>${esc(row.status)}</div></div>
+      <div class="detailBox"><div class="muted">开仓时间（北京时间）</div><div>${fmtBeijingDateTime(row.entry_ts)}</div></div>
+      <div class="detailBox"><div class="muted">平仓时间（北京时间）</div><div>${row.status==='open'?'持仓中':fmtBeijingDateTime(row.exit_ts)}</div></div>
+      <div class="detailBox"><div class="muted">持仓时长</div><div>${fmtDuration(row.entry_ts,row.status==='open'?null:row.exit_ts)}</div></div>
       <div class="detailBox"><div class="muted">小币/保护腿名义金额</div><div>${fmt(row.asset_notional_usdc,2)}U / ${fmt(row.hedge_notional_usdc,2)}U</div></div>
       <div class="detailBox"><div class="muted">价格盈亏（未扣费）</div><div>${row.status==='open'?'持仓中':fmt(row.pnl_usdc,5)+' U'}</div></div>
       <div class="detailBox"><div class="muted">相关 / Beta</div><div>${fmt(row.current_corr??row.entry_corr,3)} / ${fmt(row.current_beta??row.beta,2)}</div></div>
