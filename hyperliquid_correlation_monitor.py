@@ -586,11 +586,19 @@ def init_alt_db(path=ALT_DB_FILE):
                 close_reason TEXT,
                 opened_scan_id INTEGER,
                 closed_scan_id INTEGER,
-                plan TEXT
+                plan TEXT,
+                mode TEXT NOT NULL DEFAULT 'legacy',
+                sync_live_trade_id INTEGER
             )
         """)
+        for column in ("mode TEXT NOT NULL DEFAULT 'legacy'", "sync_live_trade_id INTEGER"):
+            try:
+                db.execute(f"ALTER TABLE paper_trades ADD COLUMN {column}")
+            except sqlite3.OperationalError:
+                pass
         db.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status, trade_key)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_ts ON paper_trades(entry_ts, exit_ts)")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_sync_live_id ON paper_trades(sync_live_trade_id) WHERE sync_live_trade_id IS NOT NULL")
         db.execute("""
             CREATE TABLE IF NOT EXISTS paper_equity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -599,9 +607,14 @@ def init_alt_db(path=ALT_DB_FILE):
                 realized_usdc REAL NOT NULL,
                 unrealized_usdc REAL NOT NULL,
                 total_usdc REAL NOT NULL,
-                open_count INTEGER NOT NULL
+                open_count INTEGER NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'legacy'
             )
         """)
+        try:
+            db.execute("ALTER TABLE paper_equity ADD COLUMN mode TEXT NOT NULL DEFAULT 'legacy'")
+        except sqlite3.OperationalError:
+            pass
         db.execute("CREATE INDEX IF NOT EXISTS idx_paper_equity_ts ON paper_equity(ts)")
         db.execute("""
             CREATE TABLE IF NOT EXISTS live_account_snapshots (
@@ -1059,11 +1072,20 @@ def load_open_paper_trades(db_path=ALT_DB_FILE):
 
 def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, config=None):
     init_alt_db(db_path)
+    sync_live = bool((config or {}).get("paper_sync_live", True))
+    trade_mode_where = " AND mode = 'live_shadow'" if sync_live else " AND mode != 'live_shadow'"
+    equity_mode_where = " WHERE mode = 'live_shadow'" if sync_live else " WHERE mode != 'live_shadow'"
     with sqlite3.connect(db_path) as db:
         db.row_factory = sqlite3.Row
-        open_rows = [dict(row) for row in db.execute("SELECT * FROM paper_trades WHERE status = 'open' ORDER BY entry_ts DESC").fetchall()]
-        closed_rows = [dict(row) for row in db.execute("SELECT * FROM paper_trades WHERE status = 'closed' ORDER BY exit_ts DESC LIMIT ?", (int(limit),)).fetchall()]
-        equity_rows = [dict(row) for row in db.execute("SELECT * FROM paper_equity ORDER BY ts DESC LIMIT ?", (int(limit),)).fetchall()][::-1]
+        open_rows = [dict(row) for row in db.execute(
+            "SELECT * FROM paper_trades WHERE status = 'open'" + trade_mode_where + " ORDER BY entry_ts DESC"
+        ).fetchall()]
+        closed_rows = [dict(row) for row in db.execute(
+            "SELECT * FROM paper_trades WHERE status = 'closed'" + trade_mode_where + " ORDER BY exit_ts DESC LIMIT ?", (int(limit),)
+        ).fetchall()]
+        equity_rows = [dict(row) for row in db.execute(
+            "SELECT * FROM paper_equity" + equity_mode_where + " ORDER BY ts DESC LIMIT ?", (int(limit),)
+        ).fetchall()][::-1]
         stats = db.execute("""
             SELECT
                 COUNT(*) AS trades,
@@ -1072,7 +1094,7 @@ def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, confi
                 COALESCE(AVG(pnl_bps), 0) AS avg_bps,
                 COALESCE(MIN(pnl_bps), 0) AS worst_bps
             FROM paper_trades WHERE status = 'closed'
-        """).fetchone()
+        """ + trade_mode_where).fetchone()
     trades = int(stats["trades"] or 0)
     wins = int(stats["wins"] or 0)
     if current_rows and config:
@@ -1095,6 +1117,7 @@ def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, confi
             trade["pnl_usdc"] = float(trade["notional_usdc"]) * pnl_bps / 10_000
     return {
         "enabled": True,
+        "mode": "live_shadow" if sync_live else "independent",
         "open": open_rows,
         "closed": closed_rows,
         "equity": equity_rows,
@@ -1902,10 +1925,135 @@ def update_live_trading(state, payload, scan_id):
     return load_live_trades_snapshot(state.db_path, current_rows=rows, config=config)
 
 
+def sync_paper_trading_with_live(state, payload, scan_id):
+    """Mirror successfully created real trades into a theoretical shadow book.
+
+    Pair, direction, entry/exit time and Z are copied from live_trades.  Only
+    PnL remains theoretical, which makes the paper-vs-real difference useful:
+    it is execution/slippage/cost difference rather than different signals.
+    """
+    config = state.config
+    init_alt_db(state.db_path)
+    now_ts = float(payload["ts"])
+    rows = prepare_live_rows(payload.get("rows", []), config, state.l2book)
+    row_by_pair = {paper_pair_key(row): row for row in rows}
+    opened_now, closed_now = [], []
+    with sqlite3.connect(state.db_path) as db:
+        db.row_factory = sqlite3.Row
+        # Old independent positions must not coexist with the synchronized
+        # shadow book.  Preserve them for audit, but remove them from current
+        # synchronized statistics instead of fabricating a close PnL.
+        db.execute("""
+            UPDATE paper_trades
+            SET status='archived', exit_ts=?, close_reason='切换为真实策略同步影子盘'
+            WHERE status='open' AND sync_live_trade_id IS NULL
+        """, (now_ts,))
+        live_rows = [dict(row) for row in db.execute("""
+            SELECT * FROM live_trades
+            WHERE status IN ('open', 'closed', 'reconciled', 'emergency_closed')
+            ORDER BY entry_ts ASC
+        """).fetchall()]
+        shadow_by_live_id = {
+            int(row["sync_live_trade_id"]): dict(row)
+            for row in db.execute("SELECT * FROM paper_trades WHERE sync_live_trade_id IS NOT NULL").fetchall()
+        }
+
+        for live in live_rows:
+            live_id = int(live["id"])
+            shadow = shadow_by_live_id.get(live_id)
+            is_open = live.get("status") == "open"
+            shadow_status = "open" if is_open else "closed"
+            current = row_by_pair.get(paper_pair_key(live)) or {}
+            notional = float(live.get("total_notional_usdc") or (
+                float(live.get("asset_notional_usdc") or 0) + float(live.get("hedge_notional_usdc") or 0)
+            ))
+            exit_z = live.get("exit_z") if not is_open else None
+            pnl_bps = 0.0
+            pnl_usdc = 0.0
+            if not is_open:
+                theoretical_row = {
+                    "zscore": exit_z if exit_z is not None else live.get("entry_z"),
+                    "corr": live.get("exit_corr") if live.get("exit_corr") is not None else live.get("entry_corr"),
+                    "spread_bps": live.get("exit_spread_bps") if live.get("exit_spread_bps") is not None else live.get("entry_spread_bps"),
+                    "funding_hourly": current.get("funding_hourly", 0),
+                }
+                pnl_bps = paper_trade_pnl_bps(
+                    {"entry_z": live["entry_z"], "entry_ts": live["entry_ts"], "action": live["action"]},
+                    theoretical_row, config, live.get("exit_ts") or now_ts,
+                )
+                pnl_usdc = notional * pnl_bps / 10_000
+            plan = f"真实策略同步影子盘；对应真实交易 #{live_id}；小币腿 {float(live.get('asset_notional_usdc') or 0):.2f}U / 保护腿 {float(live.get('hedge_notional_usdc') or 0):.2f}U"
+            if shadow is None:
+                cursor = db.execute("""
+                    INSERT INTO paper_trades (
+                        trade_key, status, asset, leader, action, notional_usdc, beta, entry_ts, exit_ts,
+                        entry_z, exit_z, entry_corr, exit_corr, entry_spread_bps, exit_spread_bps,
+                        entry_funding_hourly, exit_funding_hourly, pnl_bps, pnl_usdc, close_reason,
+                        opened_scan_id, closed_scan_id, plan, mode, sync_live_trade_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live_shadow', ?)
+                """, (
+                    live["trade_key"], shadow_status, live["asset"], live["leader"], live["action"], notional,
+                    live["beta"], live["entry_ts"], live.get("exit_ts"), live["entry_z"], exit_z,
+                    live.get("entry_corr"), live.get("exit_corr"), live.get("entry_spread_bps"), live.get("exit_spread_bps"),
+                    current.get("funding_hourly"), current.get("funding_hourly"), pnl_bps, pnl_usdc,
+                    live.get("close_reason"), live.get("opened_scan_id"), live.get("closed_scan_id"), plan, live_id,
+                ))
+                shadow = {
+                    "id": cursor.lastrowid, "trade_key": live["trade_key"], "status": shadow_status,
+                    "asset": live["asset"], "leader": live["leader"], "action": live["action"],
+                    "notional_usdc": notional, "beta": live["beta"], "entry_ts": live["entry_ts"],
+                    "entry_z": live["entry_z"], "exit_z": exit_z, "pnl_bps": pnl_bps,
+                    "pnl_usdc": pnl_usdc, "close_reason": live.get("close_reason"), "plan": plan,
+                }
+                shadow_by_live_id[live_id] = shadow
+                if is_open and int(live.get("opened_scan_id") or 0) == int(scan_id):
+                    opened_now.append((shadow, current))
+            elif shadow.get("status") == "open" and not is_open:
+                db.execute("""
+                    UPDATE paper_trades
+                    SET status='closed', exit_ts=?, exit_z=?, exit_corr=?, exit_spread_bps=?,
+                        exit_funding_hourly=?, pnl_bps=?, pnl_usdc=?, close_reason=?, closed_scan_id=?, plan=?
+                    WHERE id=?
+                """, (
+                    live.get("exit_ts") or now_ts, exit_z, live.get("exit_corr"), live.get("exit_spread_bps"),
+                    current.get("funding_hourly"), pnl_bps, pnl_usdc, live.get("close_reason") or live.get("status"),
+                    live.get("closed_scan_id"), plan, shadow["id"],
+                ))
+                shadow.update({"status": "closed", "exit_ts": live.get("exit_ts") or now_ts,
+                               "exit_z": exit_z, "pnl_bps": pnl_bps, "pnl_usdc": pnl_usdc,
+                               "close_reason": live.get("close_reason") or live.get("status"), "plan": plan})
+                if int(live.get("closed_scan_id") or 0) == int(scan_id):
+                    closed_now.append((shadow, current, shadow["close_reason"]))
+
+        shadow_open = [dict(row) for row in db.execute(
+            "SELECT * FROM paper_trades WHERE status='open' AND mode='live_shadow' ORDER BY entry_ts ASC"
+        ).fetchall()]
+        unrealized = 0.0
+        for trade in shadow_open:
+            row = row_by_pair.get(paper_pair_key(trade))
+            if row:
+                unrealized += float(trade["notional_usdc"]) * paper_trade_pnl_bps(trade, row, config, now_ts) / 10_000
+        realized = float(db.execute(
+            "SELECT COALESCE(SUM(pnl_usdc), 0) FROM paper_trades WHERE status='closed' AND mode='live_shadow'"
+        ).fetchone()[0])
+        db.execute("""
+            INSERT INTO paper_equity (ts, scan_id, realized_usdc, unrealized_usdc, total_usdc, open_count, mode)
+            VALUES (?, ?, ?, ?, ?, ?, 'live_shadow')
+        """, (now_ts, scan_id, realized, unrealized, realized + unrealized, len(shadow_open)))
+
+    for trade, row in opened_now:
+        notify_dingtalk_paper_trade(state, "模拟开仓", trade, row, "与真实策略成功开仓同步建立影子仓")
+    for trade, row, reason in closed_now:
+        notify_dingtalk_paper_trade(state, "模拟平仓", trade, row, f"与真实策略同步平仓：{reason}")
+    return load_paper_snapshot(state.db_path, current_rows=rows, config=config)
+
+
 def update_paper_trading(state, payload, scan_id):
     config = state.config
     if not config.get("paper_enabled", True):
         return {"enabled": False, "open": [], "closed": [], "equity": [], "stats": {}}
+    if config.get("paper_sync_live", True):
+        return sync_paper_trading_with_live(state, payload, scan_id)
     init_alt_db(state.db_path)
     now_ts = float(payload["ts"])
     rows = payload.get("rows", [])
@@ -2177,6 +2325,7 @@ def generate_live_api_key_cli():
 
 PAPER_CONFIG_FIELDS = {
     "paper_enabled": {"env": "PAPER_ENABLED", "type": "bool", "label": "模拟盘开关"},
+    "paper_sync_live": {"env": "PAPER_SYNC_LIVE", "type": "bool", "label": "同步真实策略影子盘"},
     "paper_notional_usdc": {"env": "PAPER_NOTIONAL_USDC", "type": "float", "min": 1, "max": 1_000_000, "label": "每笔名义本金"},
     "paper_exit_z": {"env": "PAPER_EXIT_Z", "type": "float", "min": 0, "max": 10, "label": "回归平仓 Z"},
     "paper_take_profit_bps": {"env": "PAPER_TAKE_PROFIT_BPS", "type": "float", "min": 0, "max": 10_000, "label": "固定止盈 bps（0关闭）"},
@@ -2687,6 +2836,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 </div>
 <div class="paperForm">
 <label>开关<select id="cfg_paper_enabled"><option value="true">开启</option><option value="false">关闭</option></select></label>
+<label>交易同步<select id="cfg_paper_sync_live"><option value="true">同步真实策略（默认）</option><option value="false">独立模拟（旧模式）</option></select></label>
 <label>每笔USDC<input id="cfg_paper_notional_usdc" type="number" step="1"></label>
 <label>回归Z<input id="cfg_paper_exit_z" type="number" step="0.1"></label>
 <label>固定止盈bps（0关闭）<input id="cfg_paper_take_profit_bps" type="number" step="1" min="0"></label>
@@ -2697,6 +2847,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <label>1Z折算bps<input id="cfg_paper_z_value_bps" type="number" step="0.1"></label>
 <label>最低相关<input id="cfg_paper_min_corr" type="number" step="0.01"></label>
 </div>
+<div class="subtle">同步真实策略时：模拟盘只镜像真实盘已经成功建立的币对、方向、开仓时间和平仓时间；“每笔USDC/最多持仓”改由真实交易参数决定。模拟盈亏仍按理论Z回归计算，用来和真实成交盈亏比较执行损耗。</div>
 </div>
 <div>
 <canvas id="paperChart" class="mini" width="760" height="190"></canvas>
@@ -2938,6 +3089,8 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>每笔 bps/平均 bps</code>：看收益分布。平均 bps 长期为正，才说明策略有真实边际。</p>
 
 <h3>模拟盘参数怎么读</h3>
+<p><code>交易同步</code>：默认选择“同步真实策略”。只有真实订单成功开仓后，模拟盘才建立完全相同币对、方向和时间的影子仓；真实盘平仓时影子仓同时结束。这样才能直接比较理论收益和真实执行损耗。</p>
+<p>同步模式下，“每笔名义本金”和“最多持仓”由真实交易面板的实际参数决定；模拟页的这两个旧参数只供“独立模拟”模式使用。</p>
 <p><code>每笔名义本金</code>：模拟每笔按多少 USDC 计算盈亏，不是真实下单。</p>
 <p><code>回归平仓Z</code>：Z 回到多小就认为偏离回归并平仓。比如 0.5 表示 |Z| <= 0.5 出场。</p>
 <p><code>固定止盈bps/止损bps</code>：模拟盘按残差收益估算的止盈止损。真实盘仍以实际成交价为准。</p>
@@ -3301,11 +3454,12 @@ function renderPaper(data){
   const cfg=data.config||{}, stats=data.stats||{};
   const open=data.open||[], closed=data.closed||[], equity=data.equity||[];
   fillPaperConfig(cfg, false);
-  document.getElementById('pStatus').textContent=(cfg.paper_enabled===false?'关闭':'开启')+`；持仓 ${open.length} 个`;
+  const synced=cfg.paper_sync_live!==false;
+  document.getElementById('pStatus').textContent=(cfg.paper_enabled===false?'关闭':(synced?'开启：真实同步影子盘':'开启：独立模拟'))+`；持仓 ${open.length} 个`;
   document.getElementById('pPnl').textContent=`已实现 ${fmt(stats.realized_usdc,2)} USDC`;
   document.getElementById('pWin').textContent=`${fmt((stats.win_rate||0)*100,1)}% / ${stats.trades||0} 次`;
   const tp=Number(cfg.paper_take_profit_bps||0);
-  document.getElementById('pConfig').textContent=`每笔 ${fmt(cfg.paper_notional_usdc,0)}U；固定止盈 ${tp>0?fmt(tp,0)+'bps':'关闭'}；止损 ${fmt(cfg.paper_stop_bps,0)}bps；回归Z ${fmt(cfg.paper_exit_z,2)}；最长 ${cfg.paper_max_hold_minutes||'-'}分`;
+  document.getElementById('pConfig').textContent=(synced?'仓位/方向/时间跟随真实盘；':`每笔 ${fmt(cfg.paper_notional_usdc,0)}U；`)+`固定止盈 ${tp>0?fmt(tp,0)+'bps':'关闭'}；止损 ${fmt(cfg.paper_stop_bps,0)}bps；回归Z ${fmt(cfg.paper_exit_z,2)}；最长 ${cfg.paper_max_hold_minutes||'-'}分`;
   drawPaperEquity(equity, true);
   const tb=document.querySelector('#paperTbl tbody'); tb.innerHTML='';
   const rows=[...open.map(x=>({...x,_status:'持仓'})), ...closed.slice(0,20).map(x=>({...x,_status:'已平'}))];
@@ -3347,13 +3501,13 @@ function drawPaperEquity(rows, reset=false){
     {label:'未实现U', color:'#f97316', value:r=>r.unrealized_usdc, digits:2}
   ], {marks:[0], footer:`模拟利润曲线：${(rows||[]).length} 点`, reset});
 }
-const paperConfigKeys=['paper_enabled','paper_notional_usdc','paper_exit_z','paper_take_profit_bps','paper_stop_bps','paper_max_hold_minutes','paper_max_open','paper_fee_bps','paper_z_value_bps','paper_min_corr'];
+const paperConfigKeys=['paper_enabled','paper_sync_live','paper_notional_usdc','paper_exit_z','paper_take_profit_bps','paper_stop_bps','paper_max_hold_minutes','paper_max_open','paper_fee_bps','paper_z_value_bps','paper_min_corr'];
 function cfgEl(key){return document.getElementById('cfg_'+key)}
 function fillPaperConfig(cfg, force=true){
   paperConfigKeys.forEach(key=>{
     const el=cfgEl(key); if(!el || cfg[key]===undefined) return;
     if(!force && document.activeElement===el) return;
-    if(key==='paper_enabled') el.value=cfg[key]===false?'false':'true';
+    if(['paper_enabled','paper_sync_live'].includes(key)) el.value=cfg[key]===false?'false':'true';
     else el.value=cfg[key];
   });
 }
@@ -3372,7 +3526,7 @@ function readPaperConfigForm(){
   const cfg={};
   paperConfigKeys.forEach(key=>{
     const el=cfgEl(key); if(!el) return;
-    if(key==='paper_enabled') cfg[key]=el.value==='true';
+    if(['paper_enabled','paper_sync_live'].includes(key)) cfg[key]=el.value==='true';
     else if(['paper_max_hold_minutes','paper_max_open'].includes(key)) cfg[key]=parseInt(el.value,10);
     else cfg[key]=parseFloat(el.value);
   });
@@ -4107,8 +4261,6 @@ def collector_loop(state):
             ))
             scan_id = save_alt_scan(payload, state.config, db_path=state.db_path)
             payload["scan_id"] = scan_id
-            paper_snapshot = update_paper_trading(state, payload, scan_id)
-            payload["paper"] = paper_snapshot
             account_address = state.config.get("live_account_address")
             if valid_evm_address(account_address):
                 try:
@@ -4121,6 +4273,10 @@ def collector_loop(state):
                         state.live_error = str(live_exc)
             live_snapshot = update_live_trading(state, payload, scan_id)
             payload["live_trades"] = live_snapshot
+            # The synchronized paper book runs after real execution so it can
+            # mirror only orders that actually reached an open/closed state.
+            paper_snapshot = update_paper_trading(state, payload, scan_id)
+            payload["paper"] = paper_snapshot
             with state.lock:
                 state.latest, state.error = payload, None
             notify_dingtalk_candidates(state, payload)
@@ -4169,6 +4325,8 @@ class AltRequestHandler(BaseHTTPRequestHandler):
             try:
                 with state.lock:
                     latest_rows = list((state.latest or {}).get("rows", []))
+                if state.config.get("paper_sync_live", True):
+                    latest_rows = prepare_live_rows(latest_rows, state.config, state.l2book)
                 snap = load_paper_snapshot(state.db_path, limit, current_rows=latest_rows, config=state.config)
                 snap["config"] = paper_config_public(state.config)
                 json_response(self, {"ok": True, **snap})
@@ -5498,6 +5656,7 @@ def build_server_config(args):
         "min_volume": float(args.min_volume),
         "max_assets": int(args.max_assets),
         "paper_enabled": env_bool("PAPER_ENABLED", bool(args.paper_enabled)),
+        "paper_sync_live": env_bool("PAPER_SYNC_LIVE", True),
         "paper_notional_usdc": env_float("PAPER_NOTIONAL_USDC", float(args.paper_notional)),
         "paper_exit_z": env_float("PAPER_EXIT_Z", float(args.paper_exit_z)),
         "paper_take_profit_bps": env_float("PAPER_TAKE_PROFIT_BPS", float(args.paper_take_profit_bps)),

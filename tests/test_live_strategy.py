@@ -1,4 +1,8 @@
+import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 import hyperliquid_correlation_monitor as monitor
 
@@ -47,6 +51,52 @@ class LiveStrategySignalTests(unittest.TestCase):
         self.assertIn("|Z|", monitor.live_candidate_reject_reason(
             self.row(zscore=1.0, corr=0.4, spread_bps=8.0), self.config
         ))
+
+    def test_paper_shadow_uses_the_same_live_trade_lifecycle(self):
+        config = {
+            **self.config,
+            "paper_enabled": True,
+            "paper_sync_live": True,
+            "paper_take_profit_bps": 0,
+            "paper_stop_bps": 80,
+            "paper_max_hold_minutes": 360,
+            "paper_min_corr": 0.65,
+            "max_spread_bps": 8.0,
+            "dingtalk_paper_webhook": "",
+        }
+        # Some Windows SQLite builds briefly retain a file handle after the
+        # final connection closes; ignore only that temporary cleanup race.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db_path = Path(tmp) / "monitor.sqlite3"
+            monitor.init_alt_db(db_path)
+            with sqlite3.connect(db_path) as db:
+                cursor = db.execute("""
+                    INSERT INTO live_trades (
+                        trade_key, status, asset, leader, action, asset_notional_usdc,
+                        hedge_notional_usdc, total_notional_usdc, beta, entry_ts,
+                        entry_z, entry_corr, entry_spread_bps, opened_scan_id
+                    ) VALUES ('TEST:ETH:short_asset_long_hedge', 'open', 'TEST', 'ETH',
+                              'short_asset_long_hedge', 10.5, 10.5, 21.0, 1.0,
+                              1000, 3.0, 0.8, 1.0, 1)
+                """)
+                live_id = cursor.lastrowid
+            state = SimpleNamespace(config=config, db_path=db_path, l2book=None)
+            payload = {"ts": 1000.0, "rows": [self.row()]}
+            opened = monitor.sync_paper_trading_with_live(state, payload, 1)
+            self.assertEqual(len(opened["open"]), 1)
+            self.assertEqual(opened["open"][0]["sync_live_trade_id"], live_id)
+
+            with sqlite3.connect(db_path) as db:
+                db.execute("""
+                    UPDATE live_trades SET status='closed', exit_ts=1060, exit_z=0.2,
+                        exit_corr=0.8, exit_spread_bps=1.0, close_reason='偏离回归', closed_scan_id=2
+                    WHERE id=?
+                """, (live_id,))
+            payload = {"ts": 1060.0, "rows": [self.row(zscore=0.2)]}
+            closed = monitor.sync_paper_trading_with_live(state, payload, 2)
+            self.assertEqual(len(closed["open"]), 0)
+            self.assertEqual(len(closed["closed"]), 1)
+            self.assertEqual(closed["closed"][0]["close_reason"], "偏离回归")
 
 
 if __name__ == "__main__":

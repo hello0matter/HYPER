@@ -41,12 +41,13 @@ python hyperliquid_correlation_monitor.py --server
 
 ### 模拟盘 / 纸面交易
 
-服务器模式默认开启模拟盘，不会真实下单。规则是：候选出现时模拟开仓；偏离回归、达到固定止盈、止损、超时、相关性恶化或点差恶化时自动模拟平仓；开仓和平仓都会推送钉钉。
+服务器模式默认开启“真实策略同步影子盘”。它本身不会下单，而是只在真实策略成功建立仓位后建立同币对、同方向、同开仓时间的模拟影子仓，并在真实策略平仓时同步平仓。这样模拟与真实的差异主要反映成交价、滑点、手续费和资金费，而不是两套信号不同。网页仍可切回“独立模拟（旧模式）”。
 
 常用参数可以放在 `/opt/hyperliquid-monitor/.env`：
 
 ```bash
 PAPER_ENABLED=1
+PAPER_SYNC_LIVE=1
 PAPER_NOTIONAL_USDC=1000
 PAPER_EXIT_Z=0.5
 PAPER_TAKE_PROFIT_BPS=50
@@ -67,7 +68,7 @@ HLM_ADMIN_TOKEN=一个足够长的随机口令
 python hyperliquid_correlation_monitor.py --server --paper-notional 500 --paper-stop-bps 60 --paper-exit-z 0.4 --paper-max-open 6
 ```
 
-模拟收益是残差/Z 回归近似，用于远程观察策略质量，不等于真实成交盈亏。真实成交还需要逐笔成交价、盘口深度、滑点、手续费、资金费结算和爆仓约束。
+同步影子盘的模拟收益仍是残差/Z 回归近似；币对、方向和生命周期与真实交易一致，但盈亏不会假装成真实成交。真实盘仍以逐笔成交价、盘口深度、滑点、手续费、资金费和官方仓位为准。
 
 ### 真实交易面板（默认关闭）
 
