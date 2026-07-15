@@ -194,6 +194,73 @@ class LiveStrategySignalTests(unittest.TestCase):
         self.assertAlmostEqual(result["asset_net_pnl_usdc"], 0.096, places=9)
         self.assertAlmostEqual(result["hedge_net_pnl_usdc"], -0.042, places=9)
 
+    def leadlag_config(self):
+        return {
+            "leadlag_enabled": True, "leadlag_notional_usdc": 20.0, "leadlag_max_open": 1,
+            "leadlag_leader_3s_bps": 12.0, "leadlag_leader_15s_bps": 25.0,
+            "leadlag_min_lag_bps": 15.0, "leadlag_min_corr": 0.75,
+            "leadlag_max_spread_bps": 1.5, "leadlag_min_imbalance": 0.05,
+            "leadlag_min_depth_multiple": 5.0, "leadlag_fee_bps": 5.0,
+            "leadlag_min_edge_bps": 18.0, "leadlag_take_profit_bps": 30.0,
+            "leadlag_stop_bps": 18.0, "leadlag_trail_start_bps": 15.0,
+            "leadlag_trail_gap_bps": 10.0, "leadlag_max_hold_minutes": 10,
+            "leadlag_cooldown_minutes": 20, "dingtalk_paper_webhook": "",
+        }
+
+    def test_leadlag_signal_requires_impulse_lag_and_book_confirmation(self):
+        class FakeMotion:
+            def motion(self, coin, windows=(1, 3, 15)):
+                if coin == "BTC":
+                    return {"ret_1s_bps": 5, "ret_3s_bps": 20, "ret_15s_bps": 30,
+                            "age_ms": 10, "mid": 60000, "bid": 59999, "ask": 60001,
+                            "spread_bps": .3, "imbalance": .1, "bid_size": 10, "ask_size": 10}
+                return {"ret_1s_bps": 1, "ret_3s_bps": 2, "ret_15s_bps": 5,
+                        "age_ms": 10, "mid": 10, "bid": 9.9995, "ask": 10.0005,
+                        "spread_bps": 1.0, "imbalance": .2, "bid_size": 100, "ask_size": 100}
+
+        signal = monitor.leadlag_pair_state(
+            self.row(asset="TEST", leader="BTC", corr=.82, beta=1.5), FakeMotion(), self.leadlag_config()
+        )
+        self.assertTrue(signal["eligible"])
+        self.assertEqual(signal["side"], "long")
+        self.assertGreaterEqual(signal["lag_bps"], 15)
+        self.assertGreaterEqual(signal["expected_edge_bps"], 18)
+
+    def test_leadlag_paper_trade_opens_and_takes_profit(self):
+        class MutableMotion:
+            def __init__(self):
+                self.asset_mid = 10.0
+
+            def motion(self, coin, windows=(1, 3, 15)):
+                if coin == "BTC":
+                    return {"ret_1s_bps": 5, "ret_3s_bps": 20, "ret_15s_bps": 30,
+                            "age_ms": 10, "mid": 60000, "bid": 59999, "ask": 60001,
+                            "spread_bps": .3, "imbalance": .1, "bid_size": 10, "ask_size": 10}
+                mid = self.asset_mid
+                return {"ret_1s_bps": 1, "ret_3s_bps": 2, "ret_15s_bps": 5,
+                        "age_ms": 10, "mid": mid, "bid": mid * .99995, "ask": mid * 1.00005,
+                        "spread_bps": 1.0, "imbalance": .2, "bid_size": 100, "ask_size": 100}
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db_path = Path(tmp) / "monitor.sqlite3"
+            monitor.init_alt_db(db_path)
+            book = MutableMotion()
+            state = SimpleNamespace(
+                config=self.leadlag_config(), db_path=db_path, l2book=book,
+                leadlag_lock=threading.Lock(),
+                leadlag_status={"running": False, "last_eval_ts": None, "last_error": None,
+                                "eligible": 0, "opened": 0, "closed": 0, "signals": []},
+            )
+            row = self.row(asset="TEST", leader="BTC", corr=.82, beta=1.5, funding_hourly=0)
+            opened = monitor.update_leadlag_strategy(state, [row], 1000.0)
+            self.assertEqual(len(opened["open"]), 1)
+            book.asset_mid = 10.05
+            closed = monitor.update_leadlag_strategy(state, [row], 1001.0)
+            self.assertEqual(len(closed["open"]), 0)
+            self.assertEqual(len(closed["closed"]), 1)
+            self.assertEqual(closed["closed"][0]["close_reason"], "达到单腿止盈")
+            self.assertGreater(closed["closed"][0]["net_bps"], 30)
+
     def unified_state(self, db_path):
         config = {
             **self.config,

@@ -702,6 +702,40 @@ def init_alt_db(path=ALT_DB_FILE):
                 pass
         db.execute("CREATE INDEX IF NOT EXISTS idx_live_trades_status ON live_trades(status, trade_key)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_live_trades_ts ON live_trades(entry_ts, exit_ts)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS leadlag_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL,
+                asset TEXT NOT NULL,
+                leader TEXT NOT NULL,
+                side TEXT NOT NULL,
+                notional_usdc REAL NOT NULL,
+                entry_ts REAL NOT NULL,
+                exit_ts REAL,
+                entry_px REAL NOT NULL,
+                exit_px REAL,
+                size REAL NOT NULL,
+                leader_3s_bps REAL,
+                leader_15s_bps REAL,
+                asset_3s_bps REAL,
+                lag_bps REAL,
+                expected_edge_bps REAL,
+                corr REAL,
+                beta REAL,
+                entry_spread_bps REAL,
+                entry_imbalance REAL,
+                gross_bps REAL NOT NULL DEFAULT 0,
+                fee_bps REAL NOT NULL DEFAULT 0,
+                funding_bps REAL NOT NULL DEFAULT 0,
+                net_bps REAL NOT NULL DEFAULT 0,
+                pnl_usdc REAL NOT NULL DEFAULT 0,
+                max_net_bps REAL NOT NULL DEFAULT 0,
+                close_reason TEXT,
+                signal_json TEXT
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_leadlag_status ON leadlag_trades(status, asset)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_leadlag_ts ON leadlag_trades(entry_ts, exit_ts)")
 
 
 def save_alt_scan(payload, config, *, db_path=ALT_DB_FILE):
@@ -1414,6 +1448,34 @@ def notify_dingtalk_paper_trade(state, alert_type, trade, row=None, reason=None)
         dingtalk_post(webhook, "\n".join(lines))
     except Exception as exc:
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] dingtalk paper notify failed: {exc}", flush=True)
+
+
+def notify_dingtalk_leadlag(state, alert_type, trade):
+    setting = "notify_leadlag_open" if alert_type == "V2模拟开仓" else "notify_leadlag_close"
+    if not state.config.get(setting, True):
+        return
+    webhook, keyword = dingtalk_channel_config(state.config, "paper")
+    if not webhook:
+        return
+    lines = [
+        f"{keyword} Hyperliquid 联动传播 V2",
+        f"类型：{alert_type}",
+        f"时间：{beijing_time_text()}（北京时间）",
+        f"小币 / 龙头：{trade.get('asset')} / {trade.get('leader')}",
+        f"方向：{'模拟做多小币' if trade.get('side') == 'long' else '模拟做空小币'}",
+        f"单腿金额：{_fmt_plain(trade.get('notional_usdc'), 2, ' U')}",
+        f"跟随缺口：{_fmt_signed(trade.get('lag_bps'), 1, ' bps')} | 扣费预期空间：{_fmt_signed(trade.get('expected_edge_bps'), 1, ' bps')}",
+    ]
+    if alert_type != "V2模拟开仓":
+        lines.append(f"成本后盈亏：{_fmt_signed(trade.get('net_bps'), 1, ' bps')} / {_fmt_signed(trade.get('pnl_usdc'), 4, ' U')}")
+        lines.append(f"平仓原因：{trade.get('close_reason') or '-'}")
+    dash = _dashboard_url(state.config)
+    if dash:
+        lines.append(f"面板：{dash}")
+    try:
+        dingtalk_post(webhook, "\n".join(lines))
+    except Exception as exc:
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] dingtalk leadlag notify failed: {exc}", flush=True)
 
 
 def live_direction_label(action):
@@ -2785,6 +2847,255 @@ def pair_candle_payload(asset, leader, hours=24):
     return rows
 
 
+def leadlag_pair_state(row, l2book, config):
+    """Evaluate whether a leader impulse is propagating into a lagging asset."""
+    asset = str(row.get("asset") or "").upper()
+    leader = str(row.get("leader") or "").upper()
+    asset_motion = l2book.motion(asset)
+    leader_motion = l2book.motion(leader)
+    base = {
+        "asset": asset, "leader": leader, "eligible": False, "reason": "",
+        "corr": float(row.get("corr") or 0), "beta": abs(float(row.get("beta") or 0)),
+    }
+    if not asset_motion or not leader_motion:
+        return {**base, "reason": "等待两边 WS 盘口历史"}
+    needed = ("ret_1s_bps", "ret_3s_bps", "ret_15s_bps")
+    if any(asset_motion.get(key) is None or leader_motion.get(key) is None for key in needed):
+        return {**base, "reason": "正在积累至少 15 秒盘口历史"}
+    if max(float(asset_motion.get("age_ms") or 0), float(leader_motion.get("age_ms") or 0)) > 3000:
+        return {**base, "reason": "盘口数据过旧"}
+    l1, l3, l15 = (float(leader_motion[key]) for key in needed)
+    a1, a3, a15 = (float(asset_motion[key]) for key in needed)
+    beta = max(0.25, min(3.0, base["beta"]))
+    candidates = []
+    threshold_3s = float(config.get("leadlag_leader_3s_bps", 12) or 12)
+    threshold_15s = float(config.get("leadlag_leader_15s_bps", 25) or 25)
+    if abs(l3) >= threshold_3s:
+        direction = 1 if l3 > 0 else -1
+        if direction * l1 >= 0:
+            candidates.append(("3秒", direction, l3, a3, direction * (beta * l3 - a3)))
+    if abs(l15) >= threshold_15s:
+        direction = 1 if l15 > 0 else -1
+        if direction * l3 >= 2:
+            candidates.append(("15秒", direction, l15, a15, direction * (beta * l15 - a15)))
+    if not candidates:
+        return {
+            **base, "reason": "龙头尚未形成同方向快速启动",
+            "leader_1s_bps": l1, "leader_3s_bps": l3, "leader_15s_bps": l15,
+            "asset_1s_bps": a1, "asset_3s_bps": a3, "asset_15s_bps": a15,
+        }
+    window, direction, leader_move, asset_move, lag_bps = max(candidates, key=lambda item: item[4])
+    spread = float(asset_motion.get("spread_bps") or 999)
+    imbalance = float(asset_motion.get("imbalance") or 0)
+    side_size = float((asset_motion.get("ask_size") if direction > 0 else asset_motion.get("bid_size")) or 0)
+    depth_usdc = side_size * float(asset_motion.get("mid") or 0)
+    notional = float(config.get("leadlag_notional_usdc", 20) or 20)
+    depth_multiple = depth_usdc / max(notional, 1e-9)
+    fee_bps = float(config.get("leadlag_fee_bps", 5) or 0)
+    expected_edge = lag_bps - fee_bps - spread * 2
+    out = {
+        **base, "window": window, "direction": direction,
+        "side": "long" if direction > 0 else "short",
+        "leader_move_bps": leader_move, "asset_move_bps": asset_move,
+        "leader_1s_bps": l1, "leader_3s_bps": l3, "leader_15s_bps": l15,
+        "asset_1s_bps": a1, "asset_3s_bps": a3, "asset_15s_bps": a15,
+        "lag_bps": lag_bps, "expected_edge_bps": expected_edge,
+        "spread_bps": spread, "imbalance": imbalance,
+        "depth_usdc": depth_usdc, "depth_multiple": depth_multiple,
+        "entry_px": float((asset_motion.get("ask") if direction > 0 else asset_motion.get("bid")) or 0),
+    }
+    checks = [
+        (base["corr"] >= float(config.get("leadlag_min_corr", 0.75) or 0.75),
+         f"相关 {base['corr']:.3f} 低于门槛"),
+        (lag_bps >= float(config.get("leadlag_min_lag_bps", 15) or 15),
+         f"跟随缺口 {lag_bps:.1f}bps 不足"),
+        (direction * a1 >= 0, "小币 1 秒盘口尚未同向确认"),
+        (direction * imbalance >= float(config.get("leadlag_min_imbalance", 0.05) or 0),
+         f"盘口倾斜 {imbalance:+.2f} 未同向确认"),
+        (spread <= float(config.get("leadlag_max_spread_bps", 1.5) or 1.5),
+         f"点差 {spread:.2f}bps 过大"),
+        (depth_multiple >= float(config.get("leadlag_min_depth_multiple", 5) or 0),
+         f"同向顶层深度只有目标金额 {depth_multiple:.1f} 倍"),
+        (expected_edge >= float(config.get("leadlag_min_edge_bps", 18) or 18),
+         f"扣费预期空间 {expected_edge:.1f}bps 不足"),
+        (out["entry_px"] > 0, "没有可执行入场价"),
+    ]
+    failed = next((reason for passed, reason in checks if not passed), "")
+    out["eligible"] = not failed
+    out["reason"] = failed or f"{window}龙头启动，小币落后且盘口同向"
+    return out
+
+
+def leadlag_trade_metrics(trade, row, l2book, config, now_ts=None):
+    now_ts = float(now_ts or time.time())
+    motion = l2book.motion(trade.get("asset"))
+    if not motion:
+        return None
+    direction = 1 if trade.get("side") == "long" else -1
+    exit_px = float((motion.get("bid") if direction > 0 else motion.get("ask")) or 0)
+    entry_px = float(trade.get("entry_px") or 0)
+    if entry_px <= 0 or exit_px <= 0:
+        return None
+    gross_bps = direction * (exit_px / entry_px - 1) * 10_000
+    hours = max(0.0, now_ts - float(trade.get("entry_ts") or now_ts)) / 3600
+    funding_hourly_bps = float((row or {}).get("funding_hourly") or 0) * 10_000
+    funding_bps = -direction * funding_hourly_bps * hours
+    fee_bps = float(trade.get("fee_bps") or config.get("leadlag_fee_bps", 5) or 0)
+    net_bps = gross_bps - fee_bps + funding_bps
+    return {
+        "exit_px": exit_px, "gross_bps": gross_bps, "fee_bps": fee_bps,
+        "funding_bps": funding_bps, "net_bps": net_bps,
+        "pnl_usdc": float(trade.get("notional_usdc") or 0) * net_bps / 10_000,
+    }
+
+
+def leadlag_close_reason(trade, metrics, leader_motion, config, now_ts=None):
+    now_ts = float(now_ts or time.time())
+    net_bps = float(metrics["net_bps"])
+    max_net = max(float(trade.get("max_net_bps") or 0), net_bps)
+    if net_bps >= float(config.get("leadlag_take_profit_bps", 30) or 30):
+        return "达到单腿止盈"
+    if net_bps <= -abs(float(config.get("leadlag_stop_bps", 18) or 18)):
+        return "触发单腿止损"
+    trail_start = float(config.get("leadlag_trail_start_bps", 15) or 0)
+    trail_gap = float(config.get("leadlag_trail_gap_bps", 10) or 10)
+    if trail_start > 0 and max_net >= trail_start and net_bps <= max_net - trail_gap:
+        return "移动止盈回撤"
+    direction = 1 if trade.get("side") == "long" else -1
+    if leader_motion and leader_motion.get("ret_1s_bps") is not None and direction * float(leader_motion["ret_1s_bps"]) <= -5:
+        return "龙头短线反向"
+    if now_ts - float(trade.get("entry_ts") or now_ts) >= float(config.get("leadlag_max_hold_minutes", 10) or 10) * 60:
+        return "超过最长持仓"
+    return None
+
+
+def load_leadlag_snapshot(db_path=ALT_DB_FILE, limit=200, status=None):
+    init_alt_db(db_path)
+    with sqlite3.connect(db_path) as db:
+        db.row_factory = sqlite3.Row
+        open_rows = [dict(row) for row in db.execute(
+            "SELECT * FROM leadlag_trades WHERE status='open' ORDER BY entry_ts DESC"
+        ).fetchall()]
+        closed_rows = [dict(row) for row in db.execute(
+            "SELECT * FROM leadlag_trades WHERE status='closed' ORDER BY exit_ts DESC LIMIT ?", (int(limit),)
+        ).fetchall()]
+        stats = db.execute("""
+            SELECT COUNT(*) AS trades,
+                   SUM(CASE WHEN pnl_usdc > 0 THEN 1 ELSE 0 END) AS wins,
+                   COALESCE(SUM(pnl_usdc), 0) AS realized,
+                   COALESCE(AVG(net_bps), 0) AS avg_bps,
+                   COALESCE(MIN(net_bps), 0) AS worst_bps,
+                   COALESCE(SUM(notional_usdc * fee_bps / 10000.0), 0) AS estimated_fees
+            FROM leadlag_trades WHERE status='closed'
+        """).fetchone()
+    trades = int(stats["trades"] or 0)
+    wins = int(stats["wins"] or 0)
+    return {
+        "open": open_rows, "closed": closed_rows,
+        "stats": {
+            "trades": trades, "wins": wins, "win_rate": wins / trades if trades else 0,
+            "realized_usdc": float(stats["realized"] or 0),
+            "avg_bps": float(stats["avg_bps"] or 0), "worst_bps": float(stats["worst_bps"] or 0),
+            "estimated_fees_usdc": float(stats["estimated_fees"] or 0),
+        },
+        "status": status or {},
+    }
+
+
+def update_leadlag_strategy(state, rows, now_ts=None):
+    """Run the independent WS lead-lag single-leg paper strategy."""
+    now_ts = float(now_ts or time.time())
+    config = state.config
+    init_alt_db(state.db_path)
+    row_by_pair = {paper_pair_key(row): row for row in rows}
+    signals = [leadlag_pair_state(row, state.l2book, config) for row in rows]
+    signals.sort(key=lambda item: float(item.get("expected_edge_bps") or -999999), reverse=True)
+    opened_now, closed_now = [], []
+    with state.leadlag_lock:
+        with sqlite3.connect(state.db_path) as db:
+            db.row_factory = sqlite3.Row
+            open_trades = [dict(row) for row in db.execute(
+                "SELECT * FROM leadlag_trades WHERE status='open' ORDER BY entry_ts"
+            ).fetchall()]
+            for trade in open_trades:
+                row = row_by_pair.get(f"{trade['asset']}:{trade['leader']}") or {}
+                metrics = leadlag_trade_metrics(trade, row, state.l2book, config, now_ts)
+                if not metrics:
+                    continue
+                max_net = max(float(trade.get("max_net_bps") or 0), float(metrics["net_bps"]))
+                leader_motion = state.l2book.motion(trade.get("leader"))
+                reason = leadlag_close_reason({**trade, "max_net_bps": max_net}, metrics, leader_motion, config, now_ts)
+                if reason:
+                    db.execute("""
+                        UPDATE leadlag_trades SET status='closed', exit_ts=?, exit_px=?, gross_bps=?,
+                            funding_bps=?, net_bps=?, pnl_usdc=?, max_net_bps=?, close_reason=? WHERE id=?
+                    """, (now_ts, metrics["exit_px"], metrics["gross_bps"], metrics["funding_bps"],
+                          metrics["net_bps"], metrics["pnl_usdc"], max_net, reason, trade["id"]))
+                    closed_now.append(({**trade, **metrics, "status": "closed", "exit_ts": now_ts,
+                                        "max_net_bps": max_net, "close_reason": reason}, row))
+                else:
+                    db.execute("""
+                        UPDATE leadlag_trades SET exit_px=?, gross_bps=?, funding_bps=?, net_bps=?,
+                            pnl_usdc=?, max_net_bps=? WHERE id=?
+                    """, (metrics["exit_px"], metrics["gross_bps"], metrics["funding_bps"],
+                          metrics["net_bps"], metrics["pnl_usdc"], max_net, trade["id"]))
+
+            if config.get("leadlag_enabled", True):
+                open_assets = {str(row[0]).upper() for row in db.execute(
+                    "SELECT asset FROM leadlag_trades WHERE status='open'"
+                ).fetchall()}
+                open_count = len(open_assets)
+                max_open = max(0, int(config.get("leadlag_max_open", 3) or 0))
+                cooldown = max(0, int(config.get("leadlag_cooldown_minutes", 20) or 0)) * 60
+                recent = {str(row[0]).upper(): float(row[1] or 0) for row in db.execute("""
+                    SELECT asset, MAX(exit_ts) FROM leadlag_trades WHERE status='closed' GROUP BY asset
+                """).fetchall()}
+                for signal in signals:
+                    if open_count >= max_open:
+                        break
+                    asset = str(signal.get("asset") or "").upper()
+                    if not signal.get("eligible") or not asset or asset in open_assets:
+                        continue
+                    if cooldown and asset in recent and now_ts - recent[asset] < cooldown:
+                        continue
+                    entry_px = float(signal.get("entry_px") or 0)
+                    notional = float(config.get("leadlag_notional_usdc", 20) or 20)
+                    if entry_px <= 0 or notional <= 0:
+                        continue
+                    fee_bps = float(config.get("leadlag_fee_bps", 5) or 0)
+                    cursor = db.execute("""
+                        INSERT INTO leadlag_trades (
+                            status, asset, leader, side, notional_usdc, entry_ts, entry_px, size,
+                            leader_3s_bps, leader_15s_bps, asset_3s_bps, lag_bps, expected_edge_bps,
+                            corr, beta, entry_spread_bps, entry_imbalance, fee_bps, signal_json
+                        ) VALUES ('open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        asset, signal["leader"], signal["side"], notional, now_ts, entry_px,
+                        notional / entry_px, signal.get("leader_3s_bps"), signal.get("leader_15s_bps"),
+                        signal.get("asset_3s_bps"), signal.get("lag_bps"), signal.get("expected_edge_bps"),
+                        signal.get("corr"), signal.get("beta"), signal.get("spread_bps"),
+                        signal.get("imbalance"), fee_bps,
+                        json.dumps({**signal, "funding_hourly": row_by_pair.get(f"{asset}:{signal['leader']}", {}).get("funding_hourly")}, ensure_ascii=False),
+                    ))
+                    opened_now.append({**signal, "id": cursor.lastrowid, "status": "open",
+                                       "entry_ts": now_ts, "entry_px": entry_px,
+                                       "notional_usdc": notional, "fee_bps": fee_bps,
+                                       "size": notional / entry_px})
+                    open_assets.add(asset)
+                    open_count += 1
+        state.leadlag_status.update({
+            "running": True, "last_eval_ts": now_ts, "last_error": None,
+            "signals": signals[:50], "eligible": sum(bool(item.get("eligible")) for item in signals),
+            "opened": int(state.leadlag_status.get("opened") or 0) + len(opened_now),
+            "closed": int(state.leadlag_status.get("closed") or 0) + len(closed_now),
+        })
+    for trade in opened_now:
+        notify_dingtalk_leadlag(state, "V2模拟开仓", trade)
+    for trade, _row in closed_now:
+        notify_dingtalk_leadlag(state, "V2模拟平仓", trade)
+    return load_leadlag_snapshot(state.db_path, status=dict(state.leadlag_status))
+
+
 def env_bool(name, default):
     value = os.environ.get(name)
     if value is None or value == "":
@@ -2981,6 +3292,28 @@ LIVE_CONFIG_FIELDS = {
 }
 
 
+LEADLAG_CONFIG_FIELDS = {
+    "leadlag_enabled": {"env": "LEADLAG_ENABLED", "type": "bool", "label": "V2 模拟策略开关"},
+    "leadlag_notional_usdc": {"env": "LEADLAG_NOTIONAL_USDC", "type": "float", "min": 1, "max": 100_000, "label": "单腿模拟金额 USDC"},
+    "leadlag_max_open": {"env": "LEADLAG_MAX_OPEN", "type": "int", "min": 0, "max": 50, "label": "最多同时持仓"},
+    "leadlag_leader_3s_bps": {"env": "LEADLAG_LEADER_3S_BPS", "type": "float", "min": 1, "max": 1000, "label": "龙头3秒启动 bps"},
+    "leadlag_leader_15s_bps": {"env": "LEADLAG_LEADER_15S_BPS", "type": "float", "min": 1, "max": 5000, "label": "龙头15秒启动 bps"},
+    "leadlag_min_lag_bps": {"env": "LEADLAG_MIN_LAG_BPS", "type": "float", "min": 1, "max": 5000, "label": "最小跟随缺口 bps"},
+    "leadlag_min_corr": {"env": "LEADLAG_MIN_CORR", "type": "float", "min": -1, "max": 1, "label": "最低相关性"},
+    "leadlag_max_spread_bps": {"env": "LEADLAG_MAX_SPREAD_BPS", "type": "float", "min": 0, "max": 100, "label": "最大点差 bps"},
+    "leadlag_min_imbalance": {"env": "LEADLAG_MIN_IMBALANCE", "type": "float", "min": 0, "max": 1, "label": "最小同向盘口倾斜"},
+    "leadlag_min_depth_multiple": {"env": "LEADLAG_MIN_DEPTH_MULTIPLE", "type": "float", "min": 0, "max": 1000, "label": "最小盘口深度倍数"},
+    "leadlag_fee_bps": {"env": "LEADLAG_FEE_BPS", "type": "float", "min": 0, "max": 1000, "label": "单腿往返成本 bps"},
+    "leadlag_min_edge_bps": {"env": "LEADLAG_MIN_EDGE_BPS", "type": "float", "min": 0, "max": 5000, "label": "最低扣费预期空间 bps"},
+    "leadlag_take_profit_bps": {"env": "LEADLAG_TAKE_PROFIT_BPS", "type": "float", "min": 1, "max": 5000, "label": "止盈 bps"},
+    "leadlag_stop_bps": {"env": "LEADLAG_STOP_BPS", "type": "float", "min": 1, "max": 5000, "label": "止损 bps"},
+    "leadlag_trail_start_bps": {"env": "LEADLAG_TRAIL_START_BPS", "type": "float", "min": 0, "max": 5000, "label": "移动止盈启动 bps"},
+    "leadlag_trail_gap_bps": {"env": "LEADLAG_TRAIL_GAP_BPS", "type": "float", "min": 1, "max": 5000, "label": "移动止盈回撤 bps"},
+    "leadlag_max_hold_minutes": {"env": "LEADLAG_MAX_HOLD_MINUTES", "type": "int", "min": 1, "max": 1440, "label": "最长持仓分钟"},
+    "leadlag_cooldown_minutes": {"env": "LEADLAG_COOLDOWN_MINUTES", "type": "int", "min": 0, "max": 10080, "label": "同币冷却分钟"},
+}
+
+
 NOTIFY_CONFIG_FIELDS = {
     "dingtalk_paper_webhook": {"env": "DINGTALK_PAPER_WEBHOOK", "type": "str", "default": "", "label": "模拟/候选 Webhook"},
     "dingtalk_paper_keyword": {"env": "DINGTALK_PAPER_KEYWORD", "type": "str", "default": "小测试", "label": "模拟/候选关键词"},
@@ -2994,6 +3327,8 @@ NOTIFY_CONFIG_FIELDS = {
     "notify_caution": {"env": "NOTIFY_CAUTION", "type": "bool", "default": False, "label": "谨慎风险"},
     "notify_paper_open": {"env": "NOTIFY_PAPER_OPEN", "type": "bool", "default": True, "label": "模拟开仓"},
     "notify_paper_close": {"env": "NOTIFY_PAPER_CLOSE", "type": "bool", "default": True, "label": "模拟平仓"},
+    "notify_leadlag_open": {"env": "NOTIFY_LEADLAG_OPEN", "type": "bool", "default": True, "label": "V2 模拟开仓"},
+    "notify_leadlag_close": {"env": "NOTIFY_LEADLAG_CLOSE", "type": "bool", "default": True, "label": "V2 模拟平仓"},
     "notify_live_test": {"env": "NOTIFY_LIVE_TEST", "type": "bool", "default": True, "label": "真实交易开平仓"},
     "notify_live_open": {"env": "NOTIFY_LIVE_OPEN", "type": "bool", "default": True, "label": "真实开仓"},
     "notify_live_close": {"env": "NOTIFY_LIVE_CLOSE", "type": "bool", "default": True, "label": "真实平仓"},
@@ -3001,6 +3336,37 @@ NOTIFY_CONFIG_FIELDS = {
     "notify_candidate_max_per_scan": {"env": "NOTIFY_CANDIDATE_MAX_PER_SCAN", "type": "int", "default": 1, "min": 0, "max": 50, "label": "每轮候选最多推送数"},
     "notify_candidate_min_z": {"env": "NOTIFY_CANDIDATE_MIN_Z", "type": "float", "default": 3.0, "min": 0, "max": 20, "label": "候选最低 |Z|"},
 }
+
+
+def leadlag_config_public(config):
+    return {key: config.get(key) for key in LEADLAG_CONFIG_FIELDS}
+
+
+def coerce_leadlag_config(raw):
+    updates = {}
+    for key, meta in LEADLAG_CONFIG_FIELDS.items():
+        if key not in raw:
+            continue
+        value = raw[key]
+        if meta["type"] == "bool":
+            parsed = value.strip().lower() not in ("0", "false", "no", "off", "关闭") if isinstance(value, str) else bool(value)
+        elif meta["type"] == "int":
+            parsed = int(value)
+        else:
+            parsed = float(value)
+        if meta["type"] != "bool" and not (meta["min"] <= parsed <= meta["max"]):
+            raise ValueError(f"{meta['label']} 超出允许范围")
+        updates[key] = parsed
+    if not updates:
+        raise ValueError("没有可更新的联动传播 V2 参数")
+    return updates
+
+
+def update_leadlag_env_file(values, env_path=None):
+    update_env_vars({
+        LEADLAG_CONFIG_FIELDS[key]["env"]: 1 if isinstance(value, bool) and value else 0 if isinstance(value, bool) else value
+        for key, value in values.items()
+    }, env_path=env_path)
 
 
 def notify_config_public(config):
@@ -3441,7 +3807,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 </style>
 </head>
 <body>
-<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
+<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openLeadlagDialog()">联动传播 V2</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
 <main>
 <section class="topPanel">
 <h2>模拟盘 / 纸面交易</h2>
@@ -3608,6 +3974,49 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
   <p class="subtle">真实下单总开关即使开启，也只允许策略使用服务器已加密保存的唯一 API 钱包。API 钱包状态在“全局设置”查看。</p>
 </div>
 </dialog>
+<dialog id="leadlagDlg" class="wideDialog">
+<div class="helpHead"><h2>联动传播 V2 / 单腿模拟</h2><button onclick="leadlagDlg.close()">关闭</button></div>
+<div class="helpBody">
+  <div class="grid">
+    <div class="metric"><div class="muted">策略状态</div><div id="llStatus">-</div></div>
+    <div class="metric"><div class="muted">当前持仓</div><div id="llOpen">-</div></div>
+    <div class="metric"><div class="muted">累计成本后收益</div><div id="llPnl">-</div></div>
+    <div class="metric"><div class="muted">胜率 / 次数</div><div id="llWin">-</div></div>
+    <div class="metric"><div class="muted">平均 / 最差</div><div id="llAvgWorst">-</div></div>
+    <div class="metric"><div class="muted">估算手续费</div><div id="llFees">-</div></div>
+    <div class="metric"><div class="muted">当前合格信号</div><div id="llEligible">-</div></div>
+  </div>
+  <p class="scoreMid">V2 当前只做独立单腿模拟，不会发送真实订单，也不会占用旧双腿策略仓位。先收集足够样本，再决定是否开放真实单腿开关。</p>
+  <div class="paperActions"><button onclick="saveLeadlagConfig()">保存 V2 参数</button><button onclick="loadLeadlag()">刷新</button><span id="llSaveStatus" class="subtle">保存需要全局管理口令</span></div>
+  <details class="settingBand" open><summary><b>V2 参数</b></summary>
+    <div class="paperForm">
+      <label>模拟策略开关<select id="cfg_leadlag_enabled"><option value="true">开启</option><option value="false">关闭</option></select></label>
+      <label>每笔单腿金额U<input id="cfg_leadlag_notional_usdc" type="number" step="1"></label>
+      <label>最多持仓<input id="cfg_leadlag_max_open" type="number" step="1"></label>
+      <label>龙头3秒启动bps<input id="cfg_leadlag_leader_3s_bps" type="number" step="1"></label>
+      <label>龙头15秒启动bps<input id="cfg_leadlag_leader_15s_bps" type="number" step="1"></label>
+      <label>最小跟随缺口bps<input id="cfg_leadlag_min_lag_bps" type="number" step="1"></label>
+      <label>最低相关性<input id="cfg_leadlag_min_corr" type="number" step="0.01"></label>
+      <label>最大点差bps<input id="cfg_leadlag_max_spread_bps" type="number" step="0.1"></label>
+      <label>盘口同向倾斜<input id="cfg_leadlag_min_imbalance" type="number" step="0.01"></label>
+      <label>盘口深度倍数<input id="cfg_leadlag_min_depth_multiple" type="number" step="1"></label>
+      <label>单腿往返成本bps<input id="cfg_leadlag_fee_bps" type="number" step="0.1"></label>
+      <label>最低扣费空间bps<input id="cfg_leadlag_min_edge_bps" type="number" step="1"></label>
+      <label>止盈bps<input id="cfg_leadlag_take_profit_bps" type="number" step="1"></label>
+      <label>止损bps<input id="cfg_leadlag_stop_bps" type="number" step="1"></label>
+      <label>移动止盈启动bps<input id="cfg_leadlag_trail_start_bps" type="number" step="1"></label>
+      <label>移动止盈回撤bps<input id="cfg_leadlag_trail_gap_bps" type="number" step="1"></label>
+      <label>最长持仓分钟<input id="cfg_leadlag_max_hold_minutes" type="number" step="1"></label>
+      <label>同币冷却分钟<input id="cfg_leadlag_cooldown_minutes" type="number" step="1"></label>
+    </div>
+  </details>
+  <h3>当前联动信号</h3>
+  <div class="paperTableWrap" style="max-height:320px"><table id="llSignalTbl"><thead><tr><th>结果</th><th>小币/龙头</th><th>方向</th><th>扣费空间</th><th>跟随缺口</th><th>龙头3s/15s</th><th>小币1s/3s</th><th>相关</th><th>点差</th><th>盘口倾斜</th><th>原因</th></tr></thead><tbody></tbody></table></div>
+  <h3>V2 模拟交易</h3>
+  <canvas id="llEquityChart" width="1100" height="220"></canvas>
+  <div class="paperTableWrap" style="max-height:420px"><table id="llTradeTbl"><thead><tr><th>状态</th><th>小币/龙头</th><th>成本后盈亏</th><th>方向</th><th>开仓时间</th><th>平仓时间</th><th>持仓</th><th>入场价</th><th>跟随缺口</th><th>预期空间</th><th>最高浮盈</th><th>原因</th></tr></thead><tbody></tbody></table></div>
+</div>
+</dialog>
 <dialog id="notifyDlg">
 <div class="helpHead"><h2>钉钉推送设置</h2><button onclick="notifyDlg.close()">关闭</button></div>
 <div class="helpBody">
@@ -3771,6 +4180,14 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>保护腿</code>不是必然降低风险。它只能减少 BTC/ETH 大盘方向影响，也会增加一条腿的点差和两次成交手续费。当前历史中保护腿多数时候拖累；但只做小币腿的影子结果也仍然亏，所以现阶段应继续比较，而不是直接切成真实单腿。</p>
 <p><code>现货</code>不能直接替代当前永续策略，因为当小币相对过强时需要做空小币，普通现货没有做空能力。Hyperliquid 虽有现货市场，但当前自动交易代码是永续合约双腿逻辑，不能混用。</p>
 <p><code>资金费套利</code>可以单独研究，例如现货多头配永续空头赚正资金费，但它是另一套持仓周期和风险模型。当前实际资金费接近 0，远小于约 1.8U 的累计手续费，不能用资金费把这套超短线策略救回来。</p>
+
+<h3>联动传播 V2 是什么</h3>
+<p>V2 不再看到 Z 极端就反向交易。它监听 BTC/ETH 的 1 秒、3 秒、15 秒盘口变化：龙头已经快速启动，而相关小币还没有完全跟上，并且小币盘口开始出现同方向力量时，模拟做多或做空小币。</p>
+<p><code>跟随缺口</code>：按历史 beta 推算小币本应移动的幅度，减去小币实际移动幅度。缺口越大，理论补涨/补跌空间越大。</p>
+<p><code>扣费预期空间</code>：跟随缺口减去单腿往返成本和两次盘口点差。只有剩余空间达到门槛才模拟开仓。</p>
+<p><code>盘口同向倾斜</code>：买一和卖一顶层数量的差异。做多时希望买方更强，做空时希望卖方更强；它只是确认条件，不是单独信号。</p>
+<p><code>盘口深度倍数</code>：当前可成交顶层金额是模拟下单金额的多少倍，防止看到信号却交易在太薄的盘口。</p>
+<p>V2 默认单腿、目标空间更大，并使用固定止盈、止损、移动止盈、龙头反向退出和最长持仓；不会因为 Z 回到零自动平仓。当前版本只模拟，不会发送真实订单。</p>
 
 <h3>推送参数怎么读</h3>
 <p><code>候选首次出现</code>：某个币对第一次达到候选条件时推送。</p>
@@ -4591,6 +5008,56 @@ async function runEmergencyClose(){
     loadLive();
   }
 }
+const leadlagConfigKeys=['leadlag_enabled','leadlag_notional_usdc','leadlag_max_open','leadlag_leader_3s_bps','leadlag_leader_15s_bps','leadlag_min_lag_bps','leadlag_min_corr','leadlag_max_spread_bps','leadlag_min_imbalance','leadlag_min_depth_multiple','leadlag_fee_bps','leadlag_min_edge_bps','leadlag_take_profit_bps','leadlag_stop_bps','leadlag_trail_start_bps','leadlag_trail_gap_bps','leadlag_max_hold_minutes','leadlag_cooldown_minutes'];
+function fillLeadlagConfig(cfg){
+  leadlagConfigKeys.forEach(key=>{const el=document.getElementById('cfg_'+key);if(!el||cfg[key]===undefined)return;el.value=key==='leadlag_enabled'?(cfg[key]===true?'true':'false'):cfg[key];});
+}
+function readLeadlagConfig(){
+  const out={};
+  leadlagConfigKeys.forEach(key=>{const el=document.getElementById('cfg_'+key);if(!el)return;if(key==='leadlag_enabled')out[key]=el.value==='true';else if(['leadlag_max_open','leadlag_max_hold_minutes','leadlag_cooldown_minutes'].includes(key))out[key]=parseInt(el.value,10);else out[key]=parseFloat(el.value);});
+  return out;
+}
+function leadlagSideText(side){return side==='long'?'做多小币':'做空小币'}
+function renderLeadlag(data){
+  const cfg=data.config||{},stats=data.stats||{},status=data.status||{},open=data.open||[],closed=data.closed||[];
+  fillLeadlagConfig(cfg);
+  document.getElementById('llStatus').textContent=cfg.leadlag_enabled===false?'已关闭':'模拟运行中';
+  document.getElementById('llOpen').textContent=`${open.length} / 最多 ${cfg.leadlag_max_open??'-'}`;
+  const pnl=Number(stats.realized_usdc||0),pnlEl=document.getElementById('llPnl');pnlEl.textContent=`${fmt(pnl,4)} U`;pnlEl.className=pnl>=0?'scoreGood':'scoreBad';
+  document.getElementById('llWin').textContent=`${fmt(Number(stats.win_rate||0)*100,1)}% / ${stats.trades||0} 笔`;
+  document.getElementById('llAvgWorst').textContent=`${fmt(stats.avg_bps,1)} / ${fmt(stats.worst_bps,1)} bps`;
+  document.getElementById('llFees').textContent=`${fmt(stats.estimated_fees_usdc,4)} U（按配置估算）`;
+  document.getElementById('llEligible').textContent=`${status.eligible||0} 个；累计开 ${status.opened||0} / 平 ${status.closed||0}`+(status.last_error?`；错误 ${status.last_error}`:'');
+  const signalBody=document.querySelector('#llSignalTbl tbody');signalBody.innerHTML='';
+  (status.signals||[]).slice(0,30).forEach(s=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td class="${s.eligible?'passChip':'blockChip'}">${s.eligible?'可模拟':'过滤'}</td><td>${esc(s.asset)} / ${esc(s.leader)}</td><td>${leadlagSideText(s.side)}</td><td>${fmt(s.expected_edge_bps,1)}bps</td><td>${fmt(s.lag_bps,1)}bps</td><td>${fmt(s.leader_3s_bps,1)} / ${fmt(s.leader_15s_bps,1)}</td><td>${fmt(s.asset_1s_bps,1)} / ${fmt(s.asset_3s_bps,1)}</td><td>${fmt(s.corr,3)}</td><td>${fmt(s.spread_bps,2)}bps</td><td>${fmt(s.imbalance,2)}</td><td class="reasonCell">${esc(s.reason||'-')}</td>`;
+    signalBody.appendChild(tr);
+  });
+  if(!(status.signals||[]).length)signalBody.innerHTML='<tr><td colspan="11" class="muted">等待至少 15 秒 WS 盘口历史</td></tr>';
+  const tradeBody=document.querySelector('#llTradeTbl tbody');tradeBody.innerHTML='';
+  const tradeRows=[...open.map(x=>({...x,_status:'持仓'})),...closed.slice(0,100).map(x=>({...x,_status:'已平'}))];
+  tradeRows.forEach(t=>{
+    const tr=document.createElement('tr');const isOpen=t.status==='open';
+    tr.innerHTML=`<td>${t._status}</td><td>${esc(t.asset)} / ${esc(t.leader)}</td><td class="${Number(t.pnl_usdc)>=0?'scoreGood':'scoreBad'}">${fmt(t.net_bps,1)}bps / ${fmt(t.pnl_usdc,4)}U</td><td>${leadlagSideText(t.side)}</td><td>${fmtBeijingDateTime(t.entry_ts)}</td><td>${isOpen?'持仓中':fmtBeijingDateTime(t.exit_ts)}</td><td>${fmtDuration(t.entry_ts,isOpen?null:t.exit_ts)}</td><td>${fmt(t.entry_px,7)}</td><td>${fmt(t.lag_bps,1)}bps</td><td>${fmt(t.expected_edge_bps,1)}bps</td><td>${fmt(t.max_net_bps,1)}bps</td><td class="reasonCell">${esc(t.close_reason||'等待补涨/补跌')}</td>`;
+    tradeBody.appendChild(tr);
+  });
+  if(!tradeRows.length)tradeBody.innerHTML='<tr><td colspan="12" class="muted">尚无 V2 模拟交易</td></tr>';
+  let equity=0;const eq=[...closed].sort((a,b)=>Number(a.exit_ts||0)-Number(b.exit_ts||0)).map((t,i)=>{equity+=Number(t.pnl_usdc||0);return {ts:Number(t.exit_ts||0),equity,trade:i+1}});
+  makeChart('llEquityChart',eq,[{label:'累计U',color:'#2563eb',value:r=>r.equity,digits:4}],{marks:[0],footer:`V2 单腿模拟累计收益：${eq.length} 笔`,reset:true});
+}
+async function loadLeadlag(){
+  const status=document.getElementById('llSaveStatus');if(status)status.textContent='读取中...';
+  try{const r=await fetch('leadlag?limit=200');const data=await r.json();if(!data.ok)throw new Error(data.error||'读取失败');renderLeadlag(data);if(status)status.textContent='已刷新：'+new Date().toLocaleTimeString();}
+  catch(e){if(status)status.textContent='读取失败：'+e.message;}
+}
+function openLeadlagDialog(){leadlagDlg.showModal();loadLeadlag();}
+async function saveLeadlagConfig(){
+  const status=document.getElementById('llSaveStatus'),token=adminTokenValue();if(!token){status.textContent='请先在全局设置填写管理口令';return;}
+  status.textContent='保存中...';
+  try{const r=await fetch('leadlag_config',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Token':token},body:JSON.stringify({config:readLeadlagConfig()})});const data=await r.json();if(!data.ok)throw new Error(data.error||'保存失败');fillLeadlagConfig(data.config||{});status.textContent='已保存，下一次 WS 行情立即生效';loadLeadlag();}
+  catch(e){status.textContent='保存失败：'+e.message;}
+}
 const notifyGroups=[
   ['候选信号提醒',[
     ['notify_candidate_open','候选首次出现：首次达到入场门槛时提醒'],
@@ -4600,7 +5067,9 @@ const notifyGroups=[
   ]],
   ['模拟盘提醒',[
     ['notify_paper_open','模拟开仓：纸面交易建立仓位时提醒'],
-    ['notify_paper_close','模拟平仓：纸面交易出场时提醒']
+    ['notify_paper_close','模拟平仓：纸面交易出场时提醒'],
+    ['notify_leadlag_open','V2模拟开仓：联动传播单腿建立仓位时提醒'],
+    ['notify_leadlag_close','V2模拟平仓：联动传播单腿退出时提醒']
   ]],
   ['真实交易提醒',[
     ['notify_live_open','真实开仓：真实策略建立仓位时提醒'],
@@ -4684,6 +5153,7 @@ loadPaperConfig();
 loadLatest(); setInterval(loadLatest,60000);
 setInterval(()=>{if(liveDlg.open) refreshLiveL2Only();},1000);
 setInterval(()=>{if(liveDlg.open) loadLive(true);},15000);
+setInterval(()=>{if(leadlagDlg.open) loadLeadlag();},3000);
 </script>
 </body></html>"""
 
@@ -4716,6 +5186,7 @@ class L2BookCache:
     def __init__(self, url=HL_WS):
         self.url = url
         self.books = {}
+        self.history = {}
         self.desired = set()
         self.subscribed = set()
         self.lock = threading.Lock()
@@ -4815,6 +5286,9 @@ class L2BookCache:
             }
             with self.lock:
                 self.books[coin] = book
+                history = self.history.setdefault(coin, deque(maxlen=600))
+                if not history or now - history[-1][0] >= 0.10:
+                    history.append((now, book["mid"]))
                 self.last_message_at = now
                 self.revision += 1
                 self.error = ""
@@ -4851,6 +5325,35 @@ class L2BookCache:
             book["server_lag_ms"] = max(0.0, (now - float(book.get("server_time") or now)) * 1000) if book.get("server_time") else None
         return book
 
+    def motion(self, coin, windows=(1, 3, 15)):
+        """Return short-horizon mid-price changes and current top-book imbalance."""
+        coin = str(coin or "").upper()
+        with self.lock:
+            book = dict(self.books.get(coin) or {})
+            history = list(self.history.get(coin) or ())
+        if not book or not history:
+            return None
+        current_ts = float(book.get("received_at") or history[-1][0])
+        current_mid = float(book.get("mid") or 0)
+        if current_mid <= 0:
+            return None
+        out = {"coin": coin, "mid": current_mid, "age_ms": max(0.0, (time.time() - current_ts) * 1000)}
+        for seconds in windows:
+            target = current_ts - float(seconds)
+            reference = next((mid for ts, mid in reversed(history) if ts <= target), None)
+            out[f"ret_{seconds}s_bps"] = ((current_mid / reference - 1) * 10_000
+                                                if reference and reference > 0 else None)
+        bid_size = float(book.get("bid_size") or 0)
+        ask_size = float(book.get("ask_size") or 0)
+        depth = bid_size + ask_size
+        out["imbalance"] = (bid_size - ask_size) / depth if depth > 0 else 0.0
+        out["spread_bps"] = float(book.get("spread_bps") or 0)
+        out["bid"] = float(book.get("bid") or 0)
+        out["ask"] = float(book.get("ask") or 0)
+        out["bid_size"] = bid_size
+        out["ask_size"] = ask_size
+        return out
+
     def snapshot(self, coins=None):
         with self.lock:
             status = {
@@ -4886,9 +5389,14 @@ class AltServerState:
         self.live_leverage_cache = {}
         self.last_live_account_db_save = 0.0
         self.strategy_cycle_lock = threading.Lock()
+        self.leadlag_lock = threading.Lock()
         self.realtime_strategy_status = {
             "running": False, "last_eval_ts": None, "last_event_ts": None,
             "last_error": None, "events": 0, "last_revision": 0,
+        }
+        self.leadlag_status = {
+            "running": False, "last_eval_ts": None, "last_error": None,
+            "eligible": 0, "opened": 0, "closed": 0, "signals": [],
         }
         self.l2book = L2BookCache()
 
@@ -4965,6 +5473,16 @@ def realtime_strategy_loop(state):
                             f"closes={len(payload.get('strategy_closed_keys') or [])}",
                             flush=True,
                         )
+                if should_evaluate and raw_rows:
+                    try:
+                        leadlag_snapshot = update_leadlag_strategy(state, raw_rows, time.time())
+                        with state.lock:
+                            if state.latest:
+                                state.latest["leadlag"] = leadlag_snapshot
+                    except Exception as exc:
+                        with state.leadlag_lock:
+                            state.leadlag_status["last_error"] = str(exc)
+                        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] leadlag strategy failed: {exc}", flush=True)
                 if should_evaluate:
                     last_revision = revision
             except Exception as exc:
@@ -5076,6 +5594,22 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "config": paper_config_public(state.config),
                 "fields": PAPER_CONFIG_FIELDS,
+                "admin_enabled": bool(state.config.get("admin_token")),
+            })
+            return
+        if parsed.path == "/leadlag":
+            limit = int((query.get("limit") or ["200"])[0])
+            with state.leadlag_lock:
+                leadlag_status = dict(state.leadlag_status)
+                leadlag_status["signals"] = list(state.leadlag_status.get("signals") or [])
+            snap = load_leadlag_snapshot(state.db_path, limit, status=leadlag_status)
+            snap["config"] = leadlag_config_public(state.config)
+            json_response(self, {"ok": True, **snap})
+            return
+        if parsed.path == "/leadlag_config":
+            json_response(self, {
+                "ok": True, "config": leadlag_config_public(state.config),
+                "fields": LEADLAG_CONFIG_FIELDS,
                 "admin_enabled": bool(state.config.get("admin_token")),
             })
             return
@@ -5251,7 +5785,7 @@ class AltRequestHandler(BaseHTTPRequestHandler):
             except (json.JSONDecodeError, ValueError, RuntimeError, OSError, KeyError, IndexError, TypeError) as exc:
                 json_response(self, {"ok": False, "error": str(exc)}, status=400)
             return
-        if parsed.path not in ("/paper_config", "/live_config", "/notify_config"):
+        if parsed.path not in ("/paper_config", "/live_config", "/notify_config", "/leadlag_config"):
             json_response(self, {"ok": False, "error": "not found"}, status=404)
             return
         try:
@@ -5265,6 +5799,8 @@ class AltRequestHandler(BaseHTTPRequestHandler):
             raw_config = body.get("config") or body
             if parsed.path == "/live_config":
                 updates = coerce_live_config(raw_config)
+            elif parsed.path == "/leadlag_config":
+                updates = coerce_leadlag_config(raw_config)
             elif parsed.path == "/notify_config":
                 updates = coerce_notify_config(raw_config)
             else:
@@ -5298,6 +5834,9 @@ class AltRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/notify_config":
                 update_notify_env_file(updates)
                 json_response(self, {"ok": True, "config": notify_config_public(state.config)})
+            elif parsed.path == "/leadlag_config":
+                update_leadlag_env_file(updates)
+                json_response(self, {"ok": True, "config": leadlag_config_public(state.config)})
             else:
                 update_env_file(updates)
                 json_response(self, {"ok": True, "config": paper_config_public(state.config)})
@@ -6381,6 +6920,8 @@ def build_server_config(args):
         "notify_caution": env_bool("NOTIFY_CAUTION", False),
         "notify_paper_open": env_bool("NOTIFY_PAPER_OPEN", True),
         "notify_paper_close": env_bool("NOTIFY_PAPER_CLOSE", True),
+        "notify_leadlag_open": env_bool("NOTIFY_LEADLAG_OPEN", True),
+        "notify_leadlag_close": env_bool("NOTIFY_LEADLAG_CLOSE", True),
         "notify_live_test": env_bool("NOTIFY_LIVE_TEST", True),
         "notify_live_open": env_bool("NOTIFY_LIVE_OPEN", True),
         "notify_live_close": env_bool("NOTIFY_LIVE_CLOSE", True),
@@ -6426,6 +6967,24 @@ def build_server_config(args):
         "live_realtime_strategy_interval_ms": env_float("LIVE_REALTIME_STRATEGY_INTERVAL_MS", 500.0),
         "live_require_leverage_ok": env_bool("LIVE_REQUIRE_LEVERAGE_OK", True),
         "live_strategy_enabled": env_bool("LIVE_STRATEGY_ENABLED", False),
+        "leadlag_enabled": env_bool("LEADLAG_ENABLED", True),
+        "leadlag_notional_usdc": env_float("LEADLAG_NOTIONAL_USDC", 20.0),
+        "leadlag_max_open": env_int("LEADLAG_MAX_OPEN", 3),
+        "leadlag_leader_3s_bps": env_float("LEADLAG_LEADER_3S_BPS", 12.0),
+        "leadlag_leader_15s_bps": env_float("LEADLAG_LEADER_15S_BPS", 25.0),
+        "leadlag_min_lag_bps": env_float("LEADLAG_MIN_LAG_BPS", 15.0),
+        "leadlag_min_corr": env_float("LEADLAG_MIN_CORR", 0.75),
+        "leadlag_max_spread_bps": env_float("LEADLAG_MAX_SPREAD_BPS", 1.5),
+        "leadlag_min_imbalance": env_float("LEADLAG_MIN_IMBALANCE", 0.05),
+        "leadlag_min_depth_multiple": env_float("LEADLAG_MIN_DEPTH_MULTIPLE", 5.0),
+        "leadlag_fee_bps": env_float("LEADLAG_FEE_BPS", 5.0),
+        "leadlag_min_edge_bps": env_float("LEADLAG_MIN_EDGE_BPS", 18.0),
+        "leadlag_take_profit_bps": env_float("LEADLAG_TAKE_PROFIT_BPS", 30.0),
+        "leadlag_stop_bps": env_float("LEADLAG_STOP_BPS", 18.0),
+        "leadlag_trail_start_bps": env_float("LEADLAG_TRAIL_START_BPS", 15.0),
+        "leadlag_trail_gap_bps": env_float("LEADLAG_TRAIL_GAP_BPS", 10.0),
+        "leadlag_max_hold_minutes": env_int("LEADLAG_MAX_HOLD_MINUTES", 10),
+        "leadlag_cooldown_minutes": env_int("LEADLAG_COOLDOWN_MINUTES", 20),
     }
 
 
