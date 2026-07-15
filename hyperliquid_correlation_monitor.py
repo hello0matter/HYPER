@@ -1468,7 +1468,9 @@ def load_live_trades_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None,
                 COALESCE(SUM(fee_usdc), 0) AS fees,
                 COALESCE(SUM(funding_usdc), 0) AS funding,
                 COALESCE(SUM(asset_net_pnl_usdc), 0) AS asset_only_net,
-                COALESCE(SUM(hedge_net_pnl_usdc), 0) AS hedge_leg_net
+                COALESCE(SUM(hedge_net_pnl_usdc), 0) AS hedge_leg_net,
+                COALESCE(SUM(total_notional_usdc), 0) AS total_entry_notional,
+                COALESCE(AVG(fee_usdc), 0) AS avg_fee
             FROM live_trades WHERE status = 'closed'
         """).fetchone()
     if current_rows and config:
@@ -1515,6 +1517,8 @@ def load_live_trades_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None,
             "funding_usdc": float(stats["funding"] or 0),
             "asset_only_net_usdc": float(stats["asset_only_net"] or 0),
             "hedge_leg_net_usdc": float(stats["hedge_leg_net"] or 0),
+            "total_entry_notional_usdc": float(stats["total_entry_notional"] or 0),
+            "avg_fee_usdc": float(stats["avg_fee"] or 0),
         },
     }
 
@@ -3461,7 +3465,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 </div>
 </div>
 <div class="paperTableWrap">
-<table id="paperTbl"><thead><tr><th>状态</th><th>币对</th><th>方向</th><th>入场Z</th><th>当前/出场Z</th><th>成本后盈亏</th><th>原因</th></tr></thead><tbody></tbody></table>
+<table id="paperTbl"><thead><tr><th>状态</th><th>币对</th><th>成本后盈亏</th><th>方向</th><th>入场Z</th><th>当前/出场Z</th><th>原因</th></tr></thead><tbody></tbody></table>
 </div>
 </section>
 <section>
@@ -3515,6 +3519,8 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">真实已实现</div><div id="liveRealized">-</div></div>
     <div class="metric"><div class="muted">真实平均 / 最差</div><div id="liveAvgWorst">-</div></div>
     <div class="metric"><div class="muted">官方手续费 / 资金费</div><div id="liveCosts">-</div></div>
+    <div class="metric"><div class="muted">手续费负担</div><div id="liveFeeBurden">-</div></div>
+    <div class="metric"><div class="muted">资金费影响占比</div><div id="liveFundingImpact">-</div></div>
     <div class="metric"><div class="muted">双腿 vs 单腿影子</div><div id="liveHedgeCompare">-</div></div>
     <div class="metric"><div class="muted">l2Book WS 盘口</div><div id="liveL2Status">-</div></div>
     <div class="metric"><div class="muted">本轮真实机会</div><div id="liveOpportunityStatus">-</div></div>
@@ -3575,7 +3581,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
   </div>
   <h3>当前 / 历史真实交易</h3>
   <div class="detailText">持仓显示盘口估算；已平仓显示 Hyperliquid 官方手续费和资金费后的净盈亏。点击任意一行可查看两腿成交价和原始订单回执。</div>
-  <div class="paperTableWrap" style="max-height:440px"><table id="liveTradeTbl"><thead><tr><th>状态</th><th>币对</th><th>方向</th><th>开仓时间</th><th>平仓时间</th><th>持仓时长</th><th>相关</th><th>Beta</th><th>入场Z</th><th>当前/出场Z</th><th>小币15m</th><th>保护15m</th><th>点差</th><th>资金费/小时</th><th>名义金额</th><th>盈亏</th><th>原因</th></tr></thead><tbody></tbody></table></div>
+  <div class="paperTableWrap" style="max-height:440px"><table id="liveTradeTbl"><thead><tr><th>状态</th><th>币对</th><th>净盈亏</th><th>手续费</th><th>资金费</th><th>方向</th><th>开仓时间</th><th>平仓时间</th><th>持仓时长</th><th>相关</th><th>Beta</th><th>入场Z</th><th>当前/出场Z</th><th>小币15m</th><th>保护15m</th><th>点差</th><th>资金费/小时</th><th>名义金额</th><th>原因</th></tr></thead><tbody></tbody></table></div>
   <p id="liveStatsNote" class="subtle">真实统计正在读取 Hyperliquid 官方成交手续费和资金费。</p>
   <h3>为什么这一轮没有交易</h3>
   <div id="liveDiagnosticSummary" class="detailText">读取服务器当前过滤结果中...</div>
@@ -3598,7 +3604,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="paperActions"><input id="emergencyConfirm" placeholder="输入 CLOSE"><button class="dangerBtn" onclick="runEmergencyClose()">紧急全部平仓</button><span id="emergencyStatus" class="subtle">只发送 reduce-only 平仓单，不会主动开反向仓。</span></div>
   </div>
   <h3>真实账户仓位（只读快照）</h3>
-  <div class="tableWrap"><table id="livePosTbl"><thead><tr><th>合约</th><th>方向/数量</th><th>开仓价</th><th>仓位价值</th><th>未实现盈亏</th><th>杠杆</th><th>强平价</th></tr></thead><tbody></tbody></table></div>
+  <div class="tableWrap"><table id="livePosTbl"><thead><tr><th>合约</th><th>未实现盈亏</th><th>方向/数量</th><th>开仓价</th><th>仓位价值</th><th>杠杆</th><th>强平价</th></tr></thead><tbody></tbody></table></div>
   <p class="subtle">真实下单总开关即使开启，也只允许策略使用服务器已加密保存的唯一 API 钱包。API 钱包状态在“全局设置”查看。</p>
 </div>
 </dialog>
@@ -3693,6 +3699,8 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>真实已实现</code>：按 Hyperliquid 官方成交、手续费和实际资金费计算的净盈亏。</p>
 <p><code>真实平均 / 最差</code>：平均每笔 bps 和历史最差单笔。平均长期为正比单看胜率更重要。</p>
 <p><code>官方手续费 / 资金费</code>：手续费是开、平两条腿的真实收费；资金费是持仓期间多空之间的实际收付。</p>
+<p><code>手续费负担</code>：“往返 bps”用累计手续费除以每笔两腿入场名义金额计算，能直接看策略每完成一次开平大约先损失多少；“均每笔”是平均一组双腿交易付了多少 U；亏损时还会显示手续费及资金费成本占净亏损的比例。</p>
+<p><code>资金费影响占比</code>：“资金费/手续费”用来判断资金费是否已经大到需要优先处理；“手续费/|毛收益|”表示手续费相当于价格毛盈亏绝对值的多少。超过 100% 说明手续费比策略自身产生的价格波动收益还大。</p>
 <p><code>双腿 vs 单腿影子</code>：单腿影子是假设历史只做小币腿的比较，不会发送单腿订单。当前历史中保护腿多数拖累，但单腿结果仍然亏，所以暂不开放真实单腿开关。</p>
 <p><code>l2Book WS盘口</code>：WebSocket 是否连接、订阅了多少币、最新消息年龄。</p>
 <p><code>本轮真实机会</code>：目前有多少组合通过基础过滤；通过后仍要检查账户、最低金额、盘口深度和杠杆。</p>
@@ -4129,7 +4137,7 @@ function renderPaper(data){
   rows.forEach(row=>{
     const tr=document.createElement('tr');
     const zNow=row.exit_z ?? row.current_z ?? '-';
-    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${paperActionText(row.action)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td class="${Number(row.pnl_usdc)>=0?'scoreGood':'scoreBad'}">${fmt(row.pnl_bps,1)} bps / ${fmt(row.pnl_usdc,4)}U</td><td style="text-align:left">${row.close_reason||row.plan||''}</td>`;
+    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td class="${Number(row.pnl_usdc)>=0?'scoreGood':'scoreBad'}">${fmt(row.pnl_bps,1)} bps / ${fmt(row.pnl_usdc,4)}U</td><td>${paperActionText(row.action)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td style="text-align:left">${row.close_reason||row.plan||''}</td>`;
     tr.onclick=()=>showPaperTradeDetail(row);
     tb.appendChild(tr);
   });
@@ -4427,6 +4435,13 @@ function renderLive(data){
   const realized=Number(liveStats.realized_usdc||0), avgBps=Number(liveStats.avg_bps||0), worstBps=Number(liveStats.worst_bps||0);
   const gross=Number(liveStats.gross_realized_usdc||0), fees=Number(liveStats.fee_usdc||0), funding=Number(liveStats.funding_usdc||0);
   const assetOnly=Number(liveStats.asset_only_net_usdc||0), hedgeLeg=Number(liveStats.hedge_leg_net_usdc||0);
+  const totalEntryNotional=Number(liveStats.total_entry_notional_usdc||0);
+  const avgFee=Number(liveStats.avg_fee_usdc||0);
+  const feeRoundTripBps=totalEntryNotional>0?fees/totalEntryNotional*10000:0;
+  const feeVsGross=Math.abs(gross)>1e-9?fees/Math.abs(gross)*100:null;
+  const costDrag=fees-funding;
+  const costShareOfLoss=realized<0?costDrag/Math.abs(realized)*100:null;
+  const fundingVsFee=fees>1e-9?Math.abs(funding)/fees*100:null;
   document.getElementById('liveClosedWin').textContent=`${trades} 笔 / ${fmt(winRate,1)}%（赢 ${wins}）`;
   const realizedEl=document.getElementById('liveRealized');
   realizedEl.textContent=`${fmt(realized,4)} U`;
@@ -4435,11 +4450,17 @@ function renderLive(data){
   avgWorstEl.textContent=`${fmt(avgBps,1)} bps / ${fmt(worstBps,1)} bps`;
   avgWorstEl.className=avgBps>=0?'scoreGood':'scoreBad';
   document.getElementById('liveCosts').textContent=`手续费 ${fmt(fees,4)}U；资金费 ${fmt(funding,4)}U`;
+  const feeBurdenEl=document.getElementById('liveFeeBurden');
+  feeBurdenEl.textContent=`往返约 ${fmt(feeRoundTripBps,2)}bps；均每笔 ${fmt(avgFee,4)}U`+(costShareOfLoss===null?'':`；占净亏 ${fmt(costShareOfLoss,1)}%`);
+  feeBurdenEl.className=feeRoundTripBps<=5?'scoreGood':feeRoundTripBps<=10?'scoreMid':'scoreBad';
+  const fundingImpactEl=document.getElementById('liveFundingImpact');
+  fundingImpactEl.textContent=`资金费/手续费 ${fundingVsFee===null?'-':fmt(fundingVsFee,2)+'%'}`+(feeVsGross===null?'':`；手续费/|毛收益| ${fmt(feeVsGross,1)}%`);
+  fundingImpactEl.className=(fundingVsFee??0)<=10?'scoreGood':'scoreMid';
   const hedgeEl=document.getElementById('liveHedgeCompare');
   hedgeEl.textContent=`双腿 ${fmt(realized,4)}U；仅小币影子 ${fmt(assetOnly,4)}U；保护腿 ${fmt(hedgeLeg,4)}U`;
   hedgeEl.className=hedgeLeg>=0?'scoreGood':'scoreBad';
   const note=document.getElementById('liveStatsNote');
-  if(note) note.textContent=`官方成本后统计：${trades} 笔，净胜率 ${fmt(winRate,1)}%，毛收益 ${fmt(gross,4)}U - 手续费 ${fmt(fees,4)}U + 资金费 ${fmt(funding,4)}U = 净收益 ${fmt(realized,4)}U；平均 ${fmt(avgBps,1)}bps，最差 ${fmt(worstBps,1)}bps。单腿影子只用于比较，不会自动下单。`;
+  if(note) note.textContent=`官方成本后统计：${trades} 笔，净胜率 ${fmt(winRate,1)}%，毛收益 ${fmt(gross,4)}U - 手续费 ${fmt(fees,4)}U + 资金费 ${fmt(funding,4)}U = 净收益 ${fmt(realized,4)}U；手续费往返约 ${fmt(feeRoundTripBps,2)}bps，平均 ${fmt(avgBps,1)}bps，最差 ${fmt(worstBps,1)}bps。单腿影子只用于比较，不会自动下单。`;
   if(account.ts && isUnified){
     document.getElementById('liveBlocker').textContent=`当前是 Hyperliquid 统一账户：可用 ${fmt(account.spot_available_usdc??account.spot_usdc,2)} USDC 会直接作为合约保证金来源，不需要也不能手动转入 Perps。`;
   }else if(account.ts && Number(account.account_value||0)<=0 && Number(account.spot_available_usdc ?? account.spot_usdc ?? 0)>0){
@@ -4448,7 +4469,7 @@ function renderLive(data){
   const tb=document.querySelector('#livePosTbl tbody');tb.innerHTML='';
   positions.forEach(p=>{
     const tr=document.createElement('tr');
-    tr.innerHTML=`<td>${p.coin||'-'}</td><td class="${Number(p.size)>=0?'scoreGood':'scoreBad'}">${Number(p.size)>=0?'多 ':'空 '}${fmt(Math.abs(p.size),5)}</td><td>${fmt(p.entry_px,5)}</td><td>${fmt(p.position_value,2)} U</td><td class="${Number(p.unrealized_pnl)>=0?'scoreGood':'scoreBad'}">${fmt(p.unrealized_pnl,2)} U</td><td>${p.leverage??'-'}x</td><td>${p.liquidation_px??'-'}</td>`;
+    tr.innerHTML=`<td>${p.coin||'-'}</td><td class="${Number(p.unrealized_pnl)>=0?'scoreGood':'scoreBad'}">${fmt(p.unrealized_pnl,2)} U</td><td class="${Number(p.size)>=0?'scoreGood':'scoreBad'}">${Number(p.size)>=0?'多 ':'空 '}${fmt(Math.abs(p.size),5)}</td><td>${fmt(p.entry_px,5)}</td><td>${fmt(p.position_value,2)} U</td><td>${p.leverage??'-'}x</td><td>${p.liquidation_px??'-'}</td>`;
     tb.appendChild(tr);
   });
   if(!positions.length)tb.innerHTML='<tr><td colspan="7" class="muted">当前没有读取到真实持仓</td></tr>';
@@ -4477,11 +4498,13 @@ function renderLiveTrades(snapshot){
     const entryTime=fmtBeijingDateTime(row.entry_ts);
     const exitTime=row.status==='open'?'持仓中':fmtBeijingDateTime(row.exit_ts);
     const holdTime=fmtDuration(row.entry_ts,row.status==='open'?null:row.exit_ts);
-    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${liveActionText(row.action)}</td><td>${entryTime}</td><td>${exitTime}</td><td>${holdTime}</td><td>${fmt(corr,3)}</td><td>${fmt(beta,2)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td>${fmt(row.current_asset_15m_bps,1)} bps</td><td>${fmt(row.current_hedge_15m_bps,1)} bps</td><td>${fmt(spread,2)}</td><td>${fmt(fundingBps,3)} bps</td><td>${fmt(row.asset_notional_usdc,1)}U / ${fmt(row.hedge_notional_usdc,1)}U</td><td class="${Number(pnl)>=0?'scoreGood':'scoreBad'}">${row.status==='open'?'盘口估算 ':'官方净收益 '}${fmt(pnlBps,1)} bps / ${fmt(pnl,4)}U</td><td style="text-align:left">${row.close_reason||row.current_plan||row.note||''}</td>`;
+    const feeText=row.status==='open'?'-':fmt(row.fee_usdc,4)+'U';
+    const fundingText=row.status==='open'?'-':fmt(row.funding_usdc,4)+'U';
+    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td class="${Number(pnl)>=0?'scoreGood':'scoreBad'}">${row.status==='open'?'盘口估算 ':'官方净收益 '}${fmt(pnlBps,1)} bps / ${fmt(pnl,4)}U</td><td>${feeText}</td><td class="${Number(row.funding_usdc||0)>=0?'scoreGood':'scoreBad'}">${fundingText}</td><td>${liveActionText(row.action)}</td><td>${entryTime}</td><td>${exitTime}</td><td>${holdTime}</td><td>${fmt(corr,3)}</td><td>${fmt(beta,2)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td>${fmt(row.current_asset_15m_bps,1)} bps</td><td>${fmt(row.current_hedge_15m_bps,1)} bps</td><td>${fmt(spread,2)}</td><td>${fmt(fundingBps,3)} bps</td><td>${fmt(row.asset_notional_usdc,1)}U / ${fmt(row.hedge_notional_usdc,1)}U</td><td style="text-align:left">${row.close_reason||row.current_plan||row.note||''}</td>`;
     tr.onclick=()=>showLiveTradeDetail(row);
     tb.appendChild(tr);
   });
-  if(!rows.length)tb.innerHTML='<tr><td colspan="17" class="muted">还没有真实策略持仓或平仓记录</td></tr>';
+  if(!rows.length)tb.innerHTML='<tr><td colspan="19" class="muted">还没有真实策略持仓或平仓记录</td></tr>';
 }
 function safeJson(value){try{return typeof value==='string'?JSON.parse(value):(value||{});}catch(e){return {parse_error:String(value)}}}
 function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
