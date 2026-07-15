@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,6 +84,43 @@ class LiveStrategySignalTests(unittest.TestCase):
             self.assertEqual(len(closed["open"]), 0)
             self.assertEqual(len(closed["closed"]), 1)
             self.assertEqual(closed["closed"][0]["close_reason"], "偏离回归")
+
+    def test_recent_unchanged_strategy_book_gets_execution_grace(self):
+        class FakeBook:
+            def get_book(self, coin):
+                prices = {"TEST": (10.0, 10.001), "ETH": (2000.0, 2000.1)}
+                bid, ask = prices[coin]
+                return {
+                    "coin": coin, "bid": bid, "ask": ask, "mid": (bid + ask) / 2,
+                    "spread_bps": (ask / bid - 1) * 10_000, "age_ms": 4500,
+                    "bid_size": 1000, "ask_size": 1000,
+                }
+
+            def snapshot(self, _coins=None):
+                return {"status": {"connected": True}, "books": []}
+
+        config = {
+            **self.config,
+            "live_use_l2book": True,
+            "live_l2_max_age_ms": 3000,
+            "live_strategy_entry_grace_ms": 10000,
+            "live_l2_max_spread_bps": 5,
+        }
+        state = SimpleNamespace(config=config, l2book=FakeBook())
+        row = self.row()
+        row["_strategy_l2_check"] = {
+            "checked_at": time.time() - 4,
+            "books": {
+                "TEST": {"bid": 10.0, "ask": 10.001},
+                "ETH": {"bid": 2000.0, "ask": 2000.1},
+            },
+        }
+        blocked, _ = monitor.live_l2book_reject_reason(state, row, 10.5, 10.5)
+        allowed, _ = monitor.live_l2book_reject_reason(
+            state, row, 10.5, 10.5, allow_strategy_grace=True
+        )
+        self.assertIn("数据过旧", blocked)
+        self.assertEqual(allowed, "")
 
 
 if __name__ == "__main__":

@@ -1563,20 +1563,35 @@ def l2book_subscription_coins(rows, open_trades=None, leaders=None, limit=80):
     return {coin for coin in coins if coin}
 
 
-def live_l2book_reject_reason(state, row, asset_notional, hedge_notional):
+def live_l2book_reject_reason(state, row, asset_notional, hedge_notional, *, allow_strategy_grace=False):
     config = state.config
     if not config.get("live_use_l2book", True):
         return "", {}
     max_age_ms = float(config.get("live_l2_max_age_ms", 3000) or 3000)
+    grace_ms = float(config.get("live_strategy_entry_grace_ms", 10_000) or 0)
     max_spread_bps = float(config.get("live_l2_max_spread_bps", config.get("live_max_entry_spread_bps", 2.5)) or 2.5)
+    strategy_check = row.get("_strategy_l2_check") or {}
+    checked_at = float(strategy_check.get("checked_at") or 0)
+    checked_books = strategy_check.get("books") or {}
+    ws_connected = bool(state.l2book.snapshot(["__STATUS_ONLY__"]).get("status", {}).get("connected"))
     books = {}
     for coin, notional in ((row["asset"], asset_notional), (row["leader"], hedge_notional)):
         book = state.l2book.get_book(coin)
         books[coin] = book
         if not book:
             return f"l2Book 未收到 {coin} 盘口，跳过真实开仓", books
-        if float(book.get("age_ms") or 999999) > max_age_ms:
-            return f"{coin} l2Book 数据过旧 {float(book.get('age_ms') or 0):.0f}ms > {max_age_ms:.0f}ms", books
+        age_ms = float(book.get("age_ms") or 999999)
+        if age_ms > max_age_ms:
+            accepted = checked_books.get(coin) or {}
+            elapsed_ms = max(0.0, (time.time() - checked_at) * 1000) if checked_at else 999999.0
+            same_top = (
+                accepted
+                and float(accepted.get("bid") or 0) == float(book.get("bid") or 0)
+                and float(accepted.get("ask") or 0) == float(book.get("ask") or 0)
+            )
+            grace_ok = allow_strategy_grace and ws_connected and same_top and elapsed_ms <= grace_ms
+            if not grace_ok:
+                return f"{coin} l2Book 数据过旧 {age_ms:.0f}ms > {max_age_ms:.0f}ms", books
         if float(book.get("spread_bps") or 999999) > max_spread_bps:
             return f"{coin} 实时盘口点差 {float(book.get('spread_bps') or 0):.2f}bps > {max_spread_bps:.2f}bps", books
         mid = float(book.get("mid") or 0)
@@ -1597,7 +1612,9 @@ def open_live_strategy_trade(state, row, scan_id):
         row, config.get("live_notional_usdc", 10.0), available,
         auto_min_notional=bool(config.get("live_auto_min_notional", False)),
     )
-    l2_reject, l2_books = live_l2book_reject_reason(state, row, asset_notional, hedge_notional)
+    l2_reject, l2_books = live_l2book_reject_reason(
+        state, row, asset_notional, hedge_notional, allow_strategy_grace=True,
+    )
     if l2_reject:
         raise RuntimeError(l2_reject)
     exchange = _live_sdk_exchange(config)
@@ -1941,7 +1958,15 @@ def shared_strategy_l2_reject_reason(state, row):
         )
     except (ValueError, RuntimeError, TypeError) as exc:
         return str(exc)
-    reason, _books = live_l2book_reject_reason(state, row, asset_notional, hedge_notional)
+    reason, books = live_l2book_reject_reason(state, row, asset_notional, hedge_notional)
+    if not reason:
+        row["_strategy_l2_check"] = {
+            "checked_at": time.time(),
+            "books": {
+                coin: {key: book.get(key) for key in ("bid", "ask", "mid", "spread_bps", "age_ms")}
+                for coin, book in books.items()
+            },
+        }
     return reason
 
 
@@ -2380,6 +2405,7 @@ LIVE_CONFIG_FIELDS = {
     "live_min_expected_edge_bps": {"env": "LIVE_MIN_EXPECTED_EDGE_BPS", "type": "float", "min": -1000, "max": 10000, "label": "实盘最低预期边际 bps"},
     "live_use_l2book": {"env": "LIVE_USE_L2BOOK", "type": "bool", "label": "真实开仓使用 l2Book 盘口校验"},
     "live_l2_max_age_ms": {"env": "LIVE_L2_MAX_AGE_MS", "type": "float", "min": 100, "max": 60_000, "label": "l2Book 最大延迟 ms"},
+    "live_strategy_entry_grace_ms": {"env": "LIVE_STRATEGY_ENTRY_GRACE_MS", "type": "float", "min": 0, "max": 60_000, "label": "统一信号真实执行宽限 ms"},
     "live_l2_max_spread_bps": {"env": "LIVE_L2_MAX_SPREAD_BPS", "type": "float", "min": 0, "max": 100, "label": "l2Book 最大点差 bps"},
     "live_l2_subscribe_limit": {"env": "LIVE_L2_SUBSCRIBE_LIMIT", "type": "int", "min": 2, "max": 1000, "label": "WS订阅数量"},
     "live_use_realtime_z": {"env": "LIVE_USE_REALTIME_Z", "type": "bool", "label": "使用 l2Book 实时近似 Z"},
@@ -2962,6 +2988,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <label>统一最低预期边际bps<input id="cfg_live_min_expected_edge_bps" type="number" step="1"></label>
     <label>l2Book盘口校验<select id="cfg_live_use_l2book"><option value="true">开启（默认）</option><option value="false">关闭</option></select></label>
     <label>l2Book最大延迟ms<input id="cfg_live_l2_max_age_ms" type="number" min="100" max="60000" step="100"></label>
+    <label>统一信号执行宽限ms<input id="cfg_live_strategy_entry_grace_ms" type="number" min="0" max="60000" step="100"></label>
     <label>l2Book最大点差bps<input id="cfg_live_l2_max_spread_bps" type="number" min="0" max="100" step="0.1"></label>
     <label>WS订阅数量<input id="cfg_live_l2_subscribe_limit" type="number" min="2" max="1000" step="1"></label>
     <label>WS实时Z<select id="cfg_live_use_realtime_z"><option value="true">开启（默认）</option><option value="false">关闭</option></select></label>
@@ -3098,6 +3125,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>实盘最低预期边际</code>：用 Z 回归空间减去估算成本后的粗略安全垫，默认 25 bps。</p>
 <p><code>l2Book盘口校验</code>：开仓前检查实时买一/卖一、点差、数据年龄、盘口深度。不合格就跳过真实下单。</p>
 <p><code>l2Book最大延迟ms</code>：盘口数据允许多旧。3000ms 表示超过 3 秒没更新就不拿来开仓。</p>
+<p><code>统一信号执行宽限ms</code>：模拟策略已经在 3000ms 门槛内确认过盘口后，真实执行还要读取账户，可能多花几秒。默认宽限 10000ms；只有 WS 仍连接、买一卖一与刚才完全相同、点差和深度仍合格时才允许继续，不是无条件放宽旧盘口。</p>
 <p><code>l2Book最大点差bps</code>：实时盘口点差上限。超过这个值说明进出场成本太高，跳过。</p>
 <p><code>WS订阅数量</code>：服务器实时监听多少个重点币盘口。不是模拟扫描数量；模拟可以扫 150+，WS 默认只盯前 80 个重点币加 BTC/ETH。</p>
 <p><code>WS实时Z</code>：用最近一次历史K线计算出的 beta/均值/波动率作为基准，再用 l2Book 最新 mid 估算当前偏离。它适合开仓前/平仓前快速确认，但不是完整历史回测。</p>
@@ -3620,7 +3648,7 @@ async function savePaperConfig(){
     document.getElementById('pSaveStatus').textContent='保存失败：'+e;
   }
 }
-const liveConfigKeys=['live_enabled','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_max_entry_spread_bps','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_l2_max_spread_bps','live_l2_subscribe_limit','live_use_realtime_z','live_strategy_enabled'];
+const liveConfigKeys=['live_enabled','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_max_entry_spread_bps','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_strategy_entry_grace_ms','live_l2_max_spread_bps','live_l2_subscribe_limit','live_use_realtime_z','live_strategy_enabled'];
 function liveCfgEl(key){return document.getElementById('cfg_'+key)}
 const liveRiskPresets={
   conservative:{live_min_entry_z:3.0,live_min_corr:0.75,live_max_entry_spread_bps:2.5,live_min_expected_edge_bps:25,live_l2_max_spread_bps:2.5},
@@ -3673,6 +3701,7 @@ function readLiveConfig(){
     live_min_expected_edge_bps:parseFloat(liveCfgEl('live_min_expected_edge_bps').value),
     live_use_l2book:liveCfgEl('live_use_l2book').value==='true',
     live_l2_max_age_ms:parseFloat(liveCfgEl('live_l2_max_age_ms').value),
+    live_strategy_entry_grace_ms:parseFloat(liveCfgEl('live_strategy_entry_grace_ms').value),
     live_l2_max_spread_bps:parseFloat(liveCfgEl('live_l2_max_spread_bps').value),
     live_l2_subscribe_limit:parseInt(liveCfgEl('live_l2_subscribe_limit').value,10),
     live_use_realtime_z:liveCfgEl('live_use_realtime_z').value==='true',
@@ -5734,6 +5763,7 @@ def build_server_config(args):
         "live_min_expected_edge_bps": env_float("LIVE_MIN_EXPECTED_EDGE_BPS", 25.0),
         "live_use_l2book": env_bool("LIVE_USE_L2BOOK", True),
         "live_l2_max_age_ms": env_float("LIVE_L2_MAX_AGE_MS", 3000.0),
+        "live_strategy_entry_grace_ms": env_float("LIVE_STRATEGY_ENTRY_GRACE_MS", 10_000.0),
         "live_l2_max_spread_bps": env_float("LIVE_L2_MAX_SPREAD_BPS", 2.5),
         "live_l2_subscribe_limit": env_int("LIVE_L2_SUBSCRIBE_LIMIT", 80),
         "live_use_realtime_z": env_bool("LIVE_USE_REALTIME_Z", True),
