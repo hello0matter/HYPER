@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -74,10 +75,13 @@ class LiveStrategySignalTests(unittest.TestCase):
             monitor.init_alt_db(db_path)
             state = SimpleNamespace(config=config, db_path=db_path, l2book=None)
             payload = {"ts": 1000.0, "rows": [self.row()]}
-            opened = monitor.update_shared_strategy_paper(state, payload, 1)
+            cycle = monitor.prepare_shared_strategy_cycle(state, payload, 1)
+            before = monitor.load_paper_snapshot(db_path, config=config)
+            self.assertEqual(len(before["open"]), 0)
+            self.assertEqual(len(payload["strategy_open_rows"]), 1)
+            opened = monitor.finalize_shared_strategy_cycle(state, payload, 1, cycle)
             self.assertEqual(len(opened["open"]), 1)
             self.assertEqual(opened["open"][0]["mode"], "shared_strategy")
-            self.assertEqual(len(payload["strategy_open_rows"]), 1)
 
             payload = {"ts": 1060.0, "rows": [self.row(zscore=0.2)]}
             closed = monitor.update_shared_strategy_paper(state, payload, 2)
@@ -121,6 +125,25 @@ class LiveStrategySignalTests(unittest.TestCase):
         )
         self.assertIn("数据过旧", blocked)
         self.assertEqual(allowed, "")
+
+    def test_execution_pipeline_requires_safe_preflight_order(self):
+        fast = monitor.parse_live_execution_steps(
+            "cached_account,prepare_leverage,final_l2,submit_real,record_paper,refresh_account_async"
+        )
+        self.assertLess(fast.index("submit_real"), fast.index("record_paper"))
+        with self.assertRaises(ValueError):
+            monitor.parse_live_execution_steps(
+                ["submit_real", "final_l2", "record_paper"]
+            )
+
+    def test_cached_account_is_read_without_network(self):
+        state = SimpleNamespace(
+            lock=threading.Lock(),
+            live_account={"ts": time.time(), "spot_available_usdc": 50.0},
+        )
+        account, age_ms = monitor.cached_live_account(state, max_age_ms=1000)
+        self.assertEqual(account["spot_available_usdc"], 50.0)
+        self.assertLess(age_ms, 1000)
 
 
 if __name__ == "__main__":

@@ -77,6 +77,15 @@ DEFAULT_ALT_LEADERS = "BTC, ETH"
 DEFAULT_ALT_ASSETS = "ALL"
 DEFAULT_PAPER_NOTIONAL = 1000.0
 LIVE_MIN_ORDER_USDC = 10.50
+LIVE_EXECUTION_STEP_IDS = (
+    "cached_account", "fresh_account", "prepare_leverage", "final_l2",
+    "submit_real", "record_paper", "refresh_account_async",
+)
+LIVE_EXECUTION_PRESETS = {
+    "fast": ["cached_account", "prepare_leverage", "final_l2", "submit_real", "record_paper", "refresh_account_async"],
+    "balanced": ["cached_account", "prepare_leverage", "final_l2", "submit_real", "record_paper", "refresh_account_async"],
+    "strict": ["fresh_account", "prepare_leverage", "final_l2", "submit_real", "record_paper", "refresh_account_async"],
+}
 
 
 def base_asset(symbol):
@@ -720,14 +729,25 @@ def save_alt_scan(payload, config, *, db_path=ALT_DB_FILE):
     return scan_id
 
 
-def fetch_live_account_snapshot(account_address):
+def fetch_live_account_snapshot(account_address, account_mode_hint=None):
     """Public/read-only account view. It never needs an API private key."""
     if not valid_evm_address(account_address):
         raise ValueError("未配置有效的主钱包公开地址")
-    raw = get_json(HL_INFO, payload={"type": "clearinghouseState", "user": account_address}, timeout=12)
-    spot_raw = get_json(HL_INFO, payload={"type": "spotClearinghouseState", "user": account_address}, timeout=12)
-    account_mode = get_json(HL_INFO, payload={"type": "userAbstraction", "user": account_address}, timeout=12)
-    account_mode = str(account_mode or "standard")
+    requests = {
+        "perps": {"type": "clearinghouseState", "user": account_address},
+        "spot": {"type": "spotClearinghouseState", "user": account_address},
+    }
+    if not account_mode_hint:
+        requests["mode"] = {"type": "userAbstraction", "user": account_address}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(requests)) as pool:
+        futures = {
+            key: pool.submit(get_json, HL_INFO, payload=body, timeout=12)
+            for key, body in requests.items()
+        }
+        results = {key: future.result() for key, future in futures.items()}
+    raw = results["perps"]
+    spot_raw = results["spot"]
+    account_mode = str(account_mode_hint or results.get("mode") or "standard")
     margin = raw.get("marginSummary") or {}
     spot_usdc = 0.0
     spot_available_usdc = 0.0
@@ -1365,6 +1385,119 @@ def _live_apply_leverage(exchange, coins, leverage):
     return results
 
 
+def live_execution_steps(config):
+    raw = config.get("live_execution_steps")
+    if isinstance(raw, str):
+        steps = [item.strip() for item in raw.split(",") if item.strip()]
+    else:
+        steps = list(raw or [])
+    steps = [item for item in steps if item in LIVE_EXECUTION_STEP_IDS]
+    if not steps:
+        style = str(config.get("live_execution_style") or "fast")
+        steps = list(LIVE_EXECUTION_PRESETS.get(style, LIVE_EXECUTION_PRESETS["fast"]))
+    for required in ("submit_real", "record_paper"):
+        if required not in steps:
+            steps.append(required)
+    return steps
+
+
+def parse_live_execution_steps(value):
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, (list, tuple)):
+        items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        raise ValueError("真实执行步骤必须是列表或逗号分隔文本")
+    unknown = [item for item in items if item not in LIVE_EXECUTION_STEP_IDS]
+    if unknown:
+        raise ValueError("未知真实执行步骤：" + ", ".join(unknown))
+    deduped = list(dict.fromkeys(items))
+    for required in ("submit_real", "record_paper"):
+        if required not in deduped:
+            raise ValueError(f"真实执行步骤不能删除 {required}")
+    submit_index = deduped.index("submit_real")
+    preflight = {"cached_account", "fresh_account", "prepare_leverage", "final_l2"}
+    misplaced = [step for step in preflight if step in deduped and deduped.index(step) > submit_index]
+    if misplaced:
+        raise ValueError("这些下单前检查不能放到真实IOC之后：" + ", ".join(misplaced))
+    if "refresh_account_async" in deduped and deduped.index("refresh_account_async") < submit_index:
+        raise ValueError("下单后后台刷新账户必须放在真实IOC之后")
+    return deduped
+
+
+def cached_live_account(state, *, max_age_ms=None):
+    with state.lock:
+        account = dict(state.live_account) if state.live_account else None
+    if not account:
+        return None, None
+    age_ms = max(0.0, (time.time() - float(account.get("ts") or 0)) * 1000)
+    if max_age_ms is not None and age_ms > float(max_age_ms):
+        return None, age_ms
+    return account, age_ms
+
+
+def refresh_live_account_cache(state):
+    address = state.config.get("live_account_address")
+    if not valid_evm_address(address):
+        return None
+    with state.lock:
+        mode_hint = (state.live_account or {}).get("account_mode")
+    snapshot = fetch_live_account_snapshot(address, account_mode_hint=mode_hint)
+    should_save = time.time() - float(getattr(state, "last_live_account_db_save", 0) or 0) >= 30
+    if should_save:
+        save_live_account_snapshot(snapshot, state.db_path)
+    with state.lock:
+        state.live_account, state.live_error = snapshot, None
+        if should_save:
+            state.last_live_account_db_save = time.time()
+    return snapshot
+
+
+def refresh_live_account_cache_async(state):
+    def work():
+        try:
+            refresh_live_account_cache(state)
+        except Exception as exc:
+            with state.lock:
+                state.live_error = str(exc)
+    threading.Thread(target=work, daemon=True).start()
+
+
+def live_account_cache_loop(state):
+    while state.running:
+        if valid_evm_address(state.config.get("live_account_address")):
+            try:
+                refresh_live_account_cache(state)
+            except Exception as exc:
+                with state.lock:
+                    state.live_error = str(exc)
+        interval = max(1.0, float(state.config.get("live_account_poll_seconds", 5.0) or 5.0))
+        wait_started = time.time()
+        while state.running and time.time() - wait_started < interval:
+            time.sleep(0.2)
+
+
+def live_prepare_leverage(state, exchange, coins, leverage):
+    ttl = max(0.0, float(state.config.get("live_leverage_cache_seconds", 86_400) or 0))
+    now = time.time()
+    results, missing = {}, []
+    with state.lock:
+        for coin in sorted({str(item).upper() for item in coins if item}):
+            cached = state.live_leverage_cache.get((coin, int(leverage)))
+            if cached and now - float(cached.get("ts") or 0) <= ttl:
+                results[coin] = {"status": "ok", "cached": True, "raw": cached.get("raw")}
+            else:
+                missing.append(coin)
+    if missing:
+        fresh = _live_apply_leverage(exchange, missing, leverage)
+        results.update(fresh)
+        with state.lock:
+            for coin, result in fresh.items():
+                if isinstance(result, dict) and result.get("status") == "ok":
+                    state.live_leverage_cache[(coin, int(leverage))] = {"ts": now, "raw": result}
+    return results
+
+
 def apply_live_leverage_to_current_positions(config):
     if not config.get("live_enabled") or not live_config_public(config).get("execution_ready"):
         return {}
@@ -1606,42 +1739,87 @@ def live_l2book_reject_reason(state, row, asset_notional, hedge_notional, *, all
 
 def open_live_strategy_trade(state, row, scan_id):
     config = state.config
-    account = fetch_live_account_snapshot(config["live_account_address"])
-    available = float(account.get("spot_available_usdc") or 0) if account.get("account_mode") == "unifiedAccount" else float(account.get("account_value") or 0)
-    asset_notional, hedge_notional = _live_sized_notionals(
-        row, config.get("live_notional_usdc", 10.0), available,
-        auto_min_notional=bool(config.get("live_auto_min_notional", False)),
-    )
-    l2_reject, l2_books = live_l2book_reject_reason(
-        state, row, asset_notional, hedge_notional, allow_strategy_grace=True,
-    )
-    if l2_reject:
-        raise RuntimeError(l2_reject)
-    exchange = _live_sdk_exchange(config)
+    steps = live_execution_steps(config)
+    style = str(config.get("live_execution_style") or "fast")
+    account = None
+    account_age_ms = None
+    asset_notional = hedge_notional = None
+    exchange = None
+    leverage_result = {}
+    l2_books = {}
+    response = None
+    execution_timing = []
     asset_buy = row["action"] == "long_asset_short_hedge"
     hedge_buy = not asset_buy
     slippage = float(config.get("live_max_slippage_bps", 15))
     target_leverage = _live_target_leverage(config)
-    leverage_result = _live_apply_leverage(exchange, [row["asset"], row["leader"]], target_leverage)
-    if bool(config.get("live_require_leverage_ok", True)) and target_leverage > 1:
-        failed_leverage = {
-            coin: result for coin, result in leverage_result.items()
-            if not (isinstance(result, dict) and result.get("status") == "ok")
-        }
-        if failed_leverage:
-            raise RuntimeError(f"杠杆设置失败，已跳过真实开仓：目标 {target_leverage}x；失败 {failed_leverage}")
-    asset_px = None
-    hedge_px = None
-    if l2_books:
-        asset_book = l2_books.get(row["asset"]) or {}
-        hedge_book = l2_books.get(row["leader"]) or {}
-        asset_px = asset_book.get("ask") if asset_buy else asset_book.get("bid")
-        hedge_px = hedge_book.get("ask") if hedge_buy else hedge_book.get("bid")
-    orders = [
-        _live_ioc_order(exchange, row["asset"], asset_buy, asset_notional, slippage, min_notional_usdc=LIVE_MIN_ORDER_USDC, px_override=asset_px),
-        _live_ioc_order(exchange, row["leader"], hedge_buy, hedge_notional, slippage, min_notional_usdc=LIVE_MIN_ORDER_USDC, px_override=hedge_px),
-    ]
-    response = exchange.bulk_orders(orders)
+    orders = None
+
+    def ensure_notionals():
+        nonlocal asset_notional, hedge_notional
+        if asset_notional is not None:
+            return
+        available = 0.0
+        if account:
+            available = (float(account.get("spot_available_usdc") or 0)
+                         if account.get("account_mode") == "unifiedAccount"
+                         else float(account.get("account_value") or 0))
+        asset_notional, hedge_notional = _live_sized_notionals(
+            row, config.get("live_notional_usdc", 10.0), available,
+            auto_min_notional=bool(config.get("live_auto_min_notional", False)),
+        )
+
+    for step in steps:
+        step_started = time.perf_counter()
+        if step == "cached_account":
+            max_age = float(config.get("live_account_cache_max_age_ms", 15_000) or 15_000)
+            account, account_age_ms = cached_live_account(state, max_age_ms=max_age)
+            if not account:
+                raise RuntimeError(f"后台账户缓存不可用或过旧（约 {float(account_age_ms or 0):.0f}ms），极速流程不进行同步HTTP查询")
+        elif step == "fresh_account":
+            account = refresh_live_account_cache(state)
+            account_age_ms = 0.0
+        elif step == "prepare_leverage":
+            exchange = exchange or _live_sdk_exchange(config)
+            leverage_result = live_prepare_leverage(
+                state, exchange, [row["asset"], row["leader"]], target_leverage,
+            )
+            if bool(config.get("live_require_leverage_ok", True)):
+                failed_leverage = {
+                    coin: result for coin, result in leverage_result.items()
+                    if not (isinstance(result, dict) and result.get("status") == "ok")
+                }
+                if failed_leverage:
+                    raise RuntimeError(f"杠杆设置失败，已跳过真实开仓：目标 {target_leverage}x；失败 {failed_leverage}")
+        elif step == "final_l2":
+            ensure_notionals()
+            l2_reject, l2_books = live_l2book_reject_reason(
+                state, row, asset_notional, hedge_notional, allow_strategy_grace=True,
+            )
+            if l2_reject:
+                raise RuntimeError(l2_reject)
+        elif step == "submit_real":
+            ensure_notionals()
+            exchange = exchange or _live_sdk_exchange(config)
+            if not l2_books:
+                l2_books = {
+                    row["asset"]: state.l2book.get_book(row["asset"]),
+                    row["leader"]: state.l2book.get_book(row["leader"]),
+                }
+            asset_book = l2_books.get(row["asset"]) or {}
+            hedge_book = l2_books.get(row["leader"]) or {}
+            asset_px = asset_book.get("ask") if asset_buy else asset_book.get("bid")
+            hedge_px = hedge_book.get("ask") if hedge_buy else hedge_book.get("bid")
+            orders = [
+                _live_ioc_order(exchange, row["asset"], asset_buy, asset_notional, slippage, min_notional_usdc=LIVE_MIN_ORDER_USDC, px_override=asset_px),
+                _live_ioc_order(exchange, row["leader"], hedge_buy, hedge_notional, slippage, min_notional_usdc=LIVE_MIN_ORDER_USDC, px_override=hedge_px),
+            ]
+            response = exchange.bulk_orders(orders)
+        elif step == "refresh_account_async":
+            refresh_live_account_cache_async(state)
+        execution_timing.append({"step": step, "ms": (time.perf_counter() - step_started) * 1000})
+    if response is None or orders is None:
+        raise RuntimeError("真实执行流程缺少“发送真实IOC订单”步骤")
     fills = _live_fills_from_response(response, [row["asset"], row["leader"]])
     if not all(item["filled"] and item["size"] > 0 for item in fills.values()):
         emergency = []
@@ -1679,8 +1857,15 @@ def open_live_strategy_trade(state, row, scan_id):
         "entry_z": row["zscore"], "entry_corr": row["corr"], "entry_spread_bps": row.get("spread_bps"),
         "asset_size": fills[row["asset"]]["size"], "hedge_size": fills[row["leader"]]["size"],
         "asset_entry_px": fills[row["asset"]]["price"], "hedge_entry_px": fills[row["leader"]]["price"],
-        "entry_json": json.dumps({"response": response, "fills": fills, "leverage_result": leverage_result, "l2_books": l2_books}, ensure_ascii=False),
-        "opened_scan_id": scan_id, "note": f"{row.get('plan', '')}；目标杠杆 {target_leverage}x；入场预期边际 {live_expected_edge_bps(row, config):.1f}bps；l2Book校验通过",
+        "entry_json": json.dumps({
+            "response": response, "fills": fills, "leverage_result": leverage_result,
+            "l2_books": l2_books, "execution_style": style, "execution_steps": steps,
+            "execution_timing": execution_timing, "account_cache_age_ms": account_age_ms,
+        }, ensure_ascii=False),
+        "opened_scan_id": scan_id,
+        "note": (f"{row.get('plan', '')}；目标杠杆 {target_leverage}x；入场预期边际 "
+                 f"{live_expected_edge_bps(row, config):.1f}bps；执行风格 {style}；流程耗时 "
+                 f"{sum(item['ms'] for item in execution_timing):.0f}ms"),
     }
     with sqlite3.connect(state.db_path) as db:
         cursor = db.execute("""
@@ -1895,7 +2080,20 @@ def update_live_trading(state, payload, scan_id):
             flush=True,
         )
         return load_live_trades_snapshot(state.db_path, current_rows=rows, config=config)
-    account = fetch_live_account_snapshot(config["live_account_address"])
+    execution_steps = live_execution_steps(config)
+    if "cached_account" in execution_steps or "fresh_account" in execution_steps:
+        account, account_age_ms = cached_live_account(
+            state, max_age_ms=float(config.get("live_account_cache_max_age_ms", 15_000) or 15_000),
+        )
+        if not account:
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] live open skipped: "
+                f"background account cache unavailable/stale ({float(account_age_ms or 0):.0f}ms)",
+                flush=True,
+            )
+            return load_live_trades_snapshot(state.db_path, current_rows=rows, config=config)
+    else:
+        account = {"positions": []}
     external_positions = account.get("positions") or []
     if external_positions and not open_trades:
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] live open skipped: account has positions not tracked by live_trades", flush=True)
@@ -1970,8 +2168,8 @@ def shared_strategy_l2_reject_reason(state, row):
     return reason
 
 
-def update_shared_strategy_paper(state, payload, scan_id):
-    """Run one canonical strategy continuously; real execution follows its events."""
+def prepare_shared_strategy_cycle(state, payload, scan_id):
+    """Close due paper positions and create entry decisions without recording entries yet."""
     config = state.config
     init_alt_db(state.db_path)
     now_ts = float(payload["ts"])
@@ -2053,18 +2251,8 @@ def update_shared_strategy_paper(state, payload, scan_id):
             except (ValueError, RuntimeError, TypeError):
                 notional = float(config.get("paper_notional_usdc", DEFAULT_PAPER_NOTIONAL))
             plan = f"统一策略：{row.get('plan', '')}；模拟与真实共用同一信号，真实开关只控制是否发送订单"
-            cursor = db.execute("""
-                INSERT INTO paper_trades (
-                    trade_key, status, asset, leader, action, notional_usdc, beta, entry_ts,
-                    entry_z, entry_corr, entry_spread_bps, entry_funding_hourly,
-                    pnl_bps, pnl_usdc, opened_scan_id, plan, mode
-                ) VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 'shared_strategy')
-            """, (
-                key, row["asset"], row["leader"], row["action"], notional, row["beta"], now_ts,
-                row["zscore"], row["corr"], row.get("spread_bps"), row.get("funding_hourly"), scan_id, plan,
-            ))
             trade = {
-                "id": cursor.lastrowid, "trade_key": key, "status": "open", "asset": row["asset"],
+                "id": None, "trade_key": key, "status": "open", "asset": row["asset"],
                 "leader": row["leader"], "action": row["action"], "notional_usdc": notional,
                 "beta": row["beta"], "entry_ts": now_ts, "entry_z": row["zscore"],
                 "pnl_bps": 0, "pnl_usdc": 0, "plan": plan,
@@ -2073,6 +2261,43 @@ def update_shared_strategy_paper(state, payload, scan_id):
             open_keys.add(key)
             used_coins.update((asset, leader))
 
+    payload["strategy_pending_entries"] = opened_now
+    payload["strategy_open_rows"] = [row for _trade, row in opened_now]
+    payload["strategy_closed_events"] = closed_now
+    payload["strategy_closed_keys"] = [trade["trade_key"] for trade, _row, _reason in closed_now]
+    return {"rows": rows, "row_by_pair": row_by_pair, "now_ts": now_ts}
+
+
+def finalize_shared_strategy_cycle(state, payload, scan_id, cycle):
+    """Persist the already-decided paper entries and equity after the chosen real-order phase."""
+    config = state.config
+    rows = cycle["rows"]
+    row_by_pair = cycle["row_by_pair"]
+    now_ts = cycle["now_ts"]
+    opened_now = list(payload.get("strategy_pending_entries") or [])
+    closed_now = list(payload.get("strategy_closed_events") or [])
+    with sqlite3.connect(state.db_path) as db:
+        db.row_factory = sqlite3.Row
+        for trade, row in opened_now:
+            existing = db.execute("""
+                SELECT id FROM paper_trades
+                WHERE status='open' AND mode='shared_strategy' AND trade_key=?
+            """, (trade["trade_key"],)).fetchone()
+            if existing:
+                trade["id"] = existing["id"]
+                continue
+            cursor = db.execute("""
+                INSERT INTO paper_trades (
+                    trade_key, status, asset, leader, action, notional_usdc, beta, entry_ts,
+                    entry_z, entry_corr, entry_spread_bps, entry_funding_hourly,
+                    pnl_bps, pnl_usdc, opened_scan_id, plan, mode
+                ) VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 'shared_strategy')
+            """, (
+                trade["trade_key"], trade["asset"], trade["leader"], trade["action"],
+                trade["notional_usdc"], trade["beta"], trade["entry_ts"], trade["entry_z"],
+                row.get("corr"), row.get("spread_bps"), row.get("funding_hourly"), scan_id, trade["plan"],
+            ))
+            trade["id"] = cursor.lastrowid
         current_open = [dict(row) for row in db.execute("""
             SELECT * FROM paper_trades WHERE status='open' AND mode='shared_strategy' ORDER BY entry_ts ASC
         """).fetchall()]
@@ -2090,13 +2315,16 @@ def update_shared_strategy_paper(state, payload, scan_id):
             VALUES (?, ?, ?, ?, ?, ?, 'shared_strategy')
         """, (now_ts, scan_id, realized, unrealized, realized + unrealized, len(current_open)))
 
-    payload["strategy_open_rows"] = [row for _trade, row in opened_now]
-    payload["strategy_closed_keys"] = [trade["trade_key"] for trade, _row, _reason in closed_now]
     for trade, row in opened_now:
         notify_dingtalk_paper_trade(state, "模拟开仓", trade, row, "统一策略信号开仓；真实开关决定是否同时发送真实订单")
     for trade, row, reason in closed_now:
         notify_dingtalk_paper_trade(state, "模拟平仓", trade, row, reason)
     return load_paper_snapshot(state.db_path, current_rows=rows, config=config)
+
+
+def update_shared_strategy_paper(state, payload, scan_id):
+    cycle = prepare_shared_strategy_cycle(state, payload, scan_id)
+    return finalize_shared_strategy_cycle(state, payload, scan_id, cycle)
 
 
 def update_paper_trading(state, payload, scan_id):
@@ -2393,6 +2621,11 @@ PAPER_CONFIG_FIELDS = {
 
 LIVE_CONFIG_FIELDS = {
     "live_enabled": {"env": "LIVE_ENABLED", "type": "bool", "label": "真实下单总开关"},
+    "live_execution_style": {"env": "LIVE_EXECUTION_STYLE", "type": "choice", "choices": ("fast", "balanced", "strict", "custom"), "label": "真实执行顺序风格"},
+    "live_execution_steps": {"env": "LIVE_EXECUTION_STEPS", "type": "steps", "label": "真实执行步骤"},
+    "live_account_poll_seconds": {"env": "LIVE_ACCOUNT_POLL_SECONDS", "type": "float", "min": 1, "max": 300, "label": "后台账户刷新秒数"},
+    "live_account_cache_max_age_ms": {"env": "LIVE_ACCOUNT_CACHE_MAX_AGE_MS", "type": "float", "min": 1000, "max": 300_000, "label": "账户缓存最大年龄 ms"},
+    "live_leverage_cache_seconds": {"env": "LIVE_LEVERAGE_CACHE_SECONDS", "type": "float", "min": 0, "max": 604_800, "label": "杠杆预设缓存秒数"},
     "live_account_address": {"env": "HLM_ACCOUNT_ADDRESS", "type": "address", "label": "主钱包公开地址"},
     "live_notional_usdc": {"env": "LIVE_NOTIONAL_USDC", "type": "float", "min": 1, "max": 100_000, "label": "每笔小币腿 USDC"},
     "live_max_open": {"env": "LIVE_MAX_OPEN", "type": "int", "min": 0, "max": 20, "label": "最多真实仓位"},
@@ -2520,13 +2753,19 @@ def coerce_live_config(raw):
             parsed = value.strip().lower() not in ("0", "false", "no", "off", "关闭") if isinstance(value, str) else bool(value)
         elif meta["type"] == "int":
             parsed = int(value)
+        elif meta["type"] == "choice":
+            parsed = str(value or "").strip()
+            if parsed not in meta["choices"]:
+                raise ValueError(f"{meta['label']} 无效")
+        elif meta["type"] == "steps":
+            parsed = parse_live_execution_steps(value)
         elif meta["type"] == "address":
             parsed = str(value or "").strip()
             if parsed and not valid_evm_address(parsed):
                 raise ValueError("主钱包公开地址格式不正确，应为 0x 开头的 42 位地址")
         else:
             parsed = float(value)
-        if meta["type"] not in ("bool", "address"):
+        if meta["type"] not in ("bool", "address", "choice", "steps"):
             if parsed < meta["min"] or parsed > meta["max"]:
                 raise ValueError(f"{meta['label']} 超出允许范围")
         updates[key] = parsed
@@ -2595,6 +2834,8 @@ def update_live_env_file(values, env_path=None):
     env_values = {}
     for key, value in values.items():
         env_name = LIVE_CONFIG_FIELDS[key]["env"]
+        if isinstance(value, (list, tuple)):
+            value = ",".join(str(item) for item in value)
         env_values[env_name] = 1 if isinstance(value, bool) and value else 0 if isinstance(value, bool) else value
     update_env_vars(env_values, env_path=env_path)
 
@@ -2885,21 +3126,10 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <div class="metric"><div class="muted">当前参数</div><div id="pConfig">-</div></div>
 </div>
 <div class="paperActions">
-<button onclick="savePaperConfig()">保存模拟参数</button>
-<button onclick="loadPaperConfig()">重读参数</button>
-<span id="pSaveStatus" class="subtle">保存需要先在“全局设置”填写管理口令</span>
+<button onclick="openLiveDialog()">打开统一策略 / 真实执行设置</button>
+<span id="pSaveStatus" class="subtle">模拟与真实只使用这一套策略控件；真实专属执行项放在同一弹窗后半部分。</span>
 </div>
-<div class="paperForm">
-<label>模拟状态<select disabled><option>始终运行</option></select></label>
-<label>回归Z<input id="cfg_paper_exit_z" type="number" step="0.1"></label>
-<label>固定止盈bps（0关闭）<input id="cfg_paper_take_profit_bps" type="number" step="1" min="0"></label>
-<label>止损bps<input id="cfg_paper_stop_bps" type="number" step="1"></label>
-<label>最长分钟<input id="cfg_paper_max_hold_minutes" type="number" step="1"></label>
-<label>成本bps<input id="cfg_paper_fee_bps" type="number" step="0.1"></label>
-<label>1Z折算bps<input id="cfg_paper_z_value_bps" type="number" step="0.1"></label>
-<label>最低相关<input id="cfg_paper_min_corr" type="number" step="0.01"></label>
-</div>
-<div class="subtle">模拟盘始终运行。真实开关关闭时只记录模拟交易；真实开关开启时，只有本轮刚产生的同一个模拟开仓信号才会额外发送真实订单。开仓门槛、金额和最多持仓在“真实交易”弹窗的统一策略区域设置，这里只放共用的退出与理论收益参数。</div>
+<div class="subtle">模拟盘始终运行。真实开关只决定是否把同一个统一策略信号发送成真实订单，不再维护第二套模拟参数。</div>
 </div>
 <div>
 <canvas id="paperChart" class="mini" width="760" height="190"></canvas>
@@ -2968,31 +3198,59 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">真实平均 / 最差</div><div id="liveAvgWorst">-</div></div>
     <div class="metric"><div class="muted">l2Book WS 盘口</div><div id="liveL2Status">-</div></div>
     <div class="metric"><div class="muted">本轮真实机会</div><div id="liveOpportunityStatus">-</div></div>
+    <div class="metric"><div class="muted">当前执行顺序</div><div id="liveExecutionStatus">-</div></div>
   </div>
   <p id="liveBlocker" class="scoreMid"></p>
   <div class="paperActions"><button onclick="saveLiveConfig()">保存统一策略 / 真实执行参数</button><button onclick="loadLive()">刷新真实账户</button><span id="liveSaveStatus" class="subtle">管理口令在“全局设置”里填写</span></div>
-  <div class="detailText">统一策略参数同时控制模拟与真实信号；真实下单开关只控制是否发送订单。账户、金额、滑点、杠杆和紧急平仓仅属于真实执行。</div>
-  <div class="paperForm">
-    <label>统一策略档位<select id="liveRiskPreset" onchange="applyLiveRiskPreset(this.value)"><option value="conservative">保守：少交易</option><option value="balanced">中等：测试</option><option value="aggressive">激进：多交易</option><option value="custom">自定义</option></select></label>
-    <label>真实下单总开关<select id="cfg_live_enabled"><option value="false">关闭</option><option value="true">开启</option></select></label>
-    <label>主钱包公开地址<input id="cfg_live_account_address" placeholder="0x...（不是 API 钱包）"></label>
-    <label>每笔小币腿USDC<input id="cfg_live_notional_usdc" type="number" min="1" step="0.1"></label>
-    <label>低于交易所最低<select id="cfg_live_auto_min_notional"><option value="false">跳过，不下单（默认）</option><option value="true">自动补到最低</option></select></label>
-    <label>统一策略最多持仓<input id="cfg_live_max_open" type="number" step="1"></label>
-    <label>最大滑点bps<input id="cfg_live_max_slippage_bps" type="number" step="1"></label>
-    <label>杠杆倍数<input id="cfg_live_leverage" type="number" min="1" max="50" step="1"></label>
-    <label>杠杆失败处理<select id="cfg_live_require_leverage_ok"><option value="true">跳过，不下单（默认）</option><option value="false">继续下单</option></select></label>
-    <label>统一最低|Z|<input id="cfg_live_min_entry_z" type="number" min="0" max="20" step="0.1"></label>
-    <label>统一最低相关<input id="cfg_live_min_corr" type="number" min="-1" max="1" step="0.01"></label>
-    <label>统一最大点差bps<input id="cfg_live_max_entry_spread_bps" type="number" min="0" max="100" step="0.1"></label>
-    <label>统一最低预期边际bps<input id="cfg_live_min_expected_edge_bps" type="number" step="1"></label>
-    <label>l2Book盘口校验<select id="cfg_live_use_l2book"><option value="true">开启（默认）</option><option value="false">关闭</option></select></label>
-    <label>l2Book最大延迟ms<input id="cfg_live_l2_max_age_ms" type="number" min="100" max="60000" step="100"></label>
-    <label>统一信号执行宽限ms<input id="cfg_live_strategy_entry_grace_ms" type="number" min="0" max="60000" step="100"></label>
-    <label>l2Book最大点差bps<input id="cfg_live_l2_max_spread_bps" type="number" min="0" max="100" step="0.1"></label>
-    <label>WS订阅数量<input id="cfg_live_l2_subscribe_limit" type="number" min="2" max="1000" step="1"></label>
-    <label>WS实时Z<select id="cfg_live_use_realtime_z"><option value="true">开启（默认）</option><option value="false">关闭</option></select></label>
-    <label>真实策略开关<select id="cfg_live_strategy_enabled"><option value="false">关闭（默认）</option><option value="true">开启</option></select></label>
+  <div class="settingBand">
+    <h3>① 统一策略参数（模拟与真实完全相同）</h3>
+    <div class="detailText">这里只决定“什么时候开、什么时候平、选哪个币对”。模拟盘始终使用；真实开关开启时也使用同一份决策。</div>
+    <div class="paperForm">
+      <label>统一策略档位<select id="liveRiskPreset" onchange="applyLiveRiskPreset(this.value)"><option value="conservative">保守：少交易</option><option value="balanced">中等：测试</option><option value="aggressive">激进：多交易</option><option value="custom">自定义</option></select></label>
+      <label>统一策略最多持仓<input id="cfg_live_max_open" type="number" step="1"></label>
+      <label>统一最低|Z|<input id="cfg_live_min_entry_z" type="number" min="0" max="20" step="0.1"></label>
+      <label>统一最低相关<input id="cfg_live_min_corr" type="number" min="-1" max="1" step="0.01"></label>
+      <label>统一最大点差bps<input id="cfg_live_max_entry_spread_bps" type="number" min="0" max="100" step="0.1"></label>
+      <label>统一最低预期边际bps<input id="cfg_live_min_expected_edge_bps" type="number" step="1"></label>
+      <label>回归平仓Z<input id="cfg_paper_exit_z" type="number" step="0.1"></label>
+      <label>固定止盈bps（0关闭）<input id="cfg_paper_take_profit_bps" type="number" step="1" min="0"></label>
+      <label>止损bps<input id="cfg_paper_stop_bps" type="number" step="1"></label>
+      <label>最长持仓分钟<input id="cfg_paper_max_hold_minutes" type="number" step="1"></label>
+      <label>理论成本bps<input id="cfg_paper_fee_bps" type="number" step="0.1"></label>
+      <label>每1Z折算bps<input id="cfg_paper_z_value_bps" type="number" step="0.1"></label>
+      <label>持仓最低相关<input id="cfg_paper_min_corr" type="number" step="0.01"></label>
+      <label>l2Book盘口校验<select id="cfg_live_use_l2book"><option value="true">开启（默认）</option><option value="false">关闭</option></select></label>
+      <label>l2Book最大延迟ms<input id="cfg_live_l2_max_age_ms" type="number" min="100" max="60000" step="100"></label>
+      <label>统一信号执行宽限ms<input id="cfg_live_strategy_entry_grace_ms" type="number" min="0" max="60000" step="100"></label>
+      <label>l2Book最大点差bps<input id="cfg_live_l2_max_spread_bps" type="number" min="0" max="100" step="0.1"></label>
+      <label>WS订阅数量<input id="cfg_live_l2_subscribe_limit" type="number" min="2" max="1000" step="1"></label>
+      <label>WS实时Z<select id="cfg_live_use_realtime_z"><option value="true">开启（默认）</option><option value="false">关闭</option></select></label>
+    </div>
+  </div>
+  <div class="settingBand">
+    <h3>② 真实执行追加项</h3>
+    <div class="detailText">这些控件只影响真实订单，不改变模拟信号。默认“极速锁定”使用后台账户缓存，不在商机出现后同步查询账户。</div>
+    <div class="paperForm">
+      <label>真实下单总开关<select id="cfg_live_enabled"><option value="false">关闭</option><option value="true">开启</option></select></label>
+      <label>真实策略开关<select id="cfg_live_strategy_enabled"><option value="false">关闭（默认）</option><option value="true">开启</option></select></label>
+      <label>主钱包公开地址<input id="cfg_live_account_address" placeholder="0x...（不是 API 钱包）"></label>
+      <label>每笔小币腿USDC<input id="cfg_live_notional_usdc" type="number" min="1" step="0.1"></label>
+      <label>低于交易所最低<select id="cfg_live_auto_min_notional"><option value="false">跳过，不下单（默认）</option><option value="true">自动补到最低</option></select></label>
+      <label>最大滑点bps<input id="cfg_live_max_slippage_bps" type="number" step="1"></label>
+      <label>杠杆倍数<input id="cfg_live_leverage" type="number" min="1" max="50" step="1"></label>
+      <label>杠杆失败处理<select id="cfg_live_require_leverage_ok"><option value="true">跳过，不下单（默认）</option><option value="false">继续下单</option></select></label>
+      <label>执行顺序风格<select id="cfg_live_execution_style" onchange="applyExecutionStyle(this.value)"><option value="fast">极速锁定（默认）</option><option value="balanced">平衡</option><option value="strict">严格复查</option><option value="custom">自定义</option></select></label>
+      <label>后台账户刷新秒<input id="cfg_live_account_poll_seconds" type="number" min="1" max="300" step="1"></label>
+      <label>账户缓存最大年龄ms<input id="cfg_live_account_cache_max_age_ms" type="number" min="1000" max="300000" step="1000"></label>
+      <label>杠杆预设缓存秒<input id="cfg_live_leverage_cache_seconds" type="number" min="0" max="604800" step="60"></label>
+    </div>
+    <h3>真实执行步骤（可排序、删除、插入）</h3>
+    <div id="executionStepList" class="detailText"></div>
+    <div class="paperActions">
+      <select id="executionStepAdd"><option value="cached_account">读取后台账户缓存</option><option value="fresh_account">立即查询最新账户（慢）</option><option value="prepare_leverage">准备/确认杠杆</option><option value="final_l2">内存盘口最终复查</option><option value="refresh_account_async">下单后后台刷新账户</option></select>
+      <button onclick="addExecutionStep()">插入步骤</button>
+      <span class="subtle">“发送真实IOC”和“记录模拟交易”不可删除；移动其先后顺序会真实改变执行顺序。</span>
+    </div>
   </div>
   <h3>为什么这一轮没有交易</h3>
   <div id="liveDiagnosticSummary" class="detailText">读取服务器当前过滤结果中...</div>
@@ -3125,7 +3383,10 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>实盘最低预期边际</code>：用 Z 回归空间减去估算成本后的粗略安全垫，默认 25 bps。</p>
 <p><code>l2Book盘口校验</code>：开仓前检查实时买一/卖一、点差、数据年龄、盘口深度。不合格就跳过真实下单。</p>
 <p><code>l2Book最大延迟ms</code>：盘口数据允许多旧。3000ms 表示超过 3 秒没更新就不拿来开仓。</p>
-<p><code>统一信号执行宽限ms</code>：模拟策略已经在 3000ms 门槛内确认过盘口后，真实执行还要读取账户，可能多花几秒。默认宽限 10000ms；只有 WS 仍连接、买一卖一与刚才完全相同、点差和深度仍合格时才允许继续，不是无条件放宽旧盘口。</p>
+<p><code>统一信号执行宽限ms</code>：策略已经在 3000ms 门槛内确认过盘口后，准备杠杆或网络发送仍可能花几秒。默认宽限 10000ms；只有 WS 仍连接、买一卖一与刚才完全相同、点差和深度仍合格时才允许继续，不是无条件放宽旧盘口。</p>
+<p><code>执行顺序风格</code>：极速锁定默认使用后台账户缓存，顺序是“缓存账户 → 杠杆预设 → 内存盘口复查 → 真实IOC → 模拟记录 → 后台刷新账户”；严格复查会在商机出现后同步查询最新账户，因此更慢。</p>
+<p><code>真实执行步骤</code>：可以上下移动、删除可选步骤或重新插入。发送真实IOC和记录模拟交易不可删除。若把模拟记录放到真实IOC前面，模拟会先落库；默认放在真实IOC后面以优先锁定真实商机。</p>
+<p><code>后台账户刷新</code>：服务器平时独立刷新余额和仓位，不占用商机出现后的关键时间。删除所有账户步骤会失去余额和外部净仓预检查，只应在明确理解风险时使用。</p>
 <p><code>l2Book最大点差bps</code>：实时盘口点差上限。超过这个值说明进出场成本太高，跳过。</p>
 <p><code>WS订阅数量</code>：服务器实时监听多少个重点币盘口。不是模拟扫描数量；模拟可以扫 150+，WS 默认只盯前 80 个重点币加 BTC/ETH。</p>
 <p><code>WS实时Z</code>：用最近一次历史K线计算出的 beta/均值/波动率作为基准，再用 l2Book 最新 mid 估算当前偏离。它适合开仓前/平仓前快速确认，但不是完整历史回测。</p>
@@ -3620,7 +3881,7 @@ async function openGlobalDialog(){
   if(saved) document.getElementById('globalAdminToken').value=saved;
   document.getElementById('globalApiStatus').textContent='读取中...';
   try{
-    const r=await fetch('live?fresh=1');const data=await r.json();
+    const r=await fetch('live'+(silent?'':'?fresh=1'));const data=await r.json();
     const cfg=data.config||{};
     document.getElementById('globalApiStatus').textContent=cfg.api_key_configured?(cfg.sdk_ready?'API 私钥已加密配置，可交易':'API 私钥已配置，但缺 SDK'):'未配置 API 钱包私钥';
     document.getElementById('globalAccountAddress').textContent=cfg.live_account_address||'-';
@@ -3648,8 +3909,32 @@ async function savePaperConfig(){
     document.getElementById('pSaveStatus').textContent='保存失败：'+e;
   }
 }
-const liveConfigKeys=['live_enabled','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_max_entry_spread_bps','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_strategy_entry_grace_ms','live_l2_max_spread_bps','live_l2_subscribe_limit','live_use_realtime_z','live_strategy_enabled'];
+const liveConfigKeys=['live_enabled','live_execution_style','live_execution_steps','live_account_poll_seconds','live_account_cache_max_age_ms','live_leverage_cache_seconds','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_max_entry_spread_bps','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_strategy_entry_grace_ms','live_l2_max_spread_bps','live_l2_subscribe_limit','live_use_realtime_z','live_strategy_enabled'];
 function liveCfgEl(key){return document.getElementById('cfg_'+key)}
+const executionStepLabels={cached_account:'读取后台账户缓存',fresh_account:'立即查询最新账户（慢）',prepare_leverage:'准备/确认杠杆',final_l2:'内存盘口最终复查',submit_real:'发送真实IOC订单',record_paper:'记录模拟交易',refresh_account_async:'下单后后台刷新账户'};
+const executionPresets={
+  fast:['cached_account','prepare_leverage','final_l2','submit_real','record_paper','refresh_account_async'],
+  balanced:['cached_account','prepare_leverage','final_l2','submit_real','record_paper','refresh_account_async'],
+  strict:['fresh_account','prepare_leverage','final_l2','submit_real','record_paper','refresh_account_async']
+};
+let executionSteps=[...executionPresets.fast];
+function renderExecutionSteps(){
+  const box=document.getElementById('executionStepList');if(!box)return;
+  box.innerHTML=executionSteps.map((step,i)=>{
+    const mandatory=['submit_real','record_paper'].includes(step);
+    return `<div class="settingBand" style="display:flex;align-items:center;gap:8px;margin:5px 0;padding:7px"><b>${i+1}</b><span style="flex:1">${executionStepLabels[step]||step}</span><button onclick="moveExecutionStep(${i},-1)" ${i===0?'disabled':''}>↑</button><button onclick="moveExecutionStep(${i},1)" ${i===executionSteps.length-1?'disabled':''}>↓</button><button onclick="removeExecutionStep(${i})" ${mandatory?'disabled title="必需步骤"':''}>删除</button></div>`;
+  }).join('');
+}
+function moveExecutionStep(index,delta){const target=index+delta;if(target<0||target>=executionSteps.length)return;[executionSteps[index],executionSteps[target]]=[executionSteps[target],executionSteps[index]];liveCfgEl('execution_style').value='custom';renderExecutionSteps()}
+function removeExecutionStep(index){if(['submit_real','record_paper'].includes(executionSteps[index]))return;executionSteps.splice(index,1);liveCfgEl('execution_style').value='custom';renderExecutionSteps()}
+function addExecutionStep(){const step=document.getElementById('executionStepAdd').value;if(executionSteps.includes(step))return;const orderIndex=executionSteps.indexOf('submit_real');executionSteps.splice(orderIndex<0?executionSteps.length:orderIndex,0,step);liveCfgEl('execution_style').value='custom';renderExecutionSteps()}
+function applyExecutionStyle(style){
+  if(style==='custom')return;
+  executionSteps=[...(executionPresets[style]||executionPresets.fast)];
+  const tuning={fast:[3,60000],balanced:[5,30000],strict:[5,10000]}[style];
+  if(tuning){liveCfgEl('account_poll_seconds').value=tuning[0];liveCfgEl('account_cache_max_age_ms').value=tuning[1]}
+  renderExecutionSteps();
+}
 const liveRiskPresets={
   conservative:{live_min_entry_z:3.0,live_min_corr:0.75,live_max_entry_spread_bps:2.5,live_min_expected_edge_bps:25,live_l2_max_spread_bps:2.5},
   balanced:{live_min_entry_z:2.5,live_min_corr:0.70,live_max_entry_spread_bps:3.5,live_min_expected_edge_bps:18,live_l2_max_spread_bps:3.5},
@@ -3679,15 +3964,24 @@ function applyLiveRiskPreset(name){
   if(status)status.textContent=`已套用${name==='conservative'?'保守':name==='balanced'?'中等':'激进'}档；点击“保存真实交易参数”后生效`;
 }
 function fillLiveConfig(cfg){
+  if(Array.isArray(cfg.live_execution_steps))executionSteps=[...cfg.live_execution_steps];
+  else if(typeof cfg.live_execution_steps==='string')executionSteps=cfg.live_execution_steps.split(',').filter(Boolean);
   liveConfigKeys.forEach(key=>{
+    if(key==='live_execution_steps')return;
     const el=liveCfgEl(key); if(!el || cfg[key]===undefined) return;
     el.value=['live_enabled','live_strategy_enabled','live_auto_min_notional','live_require_leverage_ok','live_use_l2book','live_use_realtime_z'].includes(key) ? (cfg[key]===true?'true':'false') : cfg[key];
   });
+  renderExecutionSteps();
   updateLiveRiskPresetSelect(cfg);
 }
 function readLiveConfig(){
   return {
     live_enabled:liveCfgEl('live_enabled').value==='true',
+    live_execution_style:liveCfgEl('execution_style').value,
+    live_execution_steps:[...executionSteps],
+    live_account_poll_seconds:parseFloat(liveCfgEl('account_poll_seconds').value),
+    live_account_cache_max_age_ms:parseFloat(liveCfgEl('account_cache_max_age_ms').value),
+    live_leverage_cache_seconds:parseFloat(liveCfgEl('leverage_cache_seconds').value),
     live_account_address:liveCfgEl('live_account_address').value.trim(),
     live_notional_usdc:parseFloat(liveCfgEl('live_notional_usdc').value),
     live_auto_min_notional:liveCfgEl('live_auto_min_notional').value==='true',
@@ -3842,6 +4136,8 @@ function renderLive(data){
   const isUnified=account.account_mode==='unifiedAccount';
   fillLiveConfig(cfg);
   document.getElementById('liveStatus').textContent=cfg.live_enabled===true?(cfg.live_strategy_enabled===true?'已开启（真实策略运行中）':'已开启（策略开关关闭）'):'关闭（不会下真实单）';
+  const executionStatus=document.getElementById('liveExecutionStatus');
+  if(executionStatus)executionStatus.textContent=`${cfg.live_execution_style||'fast'}：${(cfg.live_execution_steps||[]).map(x=>executionStepLabels[x]||x).join(' → ')}`;
   document.getElementById('liveBlocker').textContent=cfg.blocker||'';
   document.getElementById('liveBalance').textContent=account.account_value===undefined?'暂无账户快照':(isUnified?`统一账户；可用 ${fmt(account.spot_available_usdc??account.spot_usdc,2)} U`:`合约 ${fmt(account.account_value,2)} U；现货 ${fmt(account.spot_available_usdc??account.spot_usdc,2)} U`);
   document.getElementById('livePositionCount').textContent=account.ts?`${positions.length} 个；快照 ${new Date(account.ts*1000).toLocaleString()}`:'暂无；填写主钱包公开地址后等下一轮采集';
@@ -3937,22 +4233,27 @@ async function loadLive(silent=false){
     renderLive(data);if(status && !silent)status.textContent=data.account_error?`账户读取失败：${data.account_error}`:'已读取真实账户快照';
   }catch(e){if(status)status.textContent='读取失败：'+e.message;}
 }
-function openLiveDialog(){liveDlg.showModal();loadLive();}
+function openLiveDialog(){liveDlg.showModal();loadLive();loadPaperConfig();}
 async function saveLiveConfig(){
   const status=document.getElementById('liveSaveStatus');
   const token=adminTokenValue();
   if(!token){status.textContent='请输入管理口令';return;}
   const config=readLiveConfig();
+  const paperConfig=readPaperConfigForm();
   if(config.live_enabled && !confirm('确认开启真实下单授权？系统将只在 API 私钥已加密配置、额度限制有效时允许真实交易。')) return;
   status.textContent='正在保存...';
   try{
     const r=await fetch('live_config',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Token':token},body:JSON.stringify({config})});
     const data=await r.json();
     if(!data.ok){status.textContent=data.error||'保存失败';return;}
+    const paperRes=await fetch('paper_config',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Token':token},body:JSON.stringify({config:paperConfig})});
+    const paperData=await paperRes.json();
+    if(!paperData.ok){status.textContent='真实执行参数已保存，但统一退出参数保存失败：'+(paperData.error||'未知错误');return;}
     fillLiveConfig(data.config||{});
+    fillPaperConfig(paperData.config||{},true);
     const lev=data.leverage_result;
-    status.textContent=lev&&Object.keys(lev).length?`已保存；杠杆设置结果 ${JSON.stringify(lev)}`:'已保存；真实账户快照会在下一轮采集更新';
-    loadLive();
+    status.textContent=lev&&Object.keys(lev).length?`统一策略和真实执行已保存；杠杆结果 ${JSON.stringify(lev)}`:'统一策略和真实执行已保存；下一轮信号立即生效';
+    loadLive();loadPaper();
   }catch(e){status.textContent='保存失败：'+e.message;}
 }
 async function runEmergencyClose(){
@@ -4317,6 +4618,8 @@ class AltServerState:
         self.active_candidates = set()
         self.live_account = None
         self.live_error = None
+        self.live_leverage_cache = {}
+        self.last_live_account_db_save = 0.0
         self.l2book = L2BookCache()
 
 
@@ -4344,23 +4647,28 @@ def collector_loop(state):
             # decides continuously; the real executor later consumes only the
             # new-entry events produced from this same snapshot.
             payload["strategy_rows"] = prepare_live_rows(payload.get("rows", []), state.config, state.l2book)
-            paper_snapshot = update_paper_trading(state, payload, scan_id)
+            if state.config.get("paper_sync_live", True):
+                cycle = prepare_shared_strategy_cycle(state, payload, scan_id)
+                steps = live_execution_steps(state.config)
+                real_first = steps.index("submit_real") < steps.index("record_paper")
+                if real_first:
+                    try:
+                        live_snapshot = update_live_trading(state, payload, scan_id)
+                    finally:
+                        paper_snapshot = finalize_shared_strategy_cycle(state, payload, scan_id, cycle)
+                else:
+                    paper_snapshot = finalize_shared_strategy_cycle(state, payload, scan_id, cycle)
+                    live_snapshot = update_live_trading(state, payload, scan_id)
+            else:
+                paper_snapshot = update_paper_trading(state, payload, scan_id)
+                live_snapshot = update_live_trading(state, payload, scan_id)
             payload["paper"] = paper_snapshot
-            account_address = state.config.get("live_account_address")
-            if valid_evm_address(account_address):
-                try:
-                    live_snapshot = fetch_live_account_snapshot(account_address)
-                    save_live_account_snapshot(live_snapshot, state.db_path)
-                    with state.lock:
-                        state.live_account, state.live_error = live_snapshot, None
-                except Exception as live_exc:
-                    with state.lock:
-                        state.live_error = str(live_exc)
-            live_snapshot = update_live_trading(state, payload, scan_id)
             payload["live_trades"] = live_snapshot
             payload.pop("strategy_rows", None)
             payload.pop("strategy_open_rows", None)
             payload.pop("strategy_closed_keys", None)
+            payload.pop("strategy_pending_entries", None)
+            payload.pop("strategy_closed_events", None)
             with state.lock:
                 state.latest, state.error = payload, None
             notify_dingtalk_candidates(state, payload)
@@ -5751,6 +6059,13 @@ def build_server_config(args):
         "paper_z_value_bps": env_float("PAPER_Z_VALUE_BPS", float(args.paper_z_value_bps)),
         "paper_min_corr": env_float("PAPER_MIN_CORR", float(args.paper_min_corr)),
         "live_enabled": env_bool("LIVE_ENABLED", False),
+        "live_execution_style": env_text("LIVE_EXECUTION_STYLE", "fast"),
+        "live_execution_steps": parse_live_execution_steps(env_text(
+            "LIVE_EXECUTION_STEPS", ",".join(LIVE_EXECUTION_PRESETS["fast"]),
+        )),
+        "live_account_poll_seconds": env_float("LIVE_ACCOUNT_POLL_SECONDS", 3.0),
+        "live_account_cache_max_age_ms": env_float("LIVE_ACCOUNT_CACHE_MAX_AGE_MS", 60_000.0),
+        "live_leverage_cache_seconds": env_float("LIVE_LEVERAGE_CACHE_SECONDS", 86_400.0),
         "live_account_address": os.environ.get("HLM_ACCOUNT_ADDRESS") or env_file_value("HLM_ACCOUNT_ADDRESS"),
         "live_notional_usdc": env_float("LIVE_NOTIONAL_USDC", 10.0),
         "live_max_open": env_int("LIVE_MAX_OPEN", 1),
@@ -5776,8 +6091,10 @@ def run_server(args):
     config = build_server_config(args)
     db_path = Path(args.db).resolve()
     state = AltServerState(config, db_path=db_path)
+    state.live_account = load_latest_live_account_snapshot(db_path)
     state.l2book.set_coins(set(config.get("leaders", [])) | {"BTC", "ETH"})
     state.l2book.start()
+    threading.Thread(target=live_account_cache_loop, args=(state,), daemon=True).start()
     threading.Thread(target=collector_loop, args=(state,), daemon=True).start()
     server = ThreadingHTTPServer((args.host, int(args.port)), AltRequestHandler)
     server.state = state
