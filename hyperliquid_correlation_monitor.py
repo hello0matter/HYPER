@@ -678,6 +678,12 @@ def init_alt_db(path=ALT_DB_FILE):
                 hedge_exit_px REAL,
                 pnl_usdc REAL NOT NULL DEFAULT 0,
                 pnl_bps REAL NOT NULL DEFAULT 0,
+                fee_usdc REAL,
+                funding_usdc REAL,
+                net_pnl_usdc REAL,
+                net_pnl_bps REAL,
+                asset_net_pnl_usdc REAL,
+                hedge_net_pnl_usdc REAL,
                 close_reason TEXT,
                 opened_scan_id INTEGER,
                 closed_scan_id INTEGER,
@@ -686,6 +692,14 @@ def init_alt_db(path=ALT_DB_FILE):
                 note TEXT
             )
         """)
+        for column in (
+            "fee_usdc REAL", "funding_usdc REAL", "net_pnl_usdc REAL", "net_pnl_bps REAL",
+            "asset_net_pnl_usdc REAL", "hedge_net_pnl_usdc REAL",
+        ):
+            try:
+                db.execute(f"ALTER TABLE live_trades ADD COLUMN {column}")
+            except sqlite3.OperationalError:
+                pass
         db.execute("CREATE INDEX IF NOT EXISTS idx_live_trades_status ON live_trades(status, trade_key)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_live_trades_ts ON live_trades(entry_ts, exit_ts)")
 
@@ -861,6 +875,163 @@ def _live_fills_from_response(response, expected_coins):
     return result
 
 
+def _stored_order_fills(raw_json):
+    try:
+        payload = json.loads(raw_json or "{}") if isinstance(raw_json, str) else (raw_json or {})
+    except json.JSONDecodeError:
+        return {}
+    return payload.get("fills") or {}
+
+
+def official_trade_costs(trade, fills_by_oid, funding_rows):
+    """Calculate official fees/funding and per-leg net PnL for one closed trade."""
+    entry_fills = _stored_order_fills(trade.get("entry_json"))
+    exit_fills = _stored_order_fills(trade.get("exit_json"))
+    start_ms = float(trade.get("entry_ts") or 0) * 1000
+    end_ms = float(trade.get("exit_ts") or trade.get("entry_ts") or 0) * 1000
+    legs = {}
+    for coin in (trade.get("asset"), trade.get("leader")):
+        entry = entry_fills.get(coin) or {}
+        exit_fill = exit_fills.get(coin) or {}
+        entry_official = fills_by_oid.get(str(entry.get("oid"))) or {}
+        exit_official = fills_by_oid.get(str(exit_fill.get("oid"))) or {}
+        fees = float(entry_official.get("fee") or 0) + float(exit_official.get("fee") or 0)
+        if exit_official:
+            gross = float(exit_official.get("closedPnl") or 0)
+        else:
+            is_asset = coin == trade.get("asset")
+            entry_px = float(trade.get("asset_entry_px" if is_asset else "hedge_entry_px") or 0)
+            exit_px = float(trade.get("asset_exit_px" if is_asset else "hedge_exit_px") or 0)
+            size = float(trade.get("asset_size" if is_asset else "hedge_size") or 0)
+            entry_buy = (trade.get("action") == "long_asset_short_hedge") if is_asset else (trade.get("action") != "long_asset_short_hedge")
+            gross = (exit_px - entry_px) * size * (1 if entry_buy else -1)
+        funding = sum(
+            float((item.get("delta") or {}).get("usdc") or 0)
+            for item in funding_rows
+            if start_ms <= float(item.get("time") or 0) <= end_ms
+            and str((item.get("delta") or {}).get("coin") or "").upper() == str(coin or "").upper()
+        )
+        legs[coin] = {"gross": gross, "fee": fees, "funding": funding, "net": gross - fees + funding}
+    asset_leg = legs.get(trade.get("asset"), {"net": 0})
+    hedge_leg = legs.get(trade.get("leader"), {"net": 0})
+    gross = sum(item["gross"] for item in legs.values())
+    fee = sum(item["fee"] for item in legs.values())
+    funding = sum(item["funding"] for item in legs.values())
+    net = gross - fee + funding
+    total_notional = max(float(trade.get("total_notional_usdc") or 0), 1e-9)
+    return {
+        "pnl_usdc": gross, "pnl_bps": gross / total_notional * 10_000,
+        "fee_usdc": fee, "funding_usdc": funding,
+        "net_pnl_usdc": net, "net_pnl_bps": net / total_notional * 10_000,
+        "asset_net_pnl_usdc": asset_leg["net"], "hedge_net_pnl_usdc": hedge_leg["net"],
+    }
+
+
+def fetch_official_trade_costs(config, trade):
+    account = str(config.get("live_account_address") or "")
+    if not valid_evm_address(account):
+        return None
+    fills = get_json(HL_INFO, payload={"type": "userFills", "user": account}, timeout=15)
+    fills_by_oid = {str(item.get("oid")): item for item in fills if item.get("oid") is not None}
+    funding_rows = get_json(HL_INFO, payload={
+        "type": "userFunding", "user": account,
+        "startTime": max(0, int(float(trade.get("entry_ts") or 0) * 1000) - 1000),
+    }, timeout=15)
+    return official_trade_costs(trade, fills_by_oid, funding_rows)
+
+
+def reconcile_live_trade_costs(state):
+    """Backfill official net PnL for historical closed trades without placing orders."""
+    try:
+        account = str(state.config.get("live_account_address") or "")
+        if not valid_evm_address(account):
+            return
+        with sqlite3.connect(state.db_path) as db:
+            db.row_factory = sqlite3.Row
+            trades = [dict(row) for row in db.execute(
+                "SELECT * FROM live_trades WHERE status='closed' ORDER BY entry_ts"
+            ).fetchall()]
+        if not trades:
+            return
+        fills = get_json(HL_INFO, payload={"type": "userFills", "user": account}, timeout=20)
+        fills_by_oid = {str(item.get("oid")): item for item in fills if item.get("oid") is not None}
+        funding_rows = get_json(HL_INFO, payload={
+            "type": "userFunding", "user": account,
+            "startTime": max(0, int(min(float(trade["entry_ts"]) for trade in trades) * 1000) - 1000),
+        }, timeout=20)
+        with sqlite3.connect(state.db_path) as db:
+            for trade in trades:
+                costs = official_trade_costs(trade, fills_by_oid, funding_rows)
+                db.execute("""
+                    UPDATE live_trades SET pnl_usdc=?, pnl_bps=?, fee_usdc=?, funding_usdc=?,
+                        net_pnl_usdc=?, net_pnl_bps=?, asset_net_pnl_usdc=?, hedge_net_pnl_usdc=?
+                    WHERE id=?
+                """, (
+                    costs["pnl_usdc"], costs["pnl_bps"], costs["fee_usdc"], costs["funding_usdc"],
+                    costs["net_pnl_usdc"], costs["net_pnl_bps"], costs["asset_net_pnl_usdc"],
+                    costs["hedge_net_pnl_usdc"], trade["id"],
+                ))
+        reconcile_shared_paper_from_live(state.db_path, state.config.get("paper_fee_bps", 9.0))
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] reconciled official costs for {len(trades)} live trades", flush=True)
+    except Exception as exc:
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] live cost reconciliation failed: {exc}", flush=True)
+
+
+def reconcile_shared_paper_from_live(db_path=ALT_DB_FILE, fee_bps=9.0):
+    """Repair old unified paper rows that correspond to an actual live fill."""
+    init_alt_db(db_path)
+    repaired = 0
+    with sqlite3.connect(db_path) as db:
+        db.row_factory = sqlite3.Row
+        legacy_rows = [dict(row) for row in db.execute("""
+            SELECT * FROM paper_trades
+            WHERE mode='shared_strategy' AND COALESCE(pnl_model, 'z_approx') != 'l2_executable'
+        """).fetchall()]
+        live_rows = [dict(row) for row in db.execute("""
+            SELECT * FROM live_trades WHERE status IN ('open', 'closed')
+        """).fetchall()]
+        for paper in legacy_rows:
+            matches = [
+                live for live in live_rows
+                if live.get("asset") == paper.get("asset")
+                and live.get("leader") == paper.get("leader")
+                and live.get("action") == paper.get("action")
+                and abs(float(live.get("entry_ts") or 0) - float(paper.get("entry_ts") or 0)) <= 30
+            ]
+            if not matches:
+                continue
+            live = min(matches, key=lambda item: abs(float(item.get("entry_ts") or 0) - float(paper.get("entry_ts") or 0)))
+            total = max(float(live.get("total_notional_usdc") or paper.get("notional_usdc") or 0), 1e-9)
+            if live.get("status") == "closed":
+                pnl_usdc = live.get("net_pnl_usdc")
+                if pnl_usdc is None:
+                    pnl_usdc = float(live.get("pnl_usdc") or 0) - total * float(fee_bps) / 10_000
+                pnl_bps = float(pnl_usdc) / total * 10_000
+                status = "closed"
+                exit_ts = live.get("exit_ts")
+                exit_z = live.get("exit_z")
+                close_reason = paper.get("close_reason") or live.get("close_reason") or "与真实成交记录对账"
+            else:
+                pnl_usdc = pnl_bps = 0.0
+                status = "open"
+                exit_ts = exit_z = None
+                close_reason = None
+            db.execute("""
+                UPDATE paper_trades SET status=?, notional_usdc=?, asset_notional_usdc=?, hedge_notional_usdc=?,
+                    asset_entry_px=?, hedge_entry_px=?, entry_ts=?, exit_ts=?, exit_z=?, pnl_usdc=?, pnl_bps=?,
+                    close_reason=?, pnl_model='l2_executable'
+                WHERE id=?
+            """, (
+                status, total, live.get("asset_notional_usdc"), live.get("hedge_notional_usdc"),
+                live.get("asset_entry_px"), live.get("hedge_entry_px"), live.get("entry_ts"), exit_ts,
+                exit_z, pnl_usdc, pnl_bps, close_reason, paper["id"],
+            ))
+            repaired += 1
+    if repaired:
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] repaired {repaired} unified paper rows from live fills", flush=True)
+    return repaired
+
+
 def load_latest_scan(db_path=ALT_DB_FILE):
     if not Path(db_path).exists():
         return None
@@ -956,7 +1127,7 @@ def summarize_pair_history(rows):
     }
 
 
-def replay_backtest_from_scan_rows(rows, *, entry_z=2.0, exit_z=0.5, max_hold=36, fee_bps=4.0, z_value_bps=18.0):
+def replay_backtest_from_scan_rows(rows, *, entry_z=2.0, exit_z=0.5, max_hold=36, fee_bps=9.0, z_value_bps=18.0):
     rows = [row for row in rows if row.get("zscore") is not None]
     if len(rows) < 12:
         raise ValueError(f"数据库样本不足：当前只有 {len(rows)} 个点。等服务器多跑一段时间再复盘。")
@@ -1041,9 +1212,9 @@ def strategy_row_execution_prices(row, action, *, closing=False):
     hedge_book = check_books.get(row.get("leader")) or {}
 
     def px(name, side, fallback_book):
-        value = row.get(name)
+        value = fallback_book.get(side)
         if value in (None, ""):
-            value = fallback_book.get(side)
+            value = row.get(name)
         try:
             value = float(value)
         except (TypeError, ValueError):
@@ -1064,7 +1235,7 @@ def strategy_row_execution_prices(row, action, *, closing=False):
 
 def paper_trade_pnl_details(trade, row, config, now_ts=None):
     """Prefer executable two-leg price PnL; fall back only for historical rows."""
-    fee_bps = float(config.get("paper_fee_bps", 4.0))
+    fee_bps = float(config.get("paper_fee_bps", 9.0))
     now_ts = now_ts or time.time()
     hours = max(0.0, (now_ts - float(trade["entry_ts"])) / 3600)
     funding_hourly_bps = float(row.get("funding_hourly") or 0) * 10_000
@@ -1147,7 +1318,8 @@ def paper_close_reason(trade, row, config, now_ts=None):
 def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, config=None):
     init_alt_db(db_path)
     sync_live = bool((config or {}).get("paper_sync_live", True))
-    trade_mode_where = " AND mode = 'shared_strategy'" if sync_live else " AND mode = 'legacy'"
+    trade_mode_where = (" AND mode = 'shared_strategy' AND pnl_model='l2_executable'"
+                        if sync_live else " AND mode = 'legacy'")
     equity_mode_where = (" WHERE mode = 'shared_strategy' AND pnl_model='l2_executable'"
                          if sync_live else " WHERE mode = 'legacy'")
     with sqlite3.connect(db_path) as db:
@@ -1161,7 +1333,6 @@ def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, confi
         equity_rows = [dict(row) for row in db.execute(
             "SELECT * FROM paper_equity" + equity_mode_where + " ORDER BY ts DESC LIMIT ?", (int(limit),)
         ).fetchall()][::-1]
-        stats_model_where = " AND pnl_model='l2_executable'" if sync_live else ""
         stats = db.execute("""
             SELECT
                 COUNT(*) AS trades,
@@ -1170,11 +1341,7 @@ def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, confi
                 COALESCE(AVG(pnl_bps), 0) AS avg_bps,
                 COALESCE(MIN(pnl_bps), 0) AS worst_bps
             FROM paper_trades WHERE status = 'closed'
-        """ + trade_mode_where + stats_model_where).fetchone()
-        excluded_models = int(db.execute(
-            "SELECT COUNT(*) FROM paper_trades WHERE status='closed'" + trade_mode_where
-            + (" AND COALESCE(pnl_model, 'z_approx') != 'l2_executable'" if sync_live else " AND 1=0")
-        ).fetchone()[0])
+        """ + trade_mode_where).fetchone()
     trades = int(stats["trades"] or 0)
     wins = int(stats["wins"] or 0)
     if current_rows and config:
@@ -1209,7 +1376,6 @@ def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, confi
             "realized_usdc": float(stats["realized"] or 0),
             "avg_bps": float(stats["avg_bps"] or 0),
             "worst_bps": float(stats["worst_bps"] or 0),
-            "excluded_legacy_z_trades": excluded_models,
         },
     }
 
@@ -1225,8 +1391,6 @@ def notify_dingtalk_paper_trade(state, alert_type, trade, row=None, reason=None)
     asset = trade.get("asset") or (row or {}).get("asset")
     leader = trade.get("leader") or (row or {}).get("leader")
     asset_notional, hedge_notional = paper_trade_leg_notionals(trade)
-    pnl_model = str(trade.get("pnl_model") or "z_approx")
-    model_text = "盘口可成交价模型" if pnl_model == "l2_executable" else "历史Z理论模型"
     lines = [
         f"{keyword} Hyperliquid 模拟盘提醒",
         f"类型：{alert_type}",
@@ -1235,21 +1399,17 @@ def notify_dingtalk_paper_trade(state, alert_type, trade, row=None, reason=None)
         f"方向：{paper_direction_label(trade.get('action'))}",
         f"模拟名义金额：{_fmt_plain(asset_notional, 2, ' U')} + {_fmt_plain(hedge_notional, 2, ' U')}",
         f"入场Z：{_fmt_signed(trade.get('entry_z'), 2)}",
-        f"盈亏算法：{model_text}",
+        "盈亏算法：两腿盘口可成交价，扣除配置成本",
     ]
     if row:
         lines.append(f"当前Z：{_fmt_signed(row.get('zscore'), 2)} | corr：{_fmt_signed(row.get('corr'), 3)} | 点差：{_fmt_plain(row.get('spread_bps'), 2, ' bps')}")
     if trade.get("pnl_bps") is not None and alert_type != "模拟开仓":
-        label = "模拟盘口盈亏" if pnl_model == "l2_executable" else "模拟Z理论盈亏"
-        lines.append(f"{label}：{_fmt_signed(trade.get('pnl_bps'), 1, ' bps')} / {_fmt_signed(trade.get('pnl_usdc'), 4, ' USDC')}")
+        lines.append(f"模拟成本后盈亏：{_fmt_signed(trade.get('pnl_bps'), 1, ' bps')} / {_fmt_signed(trade.get('pnl_usdc'), 4, ' USDC')}")
     if reason:
         lines.append(f"原因：{reason}")
     if dash:
         lines.append(f"看图：{dash}")
-    if pnl_model == "l2_executable":
-        lines.append("性质：模拟盘按当时买一/卖一估算成交；仍可能与真实IOC成交、手续费和资金费不同。")
-    else:
-        lines.append("性质：旧记录按Z变化折算，不代表真实价格利润，不纳入新版模拟胜率。")
+    lines.append("性质：模拟盘按当时买一/卖一估算成交；仍可能与真实IOC成交、手续费和资金费不同。")
     try:
         dingtalk_post(webhook, "\n".join(lines))
     except Exception as exc:
@@ -1300,10 +1460,15 @@ def load_live_trades_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None,
         stats = db.execute("""
             SELECT
                 COUNT(*) AS trades,
-                SUM(CASE WHEN pnl_usdc > 0 THEN 1 ELSE 0 END) AS wins,
-                COALESCE(SUM(pnl_usdc), 0) AS realized,
-                COALESCE(AVG(pnl_bps), 0) AS avg_bps,
-                COALESCE(MIN(pnl_bps), 0) AS worst_bps
+                SUM(CASE WHEN COALESCE(net_pnl_usdc, pnl_usdc) > 0 THEN 1 ELSE 0 END) AS wins,
+                COALESCE(SUM(COALESCE(net_pnl_usdc, pnl_usdc)), 0) AS realized,
+                COALESCE(AVG(COALESCE(net_pnl_bps, pnl_bps)), 0) AS avg_bps,
+                COALESCE(MIN(COALESCE(net_pnl_bps, pnl_bps)), 0) AS worst_bps,
+                COALESCE(SUM(pnl_usdc), 0) AS gross_realized,
+                COALESCE(SUM(fee_usdc), 0) AS fees,
+                COALESCE(SUM(funding_usdc), 0) AS funding,
+                COALESCE(SUM(asset_net_pnl_usdc), 0) AS asset_only_net,
+                COALESCE(SUM(hedge_net_pnl_usdc), 0) AS hedge_leg_net
             FROM live_trades WHERE status = 'closed'
         """).fetchone()
     if current_rows and config:
@@ -1345,6 +1510,11 @@ def load_live_trades_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None,
             "realized_usdc": float(stats["realized"] or 0),
             "avg_bps": float(stats["avg_bps"] or 0),
             "worst_bps": float(stats["worst_bps"] or 0),
+            "gross_realized_usdc": float(stats["gross_realized"] or 0),
+            "fee_usdc": float(stats["fees"] or 0),
+            "funding_usdc": float(stats["funding"] or 0),
+            "asset_only_net_usdc": float(stats["asset_only_net"] or 0),
+            "hedge_leg_net_usdc": float(stats["hedge_leg_net"] or 0),
         },
     }
 
@@ -1376,12 +1546,19 @@ def notify_dingtalk_live_trade(state, alert_type, trade, row=None, reason=None):
         lines.append(f"当前Z：{_fmt_signed(row.get('zscore'), 2)} | corr：{_fmt_signed(row.get('corr'), 3)} | 点差：{_fmt_plain(row.get('spread_bps'), 2, ' bps')}")
     if trade.get("pnl_usdc") is not None and (alert_type != "真实开仓"):
         lines.append(f"实际价格毛盈亏：{_fmt_signed(trade.get('pnl_usdc'), 4, ' U')} / {_fmt_signed(trade.get('pnl_bps'), 1, ' bps')}（未扣官方手续费、资金费）")
-        fee_bps = float(state.config.get("paper_fee_bps", 4.0) or 0)
-        total_notional = float(trade.get("total_notional_usdc") or 0)
-        if total_notional > 0 and fee_bps > 0:
-            net_bps = float(trade.get("pnl_bps") or 0) - fee_bps
-            net_usdc = float(trade.get("pnl_usdc") or 0) - total_notional * fee_bps / 10_000
-            lines.append(f"扣配置成本后参考：{_fmt_signed(net_usdc, 4, ' U')} / {_fmt_signed(net_bps, 1, ' bps')}（仍以官方账单为准）")
+        if trade.get("net_pnl_usdc") is not None:
+            lines.append(
+                f"官方手续费：{_fmt_plain(trade.get('fee_usdc'), 4, ' U')} | "
+                f"实际资金费：{_fmt_signed(trade.get('funding_usdc'), 4, ' U')}"
+            )
+            lines.append(f"官方成本后净盈亏：{_fmt_signed(trade.get('net_pnl_usdc'), 4, ' U')} / {_fmt_signed(trade.get('net_pnl_bps'), 1, ' bps')}")
+        else:
+            fee_bps = float(state.config.get("paper_fee_bps", 9.0) or 0)
+            total_notional = float(trade.get("total_notional_usdc") or 0)
+            if total_notional > 0 and fee_bps > 0:
+                net_bps = float(trade.get("pnl_bps") or 0) - fee_bps
+                net_usdc = float(trade.get("pnl_usdc") or 0) - total_notional * fee_bps / 10_000
+                lines.append(f"暂按配置成本估算净收益：{_fmt_signed(net_usdc, 4, ' U')} / {_fmt_signed(net_bps, 1, ' bps')}")
     if reason:
         lines.append(f"原因：{reason}")
     dash = _dashboard_url(state.config)
@@ -1551,7 +1728,7 @@ def live_expected_edge_bps(row, config):
     exit_z = float(config.get("paper_exit_z", 0.5) or 0.5)
     z_value_bps = float(config.get("paper_z_value_bps", 18.0) or 18.0)
     spread_bps = float(row.get("spread_bps") or 0)
-    fee_bps = float(config.get("paper_fee_bps", 4.0) or 4.0)
+    fee_bps = float(config.get("paper_fee_bps", 9.0) or 9.0)
     gross = max(0.0, z - exit_z) * z_value_bps
     estimated_cost = fee_bps + spread_bps * 2
     return gross - estimated_cost
@@ -1742,14 +1919,14 @@ def live_opportunity_diagnostics(state, rows, account=None, open_trades=None, li
     }
 
 
-def l2book_subscription_coins(rows, open_trades=None, leaders=None, limit=80):
+def l2book_subscription_coins(rows, open_trades=None, leaders=None):
     coins = {str(item).upper() for item in (leaders or []) if item}
     for trade in open_trades or []:
         coins.add(str(trade.get("asset") or "").upper())
         coins.add(str(trade.get("leader") or "").upper())
     ranked = list(rows or [])
     ranked.sort(key=lambda r: (0 if r.get("tag") == "candidate" else 1, -abs(float(r.get("zscore") or 0))))
-    for row in ranked[:limit]:
+    for row in ranked[:1000]:
         coins.add(str(row.get("asset") or "").upper())
         coins.add(str(row.get("leader") or "").upper())
     return {coin for coin in coins if coin}
@@ -2008,6 +2185,9 @@ def close_live_strategy_trade(state, trade, row, reason, scan_id):
     note = trade.get("note") or ""
     if skipped:
         note = f"{note}；部分腿按官方净仓对账跳过：{', '.join(skipped)}"
+    exit_ts = time.time()
+    exit_json = json.dumps({"response": response, "fills": fills, "skipped": skipped,
+                            "positions_before_close": position_sizes}, ensure_ascii=False)
     with sqlite3.connect(state.db_path) as db:
         db.execute("""
             UPDATE live_trades
@@ -2016,13 +2196,31 @@ def close_live_strategy_trade(state, trade, row, reason, scan_id):
                 closed_scan_id=?, exit_json=?, note=?
             WHERE id=?
         """, (
-            final_status, time.time(), row.get("zscore"), row.get("corr"), row.get("spread_bps"),
+            final_status, exit_ts, row.get("zscore"), row.get("corr"), row.get("spread_bps"),
             asset_exit, hedge_exit, pnl_usdc, pnl_bps, reason, scan_id,
-            json.dumps({"response": response, "fills": fills, "skipped": skipped,
-                        "positions_before_close": position_sizes}, ensure_ascii=False), note, trade["id"],
+            exit_json, note, trade["id"],
         ))
-    trade.update({"status": final_status, "exit_ts": time.time(), "exit_z": row.get("zscore"),
-                  "pnl_usdc": pnl_usdc, "pnl_bps": pnl_bps, "close_reason": reason, "note": note})
+    trade.update({"status": final_status, "exit_ts": exit_ts, "exit_z": row.get("zscore"),
+                  "asset_exit_px": asset_exit, "hedge_exit_px": hedge_exit,
+                  "pnl_usdc": pnl_usdc, "pnl_bps": pnl_bps, "close_reason": reason,
+                  "exit_json": exit_json, "note": note})
+    if final_status == "closed":
+        try:
+            costs = fetch_official_trade_costs(state.config, trade)
+            if costs:
+                with sqlite3.connect(state.db_path) as db:
+                    db.execute("""
+                        UPDATE live_trades SET pnl_usdc=?, pnl_bps=?, fee_usdc=?, funding_usdc=?,
+                            net_pnl_usdc=?, net_pnl_bps=?, asset_net_pnl_usdc=?, hedge_net_pnl_usdc=?
+                        WHERE id=?
+                    """, (
+                        costs["pnl_usdc"], costs["pnl_bps"], costs["fee_usdc"], costs["funding_usdc"],
+                        costs["net_pnl_usdc"], costs["net_pnl_bps"], costs["asset_net_pnl_usdc"],
+                        costs["hedge_net_pnl_usdc"], trade["id"],
+                    ))
+                trade.update(costs)
+        except Exception as exc:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] official trade cost lookup failed: {exc}", flush=True)
     notify_dingtalk_live_trade(state, "真实平仓" if final_status == "closed" else "真实平仓对账", trade, row, reason)
     return trade
 
@@ -2073,6 +2271,34 @@ def execute_live_emergency_flatten(state, reason="manual emergency close"):
             now_ts, "紧急全部平仓", "已发送紧急全部平仓；请以官方仓位为准",
             json.dumps(payload, ensure_ascii=False),
         ))
+    with state.lock:
+        latest_rows = list((state.latest or {}).get("rows", []))
+    strategy_rows = prepare_live_rows(latest_rows, state.config, state.l2book)
+    row_by_pair = {paper_pair_key(row): row for row in strategy_rows}
+    with sqlite3.connect(state.db_path) as db:
+        db.row_factory = sqlite3.Row
+        paper_open = [dict(row) for row in db.execute("""
+            SELECT * FROM paper_trades
+            WHERE status='open' AND mode='shared_strategy' AND pnl_model='l2_executable'
+        """).fetchall()]
+        for trade in paper_open:
+            row = row_by_pair.get(paper_pair_key(trade))
+            if not row:
+                db.execute("""
+                    UPDATE paper_trades SET status='archived', exit_ts=?, close_reason=? WHERE id=?
+                """, (now_ts, "真实紧急全部平仓；缺少当前盘口，模拟记录归档", trade["id"]))
+                continue
+            details = paper_trade_pnl_details(trade, row, state.config, now_ts)
+            db.execute("""
+                UPDATE paper_trades SET status='closed', exit_ts=?, exit_z=?, exit_corr=?,
+                    exit_spread_bps=?, exit_funding_hourly=?, pnl_bps=?, pnl_usdc=?,
+                    close_reason=?, pnl_model='l2_executable'
+                WHERE id=?
+            """, (
+                now_ts, row.get("zscore"), row.get("corr"), row.get("spread_bps"),
+                row.get("funding_hourly"), details["pnl_bps"], details["pnl_usdc"],
+                "真实紧急全部平仓同步", trade["id"],
+            ))
     notify_dingtalk_live_emergency(config, "紧急全部平仓",
                                    [f"状态：{status}",
                                     "仓位：" + "，".join(f"{p.get('coin')} {p.get('size')}" for p in positions),
@@ -2082,6 +2308,7 @@ def execute_live_emergency_flatten(state, reason="manual emergency close"):
 
 def update_live_trading(state, payload, scan_id):
     config = state.config
+    payload.setdefault("strategy_live_entries", {})
     if not config.get("live_enabled") or not config.get("live_strategy_enabled"):
         return load_live_trades_snapshot(state.db_path, current_rows=payload.get("rows", []), config=config)
     if not live_config_public(config).get("execution_ready"):
@@ -2194,6 +2421,7 @@ def update_live_trading(state, payload, scan_id):
             continue
         try:
             trade = open_live_strategy_trade(state, row, scan_id)
+            payload["strategy_live_entries"][trade["trade_key"]] = trade
             open_keys.add(trade["trade_key"])
             used_coins.add(str(trade["asset"]).upper())
             used_coins.add(str(trade["leader"]).upper())
@@ -2241,12 +2469,27 @@ def prepare_shared_strategy_cycle(state, payload, scan_id):
                 UPDATE paper_trades SET status='archived', exit_ts=?, close_reason='切换为统一策略模式'
                 WHERE status='open' AND mode != 'shared_strategy'
             """, (now_ts,))
+            db.execute("""
+                UPDATE paper_trades SET status='archived', exit_ts=?, close_reason='旧Z理论记录已退出交易界面'
+                WHERE status='open' AND mode='shared_strategy'
+                  AND COALESCE(pnl_model, 'z_approx') != 'l2_executable'
+            """, (now_ts,))
             state.shared_legacy_archived = True
         open_trades = [dict(row) for row in db.execute("""
             SELECT * FROM paper_trades
             WHERE status='open' AND mode='shared_strategy'
             ORDER BY entry_ts ASC
         """).fetchall()]
+        cooldown_seconds = max(0, int(config.get("live_reentry_cooldown_minutes", 15) or 0)) * 60
+        recent_closed_pairs = {
+            f"{row['asset']}:{row['leader']}": float(row["last_exit_ts"] or 0)
+            for row in db.execute("""
+                SELECT asset, leader, MAX(exit_ts) AS last_exit_ts
+                FROM paper_trades
+                WHERE status='closed' AND mode='shared_strategy' AND pnl_model='l2_executable'
+                GROUP BY asset, leader
+            """).fetchall()
+        }
         open_keys = {trade["trade_key"] for trade in open_trades}
         missing_pairs = [
             (trade["asset"], trade["leader"]) for trade in open_trades
@@ -2299,6 +2542,8 @@ def prepare_shared_strategy_cycle(state, payload, scan_id):
             leader = str(row.get("leader") or "").upper()
             if key in open_keys or key in closed_keys_this_round or asset in used_coins or leader in used_coins:
                 continue
+            if cooldown_seconds and now_ts - recent_closed_pairs.get(paper_pair_key(row), 0) < cooldown_seconds:
+                continue
             l2_reason = shared_strategy_l2_reject_reason(state, row)
             if l2_reason:
                 continue
@@ -2314,7 +2559,9 @@ def prepare_shared_strategy_cycle(state, payload, scan_id):
                 asset_notional = notional / max(1.0 + beta_abs, 1e-9)
                 hedge_notional = max(0.0, notional - asset_notional)
             asset_entry_px, hedge_entry_px = strategy_row_execution_prices(row, row.get("action"), closing=False)
-            pnl_model = "l2_executable" if asset_entry_px and hedge_entry_px else "z_approx"
+            if not asset_entry_px or not hedge_entry_px:
+                continue
+            pnl_model = "l2_executable"
             plan = f"统一策略：{row.get('plan', '')}；模拟与真实共用同一信号，真实开关只控制是否发送订单"
             trade = {
                 "id": None, "trade_key": key, "status": "open", "asset": row["asset"],
@@ -2343,9 +2590,22 @@ def finalize_shared_strategy_cycle(state, payload, scan_id, cycle):
     now_ts = cycle["now_ts"]
     opened_now = list(payload.get("strategy_pending_entries") or [])
     closed_now = list(payload.get("strategy_closed_events") or [])
+    live_entries = payload.get("strategy_live_entries") or {}
     with sqlite3.connect(state.db_path) as db:
         db.row_factory = sqlite3.Row
         for trade, row in opened_now:
+            live_trade = live_entries.get(trade["trade_key"])
+            if live_trade:
+                trade.update({
+                    "notional_usdc": live_trade["total_notional_usdc"],
+                    "asset_notional_usdc": live_trade["asset_notional_usdc"],
+                    "hedge_notional_usdc": live_trade["hedge_notional_usdc"],
+                    "asset_entry_px": live_trade["asset_entry_px"],
+                    "hedge_entry_px": live_trade["hedge_entry_px"],
+                    "entry_ts": live_trade["entry_ts"],
+                    "pnl_model": "l2_executable",
+                    "plan": trade["plan"] + "；真实已成交，本模拟记录使用真实入场成交价",
+                })
             existing = db.execute("""
                 SELECT id FROM paper_trades
                 WHERE status='open' AND mode='shared_strategy' AND trade_key=?
@@ -2699,6 +2959,7 @@ LIVE_CONFIG_FIELDS = {
     "live_account_address": {"env": "HLM_ACCOUNT_ADDRESS", "type": "address", "label": "主钱包公开地址"},
     "live_notional_usdc": {"env": "LIVE_NOTIONAL_USDC", "type": "float", "min": 1, "max": 100_000, "label": "每笔小币腿 USDC"},
     "live_max_open": {"env": "LIVE_MAX_OPEN", "type": "int", "min": 0, "max": 20, "label": "最多真实仓位"},
+    "live_reentry_cooldown_minutes": {"env": "LIVE_REENTRY_COOLDOWN_MINUTES", "type": "int", "min": 0, "max": 10080, "label": "同币对重新开仓冷却分钟"},
     "live_max_slippage_bps": {"env": "LIVE_MAX_SLIPPAGE_BPS", "type": "float", "min": 1, "max": 500, "label": "最大下单滑点 bps"},
     "live_leverage": {"env": "LIVE_LEVERAGE", "type": "int", "min": 1, "max": 50, "label": "真实交易杠杆倍数"},
     "live_auto_min_notional": {"env": "LIVE_AUTO_MIN_NOTIONAL", "type": "bool", "label": "低于交易所最低时自动补足"},
@@ -2709,7 +2970,6 @@ LIVE_CONFIG_FIELDS = {
     "live_l2_max_age_ms": {"env": "LIVE_L2_MAX_AGE_MS", "type": "float", "min": 100, "max": 60_000, "label": "l2Book 最大延迟 ms"},
     "live_strategy_entry_grace_ms": {"env": "LIVE_STRATEGY_ENTRY_GRACE_MS", "type": "float", "min": 0, "max": 60_000, "label": "统一信号真实执行宽限 ms"},
     "live_l2_max_spread_bps": {"env": "LIVE_L2_MAX_SPREAD_BPS", "type": "float", "min": 0, "max": 100, "label": "最大允许点差 bps"},
-    "live_l2_subscribe_limit": {"env": "LIVE_L2_SUBSCRIBE_LIMIT", "type": "int", "min": 2, "max": 1000, "label": "WS订阅数量"},
     "live_use_realtime_z": {"env": "LIVE_USE_REALTIME_Z", "type": "bool", "label": "使用 l2Book 实时近似 Z"},
     "live_realtime_strategy_interval_ms": {"env": "LIVE_REALTIME_STRATEGY_INTERVAL_MS", "type": "float", "min": 100, "max": 10_000, "label": "WS策略判断间隔 ms"},
     "live_require_leverage_ok": {"env": "LIVE_REQUIRE_LEVERAGE_OK", "type": "bool", "label": "杠杆设置失败时跳过"},
@@ -3193,7 +3453,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <button onclick="openLiveDialog()">打开策略 / 实盘设置</button>
 <span id="pSaveStatus" class="subtle">模拟与真实只使用这一套策略控件；真实专属执行项放在同一弹窗后半部分。</span>
 </div>
-<div class="subtle">模拟盘始终运行。新版模拟按两腿买一/卖一估算盈亏；历史 Z 折算记录保留查看，但不再计入新版胜率和累计收益。</div>
+<div class="subtle">模拟盘始终运行，只显示按两腿买一/卖一形成的可成交价格记录；旧 Z 理论记录已从交易界面移除。</div>
 </div>
 <div>
 <canvas id="paperChart" class="mini" width="760" height="190"></canvas>
@@ -3201,7 +3461,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 </div>
 </div>
 <div class="paperTableWrap">
-<table id="paperTbl"><thead><tr><th>状态</th><th>币对</th><th>方向</th><th>入场Z</th><th>当前/出场Z</th><th>模拟算法</th><th>盈亏</th><th>原因</th></tr></thead><tbody></tbody></table>
+<table id="paperTbl"><thead><tr><th>状态</th><th>币对</th><th>方向</th><th>入场Z</th><th>当前/出场Z</th><th>成本后盈亏</th><th>原因</th></tr></thead><tbody></tbody></table>
 </div>
 </section>
 <section>
@@ -3254,6 +3514,8 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">真实已平仓 / 胜率</div><div id="liveClosedWin">-</div></div>
     <div class="metric"><div class="muted">真实已实现</div><div id="liveRealized">-</div></div>
     <div class="metric"><div class="muted">真实平均 / 最差</div><div id="liveAvgWorst">-</div></div>
+    <div class="metric"><div class="muted">官方手续费 / 资金费</div><div id="liveCosts">-</div></div>
+    <div class="metric"><div class="muted">双腿 vs 单腿影子</div><div id="liveHedgeCompare">-</div></div>
     <div class="metric"><div class="muted">l2Book WS 盘口</div><div id="liveL2Status">-</div></div>
     <div class="metric"><div class="muted">本轮真实机会</div><div id="liveOpportunityStatus">-</div></div>
     <div class="metric"><div class="muted">WS实时策略引擎</div><div id="liveRealtimeEngine">-</div></div>
@@ -3266,6 +3528,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="paperForm">
       <label>统一策略档位<select id="liveRiskPreset" onchange="applyLiveRiskPreset(this.value)"><option value="conservative">保守：少交易</option><option value="balanced">中等：测试</option><option value="aggressive">激进：多交易</option><option value="custom">自定义</option></select></label>
       <label>统一策略最多持仓<input id="cfg_live_max_open" type="number" step="1"></label>
+      <label>同币对冷却分钟<input id="cfg_live_reentry_cooldown_minutes" type="number" min="0" max="10080" step="1"></label>
       <label>回归平仓Z<input id="cfg_paper_exit_z" type="number" step="0.1"></label>
       <label>固定止盈bps（0关闭）<input id="cfg_paper_take_profit_bps" type="number" step="1" min="0"></label>
       <label>止损bps<input id="cfg_paper_stop_bps" type="number" step="1"></label>
@@ -3283,7 +3546,6 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
         <label>盘口最大年龄ms<input id="cfg_live_l2_max_age_ms" type="number" min="100" max="60000" step="100"></label>
         <label>已确认盘口宽限ms<input id="cfg_live_strategy_entry_grace_ms" type="number" min="0" max="60000" step="100"></label>
         <label>最大允许点差bps<input id="cfg_live_l2_max_spread_bps" type="number" min="0" max="100" step="0.1"></label>
-        <label>WS订阅数量<input id="cfg_live_l2_subscribe_limit" type="number" min="2" max="1000" step="1"></label>
         <label>WS实时Z<select id="cfg_live_use_realtime_z"><option value="true">开启（推荐）</option><option value="false">关闭</option></select></label>
         <label>策略判断节流ms<input id="cfg_live_realtime_strategy_interval_ms" type="number" min="100" max="10000" step="100" title="有新盘口时，最多按这个间隔合并判断一次。500ms不是行情延迟。"></label>
       </div>
@@ -3312,9 +3574,9 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     </details>
   </div>
   <h3>当前 / 历史真实交易</h3>
-  <div class="detailText">持仓显示“盘口估算”，已平仓显示真实成交毛盈亏。点击任意一行可查看两腿成交价和原始订单回执。</div>
+  <div class="detailText">持仓显示盘口估算；已平仓显示 Hyperliquid 官方手续费和资金费后的净盈亏。点击任意一行可查看两腿成交价和原始订单回执。</div>
   <div class="paperTableWrap" style="max-height:440px"><table id="liveTradeTbl"><thead><tr><th>状态</th><th>币对</th><th>方向</th><th>开仓时间</th><th>平仓时间</th><th>持仓时长</th><th>相关</th><th>Beta</th><th>入场Z</th><th>当前/出场Z</th><th>小币15m</th><th>保护15m</th><th>点差</th><th>资金费/小时</th><th>名义金额</th><th>盈亏</th><th>原因</th></tr></thead><tbody></tbody></table></div>
-  <p id="liveStatsNote" class="subtle">真实统计只计算已平仓真实策略记录；真实盈亏按成交价粗算，未扣交易所手续费与资金费；最终以 Hyperliquid 官方记录为准。</p>
+  <p id="liveStatsNote" class="subtle">真实统计正在读取 Hyperliquid 官方成交手续费和资金费。</p>
   <h3>为什么这一轮没有交易</h3>
   <div id="liveDiagnosticSummary" class="detailText">读取服务器当前过滤结果中...</div>
   <div class="paperTableWrap" style="max-height:360px"><table id="liveDiagnosticTbl"><thead><tr><th>结果</th><th>币对</th><th>WS Z</th><th>K线Z</th><th>相关</th><th>点差</th><th>预期边际</th><th>方向</th><th>具体原因</th></tr></thead><tbody></tbody></table></div>
@@ -3419,17 +3681,19 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <h3>真实交易为什么看起来没赚没亏</h3>
 <p>你现在每笔很小，通常十几 USDC 一条腿。价格动一点点，显示出来可能只有几分钱，手续费、点差和资金费会很容易吃掉它。</p>
 <p>所以小仓位阶段主要是在验证：能不能正确开平仓、滑点多大、异常能不能及时发现，而不是马上看大额利润。</p>
-<p><b>旧版模拟为什么总显得赚钱：</b>旧算法把 Z 的变化直接乘以“每1Z折算bps”。例如入场 Z=-4.72、出场 Z=-0.38，旧算法约为 <code>(-0.38 - -4.72) × 18 - 4 = 74.1bps</code>。这只是指标回归分数，不是 LTC 与 ETH 两腿的价格利润。</p>
-<p><b>新版模拟怎么计算：</b>做多的一腿按卖一价模拟买入、按买一价模拟卖出；做空的一腿按买一价模拟卖出、按卖一价模拟买回，再按两腿名义金额计算 bps，并扣除“模拟手续费/额外滑点”。因此 ADA 即使 Z 从 2.01 回到 -0.17，如果 ADA 与 ETH 的实际价格组合亏损，新模拟也会显示亏损。</p>
-<p>真实盘仍可能和新版模拟差几 bps，因为真实 IOC 从判断到成交有时间差，还存在真实成交档位、手续费和资金费。新版的目标是接近真实，而不是制造漂亮胜率。</p>
+<p><b>模拟怎么计算：</b>做多的一腿按卖一价模拟买入、按买一价模拟卖出；做空的一腿按买一价模拟卖出、按卖一价模拟买回，再按两腿名义金额计算 bps，并扣除“模拟手续费/额外滑点”。因此 ADA 即使 Z 回归，如果 ADA 与 ETH 的真实价格组合亏损，模拟也会显示亏损。</p>
+<p>旧版把 Z 变化直接折算成收益的算法已经从交易界面删除，因为 Z 回归不等于两腿价格一定赚钱。真实盘仍可能和模拟差几 bps，原因是 IOC 发送耗时、真实成交档位、手续费和资金费。</p>
+<p><b>这次官方账单核对：</b>85 笔正常平仓的价格毛收益约 -0.354U，官方手续费约 1.767U，资金费约 -0.001U，最终净收益约 -2.122U。说明当前首先要解决的是信号质量和交易频率，不是更换行情 API。</p>
 
 <h3>真实面板顶部每一项是什么</h3>
 <p><code>真实下单状态</code>：总开关和策略开关是否同时开启。</p>
 <p><code>账户模式 / 可用USDC</code>：Hyperliquid 当前可用于保证金和下单的余额，不等于你愿意承担的最大亏损。</p>
 <p><code>当前真实仓位数</code>：官方账户当前非零合约仓位；程序记录和官方仓位不一致时应优先看官方。</p>
 <p><code>真实已平仓 / 胜率</code>：只统计程序真实成交并正常平仓的记录。胜率高不代表赚钱，仍要看平均 bps。</p>
-<p><code>真实已实现</code>：按成交价格粗算的累计盈亏，目前不含官方手续费和资金费。</p>
+<p><code>真实已实现</code>：按 Hyperliquid 官方成交、手续费和实际资金费计算的净盈亏。</p>
 <p><code>真实平均 / 最差</code>：平均每笔 bps 和历史最差单笔。平均长期为正比单看胜率更重要。</p>
+<p><code>官方手续费 / 资金费</code>：手续费是开、平两条腿的真实收费；资金费是持仓期间多空之间的实际收付。</p>
+<p><code>双腿 vs 单腿影子</code>：单腿影子是假设历史只做小币腿的比较，不会发送单腿订单。当前历史中保护腿多数拖累，但单腿结果仍然亏，所以暂不开放真实单腿开关。</p>
 <p><code>l2Book WS盘口</code>：WebSocket 是否连接、订阅了多少币、最新消息年龄。</p>
 <p><code>本轮真实机会</code>：目前有多少组合通过基础过滤；通过后仍要检查账户、最低金额、盘口深度和杠杆。</p>
 <p><code>WS实时策略引擎</code>：实时判断是否在运行、多久判断一次、最近是否报错。</p>
@@ -3446,6 +3710,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>每笔小币腿USDC</code>：小币这一腿想下多少名义金额。保护腿会按 beta 自动折算，不是固定同样金额。</p>
 <p><code>低于交易所最低</code>：Hyperliquid 单腿最低约 10U。选择“跳过”时，小额不下单；选择“自动补到最低”时，会把金额抬到两条腿都满足最低订单。</p>
 <p><code>统一策略最多持仓</code>：模拟和真实共用的最多组合数。小资金阶段建议 1。</p>
+<p><code>同币对冷却分钟</code>：一个组合刚平仓后，至少等这么久才允许再次开仓。它用于阻止几秒内反复开平、被手续费连续磨损；默认 15 分钟。</p>
 <p><code>最大滑点bps</code>：IOC 限价单最多允许比当前可成交价差多少。太小容易不成交，太大容易成交很差。</p>
 <p><code>杠杆倍数</code>：放大仓位，不提高胜率。小资金测试建议先 1x，确认策略真实转正后再考虑提高。</p>
 <p><code>杠杆失败处理</code>：有些小币不支持设置的杠杆。默认“跳过”更安全，避免你以为是 5x，实际交易所没接受。</p>
@@ -3467,7 +3732,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>账户缓存最大年龄ms</code>：缓存超过多旧就拒绝开仓。不是行情延迟。</p>
 <p><code>杠杆预设缓存秒</code>：同一币种杠杆已经设置成功后，多长时间内不重复调用设置接口。</p>
 <p><code>l2Book最大点差bps</code>：实时盘口点差上限。超过这个值说明进出场成本太高，跳过。</p>
-<p><code>WS订阅数量</code>：服务器实时监听多少个重点币盘口。不是模拟扫描数量；模拟可以扫 150+，WS 默认只盯前 80 个重点币加 BTC/ETH。</p>
+<p><code>WS盘口覆盖</code>：服务器现在自动订阅本轮全部扫描币、保护腿和持仓币，最多 1000 个，不再由“150”参数截断。因此观察表和可做实时盘口校验的币集合保持一致。</p>
 <p><code>WS实时Z</code>：用最近一次历史K线计算出的 beta/均值/波动率作为基准，再用 l2Book 最新 mid 估算当前偏离。它适合开仓前/平仓前快速确认，但不是完整历史回测。</p>
 <p><code>策略判断节流ms</code>：WS 行情本身持续接收；500ms 表示把这段时间内的新盘口合并判断一次，避免每条消息都重复查库。它不是 500ms 网络延迟。</p>
 <p><code>真实下单总开关</code>：最外层保险。关闭后绝不会发送新的真实订单。</p>
@@ -3491,8 +3756,13 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>统一策略</code>：模拟盘始终运行并产生唯一的开平仓决定。真实开关关闭时只模拟；真实开关开启时，真实模块只把本轮刚出现的同一个模拟开仓事件发送成真实订单。</p>
 <p>统一模式下，WS Z、相关性、点差、预期边际、方向、止盈止损和最多持仓都共用一套参数。真实盘额外检查余额、最低订单、杠杆和实际成交；这些属于执行条件，不会改变模拟策略本身。</p>
 <p><code>盘口可成交价</code>：新版记录。模拟多头按卖一买、买一卖；模拟空头按买一卖、卖一买。新版累计收益、胜率和利润曲线只统计这种记录。</p>
-<p><code>历史Z理论</code>：旧版记录。它只根据 Z 变化折算，可能出现模拟 +35bps、真实只有几 bps 甚至亏损。保留用于复盘，但不再混入新版统计。</p>
+<p>旧 Z 理论交易记录仍留在 SQLite 里用于审计，但不会再出现在模拟交易表、胜率或利润曲线中。</p>
 <p><code>双腿名义金额</code>：模拟与真实会显示同样的“小币腿 + 保护腿”格式，例如 18.9U + 10.5U，不再一个显示总额、另一个显示两腿。</p>
+
+<h3>保护腿、现货和资金费怎么选</h3>
+<p><code>保护腿</code>不是必然降低风险。它只能减少 BTC/ETH 大盘方向影响，也会增加一条腿的点差和两次成交手续费。当前历史中保护腿 16 次帮助、69 次拖累；但只做小币腿的影子结果也仍然亏，所以现阶段应继续比较，而不是直接切成真实单腿。</p>
+<p><code>现货</code>不能直接替代当前永续策略，因为当小币相对过强时需要做空小币，普通现货没有做空能力。Hyperliquid 虽有现货市场，但当前自动交易代码是永续合约双腿逻辑，不能混用。</p>
+<p><code>资金费套利</code>可以单独研究，例如现货多头配永续空头赚正资金费，但它是另一套持仓周期和风险模型。当前 85 笔的实际资金费约 -0.001U，远小于 1.767U 手续费，不能用资金费把这套超短线策略救回来。</p>
 
 <h3>推送参数怎么读</h3>
 <p><code>候选首次出现</code>：某个币对第一次达到候选条件时推送。</p>
@@ -3620,12 +3890,8 @@ function showRowDetail(row, stats={}, seriesRows=[], candleRows=[]){
     <div class="detailText">${explainRow(row)}</div>
     <h3>历史质量</h3>
     <div class="detailText">样本：${row.samples||'-'}；相关均值：${fmt(stats.corr_avg,3)}；相关波动：${fmt(stats.corr_std,3)}；候选率：${fmt((stats.candidate_ratio||0)*100,1)}%；平均点差：${fmt(stats.spread_avg,2)} bps；最大点差：${fmt(stats.spread_max,2)} bps。</div>
-    <h3>图表和数据库复盘</h3>
-    <div class="controls">
-      <button onclick="runBacktest()">数据库复盘</button>
-      <span class="subtle">默认使用服务器 SQLite 记录，不再临时刷交易所 K 线；图表滚轮缩放，拖拽平移。</span>
-    </div>
-    <div id="mBacktest" class="metric">点击“数据库复盘”后显示</div>
+    <h3>历史走势</h3>
+    <div class="subtle">这里只画真实采集到的价格、Z、相关性和点差，不再把旧 Z 理论公式包装成收益回测。图表可滚轮缩放、拖拽平移。</div>
     <div class="detailCharts">
       <canvas id="priceChart" width="1100" height="260"></canvas>
       <canvas id="zChart" width="1100" height="240"></canvas>
@@ -3649,21 +3915,6 @@ function explainRow(row){
     return '它有明显偏离，但交易质量不够好，通常是点差太大或盘口太差。模拟盘可以观察，真实交易容易被滑点吃掉。';
   }
   return '它现在只是观察项：偏离、相关性或点差没有同时满足条件。先记录，不适合当作开仓信号。';
-}
-async function runBacktest(){
-  if(!selectedRow) return;
-  const row=selectedRow;
-  document.getElementById('mBacktest').textContent='正在读取数据库复盘...';
-  try{
-    const zValue=document.getElementById('cfg_paper_z_value_bps')?.value||18;
-    const fee=document.getElementById('cfg_paper_fee_bps')?.value||4;
-    const exitZ=document.getElementById('cfg_paper_exit_z')?.value||0.5;
-    const r=await fetch(`backtest?source=db&asset=${encodeURIComponent(row.asset)}&leader=${encodeURIComponent(row.leader)}&hours=168&entry_z=2&exit_z=${encodeURIComponent(exitZ)}&max_hold=36&fee_bps=${encodeURIComponent(fee)}&z_value_bps=${encodeURIComponent(zValue)}`);
-    const data=await r.json();
-    if(!data.ok){document.getElementById('mBacktest').textContent=data.error||'复盘失败';return}
-    const x=data.result;
-    document.getElementById('mBacktest').innerHTML=`来源 ${x.source||'db'}；样本 ${x.points||'-'} 点；交易 ${x.trades.length} 次；胜率 ${fmt(x.win_rate*100,1)}%；总 ${fmt(x.total_bps,1)} bps；均 ${fmt(x.avg_bps,1)} bps；最差 ${fmt(x.worst_bps,1)} bps<br><span class="subtle">${x.note||''}</span>`;
-  }catch(e){document.getElementById('mBacktest').textContent='复盘失败：'+e}
 }
 function canvasMetrics(c){
   const rect=c.getBoundingClientRect();
@@ -3862,15 +4113,14 @@ function paperActionText(action){
   if(action==='long_asset_short_hedge') return '多小币/空保护';
   return action||'-';
 }
-function paperPnlModelText(model){return model==='l2_executable'?'盘口可成交价':'历史Z理论'}
 function renderPaper(data){
   const cfg=data.config||{}, stats=data.stats||{};
   const open=data.open||[], closed=data.closed||[], equity=data.equity||[];
   fillPaperConfig(cfg, false);
   const synced=cfg.paper_sync_live!==false;
   document.getElementById('pStatus').textContent=(synced?'统一策略模拟：始终运行':(cfg.paper_enabled===false?'独立模拟关闭':'独立模拟运行'))+`；持仓 ${open.length} 个`;
-  document.getElementById('pPnl').textContent=`新版盘口模型已实现 ${fmt(stats.realized_usdc,2)} USDC`;
-  document.getElementById('pWin').textContent=`新版 ${fmt((stats.win_rate||0)*100,1)}% / ${stats.trades||0} 次`+(stats.excluded_legacy_z_trades?`；旧Z记录 ${stats.excluded_legacy_z_trades} 笔未计入`:'');
+  document.getElementById('pPnl').textContent=`盘口成交模型已实现 ${fmt(stats.realized_usdc,2)} USDC`;
+  document.getElementById('pWin').textContent=`${fmt((stats.win_rate||0)*100,1)}% / ${stats.trades||0} 次`;
   const tp=Number(cfg.paper_take_profit_bps||0);
   document.getElementById('pConfig').textContent=(synced?'与真实盘共用入场/退出信号；真实关闭时仍模拟；':`每笔 ${fmt(cfg.paper_notional_usdc,0)}U；`)+`固定止盈 ${tp>0?fmt(tp,0)+'bps':'关闭'}；止损 ${fmt(cfg.paper_stop_bps,0)}bps；回归Z ${fmt(cfg.paper_exit_z,2)}；最长 ${cfg.paper_max_hold_minutes||'-'}分`;
   drawPaperEquity(equity, true);
@@ -3879,7 +4129,7 @@ function renderPaper(data){
   rows.forEach(row=>{
     const tr=document.createElement('tr');
     const zNow=row.exit_z ?? row.current_z ?? '-';
-    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${paperActionText(row.action)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td>${paperPnlModelText(row.pnl_model)}</td><td class="${Number(row.pnl_usdc)>=0?'scoreGood':'scoreBad'}">${fmt(row.pnl_bps,1)} bps / ${fmt(row.pnl_usdc,4)}U</td><td style="text-align:left">${row.close_reason||row.plan||''}</td>`;
+    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${paperActionText(row.action)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td class="${Number(row.pnl_usdc)>=0?'scoreGood':'scoreBad'}">${fmt(row.pnl_bps,1)} bps / ${fmt(row.pnl_usdc,4)}U</td><td style="text-align:left">${row.close_reason||row.plan||''}</td>`;
     tr.onclick=()=>showPaperTradeDetail(row);
     tb.appendChild(tr);
   });
@@ -3893,19 +4143,18 @@ function showPaperTradeDetail(row){
     <div class="detailGrid">
       <div class="detailBox"><div class="muted">状态</div><div>${row._status||row.status}</div></div>
       <div class="detailBox"><div class="muted">方向</div><div>${paperActionText(row.action)}</div></div>
-      <div class="detailBox"><div class="muted">双腿名义金额</div><div>${assetNotional&&hedgeNotional?fmt(assetNotional,2)+'U + '+fmt(hedgeNotional,2)+'U':fmt(row.notional_usdc,2)+'U（旧记录）'}</div></div>
+      <div class="detailBox"><div class="muted">双腿名义金额</div><div>${fmt(assetNotional,2)}U + ${fmt(hedgeNotional,2)}U</div></div>
       <div class="detailBox"><div class="muted">入场时间</div><div>${entryTime}</div></div>
       <div class="detailBox"><div class="muted">出场时间</div><div>${exitTime}</div></div>
       <div class="detailBox"><div class="muted">Beta</div><div>${fmt(row.beta,2)}</div></div>
       <div class="detailBox"><div class="muted">入场Z</div><div>${fmt(row.entry_z,2)}</div></div>
       <div class="detailBox"><div class="muted">当前/出场Z</div><div>${fmt(row.exit_z ?? row.current_z,2)}</div></div>
-      <div class="detailBox"><div class="muted">模拟算法</div><div>${paperPnlModelText(row.pnl_model)}</div></div>
       <div class="detailBox"><div class="muted">模拟盈亏</div><div class="${Number(row.pnl_usdc)>=0?'scoreGood':'scoreBad'}">${fmt(row.pnl_bps,1)} bps / ${fmt(row.pnl_usdc,4)} USDC</div></div>
     </div>
     <h3>原因/计划</h3>
     <div class="detailText">${row.close_reason||row.plan||'持仓观察中'}</div>
     <h3>注意</h3>
-    <div class="detailText">${row.pnl_model==='l2_executable'?'新版记录按开仓和当前/平仓时的买一卖一估算两腿收益，并扣除配置成本；真实IOC仍会因下单耗时、实际成交、手续费和资金费略有不同。':'这是旧版 Z 变化折算收益，不是两腿价格利润，已不纳入新版模拟胜率与累计收益。'}</div>
+    <div class="detailText">这条记录按开仓和当前/平仓时的买一卖一计算两腿收益，并扣除配置成本；真实 IOC 仍会因发送耗时、实际成交档位和官方费用略有不同。</div>
   `;
   detailDlg.showModal();
 }
@@ -3969,7 +4218,7 @@ async function openGlobalDialog(){
     document.getElementById('globalApiStatus').textContent='读取失败：'+e.message;
   }
 }
-const liveConfigKeys=['live_enabled','live_account_poll_seconds','live_account_cache_max_age_ms','live_leverage_cache_seconds','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_strategy_entry_grace_ms','live_l2_max_spread_bps','live_l2_subscribe_limit','live_use_realtime_z','live_realtime_strategy_interval_ms','live_strategy_enabled'];
+const liveConfigKeys=['live_enabled','live_account_poll_seconds','live_account_cache_max_age_ms','live_leverage_cache_seconds','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_reentry_cooldown_minutes','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_strategy_entry_grace_ms','live_l2_max_spread_bps','live_use_realtime_z','live_realtime_strategy_interval_ms','live_strategy_enabled'];
 function liveCfgEl(key){return document.getElementById('cfg_'+key)}
 const liveRiskPresets={
   conservative:{live_min_entry_z:3.0,live_min_corr:0.75,live_min_expected_edge_bps:25,live_l2_max_spread_bps:2.5},
@@ -4009,13 +4258,14 @@ function fillLiveConfig(cfg){
 function readLiveConfig(){
   return {
     live_enabled:liveCfgEl('live_enabled').value==='true',
-    live_account_poll_seconds:parseFloat(liveCfgEl('account_poll_seconds').value),
-    live_account_cache_max_age_ms:parseFloat(liveCfgEl('account_cache_max_age_ms').value),
-    live_leverage_cache_seconds:parseFloat(liveCfgEl('leverage_cache_seconds').value),
+    live_account_poll_seconds:parseFloat(liveCfgEl('live_account_poll_seconds').value),
+    live_account_cache_max_age_ms:parseFloat(liveCfgEl('live_account_cache_max_age_ms').value),
+    live_leverage_cache_seconds:parseFloat(liveCfgEl('live_leverage_cache_seconds').value),
     live_account_address:liveCfgEl('live_account_address').value.trim(),
     live_notional_usdc:parseFloat(liveCfgEl('live_notional_usdc').value),
     live_auto_min_notional:liveCfgEl('live_auto_min_notional').value==='true',
     live_max_open:parseInt(liveCfgEl('live_max_open').value,10),
+    live_reentry_cooldown_minutes:parseInt(liveCfgEl('live_reentry_cooldown_minutes').value,10),
     live_max_slippage_bps:parseFloat(liveCfgEl('live_max_slippage_bps').value),
     live_leverage:parseInt(liveCfgEl('live_leverage').value,10),
     live_require_leverage_ok:liveCfgEl('live_require_leverage_ok').value==='true',
@@ -4026,7 +4276,6 @@ function readLiveConfig(){
     live_l2_max_age_ms:parseFloat(liveCfgEl('live_l2_max_age_ms').value),
     live_strategy_entry_grace_ms:parseFloat(liveCfgEl('live_strategy_entry_grace_ms').value),
     live_l2_max_spread_bps:parseFloat(liveCfgEl('live_l2_max_spread_bps').value),
-    live_l2_subscribe_limit:parseInt(liveCfgEl('live_l2_subscribe_limit').value,10),
     live_use_realtime_z:liveCfgEl('live_use_realtime_z').value==='true',
     live_realtime_strategy_interval_ms:parseFloat(liveCfgEl('live_realtime_strategy_interval_ms').value),
     live_strategy_enabled:liveCfgEl('live_strategy_enabled').value==='true',
@@ -4034,15 +4283,15 @@ function readLiveConfig(){
 }
 function livePerformanceRows(snapshot){
   const closed=(snapshot.closed||[])
-    .filter(r=>r.status==='closed' && !isNaN(Number(r.pnl_usdc)) && !isNaN(Number(r.pnl_bps)))
+    .filter(r=>r.status==='closed' && !isNaN(Number(r.net_pnl_usdc??r.pnl_usdc)) && !isNaN(Number(r.net_pnl_bps??r.pnl_bps)))
     .sort((a,b)=>Number(a.exit_ts||a.entry_ts||0)-Number(b.exit_ts||b.entry_ts||0));
   let equity=0, peak=0, wins=0;
   return closed.map((r,i)=>{
-    const pnl=Number(r.pnl_usdc||0), bps=Number(r.pnl_bps||0);
+    const pnl=Number(r.net_pnl_usdc??r.pnl_usdc??0), bps=Number(r.net_pnl_bps??r.pnl_bps??0);
     equity+=pnl; peak=Math.max(peak,equity); if(pnl>0) wins+=1;
     const window=closed.slice(Math.max(0,i-9),i+1);
-    const rollingWins=window.filter(x=>Number(x.pnl_usdc||0)>0).length;
-    const avgBps=closed.slice(0,i+1).reduce((s,x)=>s+Number(x.pnl_bps||0),0)/(i+1);
+    const rollingWins=window.filter(x=>Number(x.net_pnl_usdc??x.pnl_usdc??0)>0).length;
+    const avgBps=closed.slice(0,i+1).reduce((s,x)=>s+Number(x.net_pnl_bps??x.pnl_bps??0),0)/(i+1);
     return {
       ts:Number(r.exit_ts||r.entry_ts||0),
       trade_no:i+1,
@@ -4093,8 +4342,7 @@ function renderL2Book(l2){
   if(el){
     const age=status.last_message_age_ms===null||status.last_message_age_ms===undefined?'-':fmt(status.last_message_age_ms,0)+'ms';
     const scanText=status.scan_rows!==undefined?`；扫描 ${status.scan_rows}`:'';
-    const limitText=status.subscribe_limit!==undefined?`；上限 ${status.subscribe_limit}`:'';
-    el.textContent=`${status.connected?'已连接':'未连接'}；订阅 ${status.subscribed||0}/${status.desired||0}${limitText}${scanText}；盘口 ${status.books||0}；最新 ${age}`;
+    el.textContent=`${status.connected?'已连接':'未连接'}；订阅 ${status.subscribed||0}/${status.desired||0}${scanText}；盘口 ${status.books||0}；最新 ${age}`;
     el.className=status.connected?'scoreGood':'scoreBad';
   }
   const tb=document.querySelector('#liveL2Tbl tbody'); if(!tb)return; tb.innerHTML='';
@@ -4177,6 +4425,8 @@ function renderLive(data){
   document.getElementById('livePositionCount').textContent=account.ts?`${positions.length} 个；快照 ${new Date(account.ts*1000).toLocaleString()}`:'暂无；填写主钱包公开地址后等下一轮采集';
   const trades=Number(liveStats.trades||0), wins=Number(liveStats.wins||0), winRate=Number(liveStats.win_rate||0)*100;
   const realized=Number(liveStats.realized_usdc||0), avgBps=Number(liveStats.avg_bps||0), worstBps=Number(liveStats.worst_bps||0);
+  const gross=Number(liveStats.gross_realized_usdc||0), fees=Number(liveStats.fee_usdc||0), funding=Number(liveStats.funding_usdc||0);
+  const assetOnly=Number(liveStats.asset_only_net_usdc||0), hedgeLeg=Number(liveStats.hedge_leg_net_usdc||0);
   document.getElementById('liveClosedWin').textContent=`${trades} 笔 / ${fmt(winRate,1)}%（赢 ${wins}）`;
   const realizedEl=document.getElementById('liveRealized');
   realizedEl.textContent=`${fmt(realized,4)} U`;
@@ -4184,8 +4434,12 @@ function renderLive(data){
   const avgWorstEl=document.getElementById('liveAvgWorst');
   avgWorstEl.textContent=`${fmt(avgBps,1)} bps / ${fmt(worstBps,1)} bps`;
   avgWorstEl.className=avgBps>=0?'scoreGood':'scoreBad';
+  document.getElementById('liveCosts').textContent=`手续费 ${fmt(fees,4)}U；资金费 ${fmt(funding,4)}U`;
+  const hedgeEl=document.getElementById('liveHedgeCompare');
+  hedgeEl.textContent=`双腿 ${fmt(realized,4)}U；仅小币影子 ${fmt(assetOnly,4)}U；保护腿 ${fmt(hedgeLeg,4)}U`;
+  hedgeEl.className=hedgeLeg>=0?'scoreGood':'scoreBad';
   const note=document.getElementById('liveStatsNote');
-  if(note) note.textContent=`真实统计：已平仓 ${trades} 笔，胜率 ${fmt(winRate,1)}%，已实现 ${fmt(realized,4)}U，平均 ${fmt(avgBps,1)}bps，最差 ${fmt(worstBps,1)}bps。统计未扣官方手续费和资金费，最终以 Hyperliquid 官方为准。点击行查看原始成交回执。`;
+  if(note) note.textContent=`官方成本后统计：${trades} 笔，净胜率 ${fmt(winRate,1)}%，毛收益 ${fmt(gross,4)}U - 手续费 ${fmt(fees,4)}U + 资金费 ${fmt(funding,4)}U = 净收益 ${fmt(realized,4)}U；平均 ${fmt(avgBps,1)}bps，最差 ${fmt(worstBps,1)}bps。单腿影子只用于比较，不会自动下单。`;
   if(account.ts && isUnified){
     document.getElementById('liveBlocker').textContent=`当前是 Hyperliquid 统一账户：可用 ${fmt(account.spot_available_usdc??account.spot_usdc,2)} USDC 会直接作为合约保证金来源，不需要也不能手动转入 Perps。`;
   }else if(account.ts && Number(account.account_value||0)<=0 && Number(account.spot_available_usdc ?? account.spot_usdc ?? 0)>0){
@@ -4214,8 +4468,8 @@ function renderLiveTrades(snapshot){
   rows.forEach(row=>{
     const tr=document.createElement('tr');
     const zNow=row.status==='open'?(row.current_z??row.entry_z):(row.exit_z??row.entry_z);
-    const pnl=row.status==='open'?(row.signal_pnl_usdc??0):row.pnl_usdc;
-    const pnlBps=row.status==='open'?(row.signal_pnl_bps??0):row.pnl_bps;
+    const pnl=row.status==='open'?(row.signal_pnl_usdc??0):(row.net_pnl_usdc??row.pnl_usdc);
+    const pnlBps=row.status==='open'?(row.signal_pnl_bps??0):(row.net_pnl_bps??row.pnl_bps);
     const corr=row.status==='open'?(row.current_corr??row.entry_corr):row.exit_corr??row.entry_corr;
     const beta=row.status==='open'?(row.current_beta??row.beta):row.beta;
     const spread=row.status==='open'?(row.current_spread_bps??row.entry_spread_bps):row.exit_spread_bps??row.entry_spread_bps;
@@ -4223,7 +4477,7 @@ function renderLiveTrades(snapshot){
     const entryTime=fmtBeijingDateTime(row.entry_ts);
     const exitTime=row.status==='open'?'持仓中':fmtBeijingDateTime(row.exit_ts);
     const holdTime=fmtDuration(row.entry_ts,row.status==='open'?null:row.exit_ts);
-    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${liveActionText(row.action)}</td><td>${entryTime}</td><td>${exitTime}</td><td>${holdTime}</td><td>${fmt(corr,3)}</td><td>${fmt(beta,2)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td>${fmt(row.current_asset_15m_bps,1)} bps</td><td>${fmt(row.current_hedge_15m_bps,1)} bps</td><td>${fmt(spread,2)}</td><td>${fmt(fundingBps,3)} bps</td><td>${fmt(row.asset_notional_usdc,1)}U / ${fmt(row.hedge_notional_usdc,1)}U</td><td class="${Number(pnl)>=0?'scoreGood':'scoreBad'}">${row.status==='open'?'盘口估算 ':'实际成交 '}${fmt(pnlBps,1)} bps / ${fmt(pnl,4)}U</td><td style="text-align:left">${row.close_reason||row.current_plan||row.note||''}</td>`;
+    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${liveActionText(row.action)}</td><td>${entryTime}</td><td>${exitTime}</td><td>${holdTime}</td><td>${fmt(corr,3)}</td><td>${fmt(beta,2)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td>${fmt(row.current_asset_15m_bps,1)} bps</td><td>${fmt(row.current_hedge_15m_bps,1)} bps</td><td>${fmt(spread,2)}</td><td>${fmt(fundingBps,3)} bps</td><td>${fmt(row.asset_notional_usdc,1)}U / ${fmt(row.hedge_notional_usdc,1)}U</td><td class="${Number(pnl)>=0?'scoreGood':'scoreBad'}">${row.status==='open'?'盘口估算 ':'官方净收益 '}${fmt(pnlBps,1)} bps / ${fmt(pnl,4)}U</td><td style="text-align:left">${row.close_reason||row.current_plan||row.note||''}</td>`;
     tr.onclick=()=>showLiveTradeDetail(row);
     tb.appendChild(tr);
   });
@@ -4248,6 +4502,9 @@ function showLiveTradeDetail(row){
       <div class="detailBox"><div class="muted">持仓时长</div><div>${fmtDuration(row.entry_ts,row.status==='open'?null:row.exit_ts)}</div></div>
       <div class="detailBox"><div class="muted">小币/保护腿名义金额</div><div>${fmt(row.asset_notional_usdc,2)}U / ${fmt(row.hedge_notional_usdc,2)}U</div></div>
       <div class="detailBox"><div class="muted">价格盈亏（未扣费）</div><div>${row.status==='open'?'持仓中':fmt(row.pnl_usdc,5)+' U'}</div></div>
+      <div class="detailBox"><div class="muted">官方手续费 / 资金费</div><div>${row.status==='open'?'-':fmt(row.fee_usdc,5)+'U / '+fmt(row.funding_usdc,5)+'U'}</div></div>
+      <div class="detailBox"><div class="muted">官方净盈亏</div><div class="${Number(row.net_pnl_usdc)>=0?'scoreGood':'scoreBad'}">${row.status==='open'?'-':fmt(row.net_pnl_bps,1)+' bps / '+fmt(row.net_pnl_usdc,5)+'U'}</div></div>
+      <div class="detailBox"><div class="muted">小币腿 / 保护腿净贡献</div><div>${row.status==='open'?'-':fmt(row.asset_net_pnl_usdc,5)+'U / '+fmt(row.hedge_net_pnl_usdc,5)+'U'}</div></div>
       <div class="detailBox"><div class="muted">相关 / Beta</div><div>${fmt(row.current_corr??row.entry_corr,3)} / ${fmt(row.current_beta??row.beta,2)}</div></div>
       <div class="detailBox"><div class="muted">Z：入场 → 当前/出场</div><div>${fmt(row.entry_z,2)} → ${fmt(row.current_z??row.exit_z??row.entry_z,2)}</div></div>
       <div class="detailBox"><div class="muted">小币/保护腿 15m</div><div>${fmt(row.current_asset_15m_bps,1)} bps / ${fmt(row.current_hedge_15m_bps,1)} bps</div></div>
@@ -4705,7 +4962,6 @@ def collector_loop(state):
     if disk:
         state.l2book.set_coins(l2book_subscription_coins(
             disk["rows"], leaders=state.config.get("leaders", []),
-            limit=int(state.config.get("live_l2_subscribe_limit", 80) or 80),
         ))
         with state.lock:
             state.latest = {
@@ -4720,7 +4976,6 @@ def collector_loop(state):
             payload = make_alt_scan_payload(state.config)
             state.l2book.set_coins(l2book_subscription_coins(
                 payload.get("rows", []), leaders=state.config.get("leaders", []),
-                limit=int(state.config.get("live_l2_subscribe_limit", 80) or 80),
             ))
             scan_id = save_alt_scan(payload, state.config, db_path=state.db_path)
             payload["scan_id"] = scan_id
@@ -4736,6 +4991,7 @@ def collector_loop(state):
             payload.pop("strategy_closed_keys", None)
             payload.pop("strategy_pending_entries", None)
             payload.pop("strategy_closed_events", None)
+            payload.pop("strategy_live_entries", None)
             with state.lock:
                 state.latest, state.error = payload, None
             notify_dingtalk_candidates(state, payload)
@@ -4829,11 +5085,9 @@ class AltRequestHandler(BaseHTTPRequestHandler):
             account = account or load_latest_live_account_snapshot(state.db_path)
             l2_coins = l2book_subscription_coins(
                 latest_rows, leaders=state.config.get("leaders", []),
-                limit=int(state.config.get("live_l2_subscribe_limit", 80) or 80),
             )
             l2_snapshot = state.l2book.snapshot(l2_coins)
             l2_snapshot.setdefault("status", {})["scan_rows"] = len(latest_rows)
-            l2_snapshot["status"]["subscribe_limit"] = int(state.config.get("live_l2_subscribe_limit", 80) or 80)
             live_trades = load_live_trades_snapshot(state.db_path, 200, current_rows=latest_rows, config=state.config)
             diagnostics = live_opportunity_diagnostics(
                 state, latest_rows, account=account, open_trades=live_trades.get("open", []), limit=20,
@@ -5008,7 +5262,6 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                         latest_rows = list((state.latest or {}).get("rows", []))
                     state.l2book.set_coins(l2book_subscription_coins(
                         latest_rows, leaders=state.config.get("leaders", []),
-                        limit=int(state.config.get("live_l2_subscribe_limit", 80) or 80),
                     ))
                 except Exception as exc:
                     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] l2Book resubscribe failed after config update: {exc}", flush=True)
@@ -5032,7 +5285,7 @@ class AltRequestHandler(BaseHTTPRequestHandler):
         return
 
 
-def backtest_pair(asset_series, hedge_series, *, entry_z=2.0, exit_z=0.5, rolling=72, max_hold=36, fee_bps=4.0):
+def backtest_pair(asset_series, hedge_series, *, entry_z=2.0, exit_z=0.5, rolling=72, max_hold=36, fee_bps=9.0):
     times, asset_returns, hedge_returns = aligned_returns(asset_series, hedge_series)
     beta = beta_against(asset_returns, hedge_returns)
     corr = pearson(asset_returns, hedge_returns)
@@ -5457,7 +5710,7 @@ class App(tk.Tk):
         self.bt_exit_z = tk.StringVar(value="0.5")
         self.bt_rolling = tk.StringVar(value="72")
         self.bt_max_hold = tk.StringVar(value="36")
-        self.bt_fee_bps = tk.StringVar(value="4")
+        self.bt_fee_bps = tk.StringVar(value="9")
         fields = [("小币", self.bt_asset, 10), ("保护腿", self.bt_hedge, 10), ("回看小时", self.bt_hours, 8),
                   ("入场Z", self.bt_entry_z, 8), ("出场Z", self.bt_exit_z, 8), ("滚动窗口", self.bt_rolling, 8),
                   ("最长持有K", self.bt_max_hold, 8), ("双边成本bps", self.bt_fee_bps, 8)]
@@ -6133,6 +6386,7 @@ def build_server_config(args):
         "live_account_address": os.environ.get("HLM_ACCOUNT_ADDRESS") or env_file_value("HLM_ACCOUNT_ADDRESS"),
         "live_notional_usdc": env_float("LIVE_NOTIONAL_USDC", 10.0),
         "live_max_open": env_int("LIVE_MAX_OPEN", 1),
+        "live_reentry_cooldown_minutes": env_int("LIVE_REENTRY_COOLDOWN_MINUTES", 15),
         "live_max_slippage_bps": env_float("LIVE_MAX_SLIPPAGE_BPS", 15.0),
         "live_leverage": env_int("LIVE_LEVERAGE", 1),
         "live_auto_min_notional": env_bool("LIVE_AUTO_MIN_NOTIONAL", False),
@@ -6145,7 +6399,6 @@ def build_server_config(args):
         "live_l2_max_spread_bps": env_float(
             "LIVE_L2_MAX_SPREAD_BPS", env_float("LIVE_MAX_ENTRY_SPREAD_BPS", 2.5),
         ),
-        "live_l2_subscribe_limit": env_int("LIVE_L2_SUBSCRIBE_LIMIT", 80),
         "live_use_realtime_z": env_bool("LIVE_USE_REALTIME_Z", True),
         "live_realtime_strategy_interval_ms": env_float("LIVE_REALTIME_STRATEGY_INTERVAL_MS", 500.0),
         "live_require_leverage_ok": env_bool("LIVE_REQUIRE_LEVERAGE_OK", True),
@@ -6156,11 +6409,14 @@ def build_server_config(args):
 def run_server(args):
     config = build_server_config(args)
     db_path = Path(args.db).resolve()
+    init_alt_db(db_path)
+    reconcile_shared_paper_from_live(db_path, config.get("paper_fee_bps", 9.0))
     state = AltServerState(config, db_path=db_path)
     state.live_account = load_latest_live_account_snapshot(db_path)
     state.l2book.set_coins(set(config.get("leaders", [])) | {"BTC", "ETH"})
     state.l2book.start()
     threading.Thread(target=live_account_cache_loop, args=(state,), daemon=True).start()
+    threading.Thread(target=reconcile_live_trade_costs, args=(state,), daemon=True).start()
     threading.Thread(target=collector_loop, args=(state,), daemon=True).start()
     threading.Thread(target=realtime_strategy_loop, args=(state,), daemon=True).start()
     server = ThreadingHTTPServer((args.host, int(args.port)), AltRequestHandler)
@@ -6205,7 +6461,7 @@ def parse_args():
     parser.add_argument("--paper-stop-bps", type=float, default=80.0, help="模拟止损 bps，默认 80")
     parser.add_argument("--paper-max-hold", type=int, default=360, help="模拟最长持仓分钟，默认 360")
     parser.add_argument("--paper-max-open", type=int, default=12, help="最多同时模拟持仓数量，默认 12")
-    parser.add_argument("--paper-fee-bps", type=float, default=4.0, help="模拟双边手续费/滑点成本 bps，默认 4")
+    parser.add_argument("--paper-fee-bps", type=float, default=9.0, help="模拟双腿往返手续费/额外滑点成本 bps，默认 9")
     parser.add_argument("--paper-z-value-bps", type=float, default=18.0, help="每 1 个 Z 回归折算多少 bps，默认 18")
     parser.add_argument("--paper-min-corr", type=float, default=0.65, help="模拟盘最低相关性风控基准，默认 0.65")
     parser.add_argument("--set-live-api-key", action="store_true", help="通过终端交互加密保存 API 钱包私钥；不会显示或写入 shell 历史")

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import time
@@ -31,6 +32,10 @@ class LiveStrategySignalTests(unittest.TestCase):
             "beta": 1.0,
             "zscore": 3.0,
             "spread_bps": 1.0,
+            "asset_l2_bid": 10.0,
+            "asset_l2_ask": 10.01,
+            "hedge_l2_bid": 99.99,
+            "hedge_l2_ask": 100.0,
         }
         row.update(updates)
         return row
@@ -164,6 +169,31 @@ class LiveStrategySignalTests(unittest.TestCase):
         self.assertAlmostEqual(details["pnl_usdc"], -0.03, places=6)
         self.assertAlmostEqual(details["pnl_bps"], -10.0, places=6)
 
+    def test_official_costs_include_four_fills_and_funding(self):
+        trade = {
+            "asset": "APT", "leader": "BTC", "action": "short_asset_long_hedge",
+            "entry_ts": 1000.0, "exit_ts": 1100.0, "total_notional_usdc": 28.0,
+            "entry_json": json.dumps({"fills": {"APT": {"oid": 1}, "BTC": {"oid": 2}}}),
+            "exit_json": json.dumps({"fills": {"APT": {"oid": 3}, "BTC": {"oid": 4}}}),
+        }
+        fills = {
+            "1": {"fee": "0.002"}, "2": {"fee": "0.004"},
+            "3": {"fee": "0.003", "closedPnl": "0.100"},
+            "4": {"fee": "0.006", "closedPnl": "-0.030"},
+        }
+        funding = [
+            {"time": 1_050_000, "delta": {"coin": "APT", "usdc": "0.001"}},
+            {"time": 1_060_000, "delta": {"coin": "BTC", "usdc": "-0.002"}},
+            {"time": 2_000_000, "delta": {"coin": "APT", "usdc": "99"}},
+        ]
+        result = monitor.official_trade_costs(trade, fills, funding)
+        self.assertAlmostEqual(result["pnl_usdc"], 0.070, places=9)
+        self.assertAlmostEqual(result["fee_usdc"], 0.015, places=9)
+        self.assertAlmostEqual(result["funding_usdc"], -0.001, places=9)
+        self.assertAlmostEqual(result["net_pnl_usdc"], 0.054, places=9)
+        self.assertAlmostEqual(result["asset_net_pnl_usdc"], 0.096, places=9)
+        self.assertAlmostEqual(result["hedge_net_pnl_usdc"], -0.042, places=9)
+
     def unified_state(self, db_path):
         config = {
             **self.config,
@@ -224,6 +254,44 @@ class LiveStrategySignalTests(unittest.TestCase):
             self.assertIsNotNone(closed)
             self.assertEqual(len(closed["paper"]["open"]), 0)
             self.assertEqual(closed["paper"]["closed"][0]["close_reason"], "偏离回归")
+
+    def test_pair_cannot_reenter_during_cooldown(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db_path = Path(tmp) / "monitor.sqlite3"
+            monitor.init_alt_db(db_path)
+            state = self.unified_state(db_path)
+            state.config["live_reentry_cooldown_minutes"] = 15
+            monitor.run_unified_strategy_cycle(state, {"ts": 1000.0, "rows": [self.row()]}, 1)
+            monitor.run_unified_strategy_cycle(state, {"ts": 1001.0, "rows": [self.row(zscore=0.2)]}, 2)
+            blocked = monitor.run_unified_strategy_cycle(
+                state, {"ts": 1002.0, "rows": [self.row()]}, 3, skip_if_idle=True,
+            )
+            self.assertIsNone(blocked)
+            reopened = monitor.run_unified_strategy_cycle(
+                state, {"ts": 1902.0, "rows": [self.row()]}, 4, skip_if_idle=True,
+            )
+            self.assertEqual(len(reopened["paper"]["open"]), 1)
+
+    def test_real_fill_overrides_paper_entry_estimate(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db_path = Path(tmp) / "monitor.sqlite3"
+            monitor.init_alt_db(db_path)
+            state = self.unified_state(db_path)
+            payload = {"ts": 1000.0, "rows": [self.row()]}
+            cycle = monitor.prepare_shared_strategy_cycle(state, payload, 1)
+            pending = payload["strategy_pending_entries"][0][0]
+            payload["strategy_live_entries"] = {
+                pending["trade_key"]: {
+                    "trade_key": pending["trade_key"], "total_notional_usdc": 30.0,
+                    "asset_notional_usdc": 20.0, "hedge_notional_usdc": 10.0,
+                    "asset_entry_px": 10.123, "hedge_entry_px": 100.456, "entry_ts": 1000.25,
+                }
+            }
+            snapshot = monitor.finalize_shared_strategy_cycle(state, payload, 1, cycle)
+            trade = snapshot["open"][0]
+            self.assertAlmostEqual(trade["asset_entry_px"], 10.123)
+            self.assertAlmostEqual(trade["hedge_entry_px"], 100.456)
+            self.assertAlmostEqual(trade["notional_usdc"], 30.0)
 
     def test_unified_cycle_persists_executable_price_model(self):
         class MutableBook:
