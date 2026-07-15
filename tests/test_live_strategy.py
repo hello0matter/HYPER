@@ -145,6 +145,67 @@ class LiveStrategySignalTests(unittest.TestCase):
         self.assertEqual(account["spot_available_usdc"], 50.0)
         self.assertLess(age_ms, 1000)
 
+    def unified_state(self, db_path):
+        config = {
+            **self.config,
+            "paper_enabled": True,
+            "paper_sync_live": True,
+            "paper_take_profit_bps": 0,
+            "paper_stop_bps": 80,
+            "paper_max_hold_minutes": 360,
+            "paper_min_corr": 0.65,
+            "live_use_l2book": False,
+            "live_notional_usdc": 10.5,
+            "live_max_open": 1,
+            "live_enabled": False,
+            "live_strategy_enabled": False,
+            "dingtalk_paper_webhook": "",
+        }
+        return SimpleNamespace(
+            config=config, db_path=db_path, l2book=None,
+            strategy_cycle_lock=threading.Lock(),
+        )
+
+    def test_realtime_idle_cycle_does_not_create_a_trade(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db_path = Path(tmp) / "monitor.sqlite3"
+            monitor.init_alt_db(db_path)
+            state = self.unified_state(db_path)
+            payload = {"ts": 1000.0, "rows": [self.row(zscore=0.5)]}
+            result = monitor.run_unified_strategy_cycle(
+                state, payload, 1, skip_if_idle=True, source="ws_realtime"
+            )
+            self.assertIsNone(result)
+            self.assertEqual(len(monitor.load_paper_snapshot(db_path, config=state.config)["open"]), 0)
+
+    def test_realtime_signal_opens_only_once_and_closes_on_reversion(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db_path = Path(tmp) / "monitor.sqlite3"
+            monitor.init_alt_db(db_path)
+            state = self.unified_state(db_path)
+
+            first = monitor.run_unified_strategy_cycle(
+                state, {"ts": 1000.0, "rows": [self.row()]}, 1,
+                skip_if_idle=True, source="ws_realtime",
+            )
+            self.assertIsNotNone(first)
+            self.assertEqual(len(first["paper"]["open"]), 1)
+
+            duplicate = monitor.run_unified_strategy_cycle(
+                state, {"ts": 1000.5, "rows": [self.row()]}, 1,
+                skip_if_idle=True, source="ws_realtime",
+            )
+            self.assertIsNone(duplicate)
+            self.assertEqual(len(monitor.load_paper_snapshot(db_path, config=state.config)["open"]), 1)
+
+            closed = monitor.run_unified_strategy_cycle(
+                state, {"ts": 1001.0, "rows": [self.row(zscore=0.2)]}, 1,
+                skip_if_idle=True, source="ws_realtime",
+            )
+            self.assertIsNotNone(closed)
+            self.assertEqual(len(closed["paper"]["open"]), 0)
+            self.assertEqual(closed["paper"]["closed"][0]["close_reason"], "偏离回归")
+
 
 if __name__ == "__main__":
     unittest.main()

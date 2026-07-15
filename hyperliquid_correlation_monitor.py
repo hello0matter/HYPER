@@ -2181,10 +2181,12 @@ def prepare_shared_strategy_cycle(state, payload, scan_id):
         db.row_factory = sqlite3.Row
         # Preserve older modes for audit, but never let them occupy canonical
         # strategy slots or pollute the new synchronized statistics.
-        db.execute("""
-            UPDATE paper_trades SET status='archived', exit_ts=?, close_reason='切换为统一策略模式'
-            WHERE status='open' AND mode != 'shared_strategy'
-        """, (now_ts,))
+        if not getattr(state, "shared_legacy_archived", False):
+            db.execute("""
+                UPDATE paper_trades SET status='archived', exit_ts=?, close_reason='切换为统一策略模式'
+                WHERE status='open' AND mode != 'shared_strategy'
+            """, (now_ts,))
+            state.shared_legacy_archived = True
         open_trades = [dict(row) for row in db.execute("""
             SELECT * FROM paper_trades
             WHERE status='open' AND mode='shared_strategy'
@@ -2642,6 +2644,7 @@ LIVE_CONFIG_FIELDS = {
     "live_l2_max_spread_bps": {"env": "LIVE_L2_MAX_SPREAD_BPS", "type": "float", "min": 0, "max": 100, "label": "l2Book 最大点差 bps"},
     "live_l2_subscribe_limit": {"env": "LIVE_L2_SUBSCRIBE_LIMIT", "type": "int", "min": 2, "max": 1000, "label": "WS订阅数量"},
     "live_use_realtime_z": {"env": "LIVE_USE_REALTIME_Z", "type": "bool", "label": "使用 l2Book 实时近似 Z"},
+    "live_realtime_strategy_interval_ms": {"env": "LIVE_REALTIME_STRATEGY_INTERVAL_MS", "type": "float", "min": 100, "max": 10_000, "label": "WS策略判断间隔 ms"},
     "live_require_leverage_ok": {"env": "LIVE_REQUIRE_LEVERAGE_OK", "type": "bool", "label": "杠杆设置失败时跳过"},
     "live_strategy_enabled": {"env": "LIVE_STRATEGY_ENABLED", "type": "bool", "label": "真实策略开关"},
 }
@@ -3199,6 +3202,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">l2Book WS 盘口</div><div id="liveL2Status">-</div></div>
     <div class="metric"><div class="muted">本轮真实机会</div><div id="liveOpportunityStatus">-</div></div>
     <div class="metric"><div class="muted">当前执行顺序</div><div id="liveExecutionStatus">-</div></div>
+    <div class="metric"><div class="muted">WS实时策略引擎</div><div id="liveRealtimeEngine">-</div></div>
   </div>
   <p id="liveBlocker" class="scoreMid"></p>
   <div class="paperActions"><button onclick="saveLiveConfig()">保存统一策略 / 真实执行参数</button><button onclick="loadLive()">刷新真实账户</button><span id="liveSaveStatus" class="subtle">管理口令在“全局设置”里填写</span></div>
@@ -3225,6 +3229,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
       <label>l2Book最大点差bps<input id="cfg_live_l2_max_spread_bps" type="number" min="0" max="100" step="0.1"></label>
       <label>WS订阅数量<input id="cfg_live_l2_subscribe_limit" type="number" min="2" max="1000" step="1"></label>
       <label>WS实时Z<select id="cfg_live_use_realtime_z"><option value="true">开启（默认）</option><option value="false">关闭</option></select></label>
+      <label>WS策略判断间隔ms<input id="cfg_live_realtime_strategy_interval_ms" type="number" min="100" max="10000" step="100" title="有新盘口时，最多按这个间隔合并判断一次。500ms不是行情延迟，而是策略计算节流。"></label>
     </div>
   </div>
   <div class="settingBand">
@@ -3239,18 +3244,22 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
       <label>最大滑点bps<input id="cfg_live_max_slippage_bps" type="number" step="1"></label>
       <label>杠杆倍数<input id="cfg_live_leverage" type="number" min="1" max="50" step="1"></label>
       <label>杠杆失败处理<select id="cfg_live_require_leverage_ok"><option value="true">跳过，不下单（默认）</option><option value="false">继续下单</option></select></label>
-      <label>执行顺序风格<select id="cfg_live_execution_style" onchange="applyExecutionStyle(this.value)"><option value="fast">极速锁定（默认）</option><option value="balanced">平衡</option><option value="strict">严格复查</option><option value="custom">自定义</option></select></label>
+      <label>执行顺序风格<select id="cfg_live_execution_style" onchange="applyExecutionStyle(this.value)"><option value="fast">极速锁定（默认）</option><option value="balanced">平衡</option><option value="strict">严格复查</option><option value="custom" hidden>专家自定义</option></select></label>
       <label>后台账户刷新秒<input id="cfg_live_account_poll_seconds" type="number" min="1" max="300" step="1"></label>
       <label>账户缓存最大年龄ms<input id="cfg_live_account_cache_max_age_ms" type="number" min="1000" max="300000" step="1000"></label>
       <label>杠杆预设缓存秒<input id="cfg_live_leverage_cache_seconds" type="number" min="0" max="604800" step="60"></label>
     </div>
-    <h3>真实执行步骤（可排序、删除、插入）</h3>
-    <div id="executionStepList" class="detailText"></div>
-    <div class="paperActions">
-      <select id="executionStepAdd"><option value="cached_account">读取后台账户缓存</option><option value="fresh_account">立即查询最新账户（慢）</option><option value="prepare_leverage">准备/确认杠杆</option><option value="final_l2">内存盘口最终复查</option><option value="refresh_account_async">下单后后台刷新账户</option></select>
-      <button onclick="addExecutionStep()">插入步骤</button>
-      <span class="subtle">“发送真实IOC”和“记录模拟交易”不可删除；移动其先后顺序会真实改变执行顺序。</span>
-    </div>
+    <details class="settingBand">
+      <summary><b>专家调试模式：查看/调整底层执行步骤</b></summary>
+      <p class="scoreMid">日常交易不需要打开。它主要用于定位漏单和测量耗时；错误删除检查会提高真实交易风险。</p>
+      <div id="executionStepList" class="detailText"></div>
+      <div class="paperActions">
+        <select id="executionStepAdd"><option value="cached_account">读取后台账户缓存</option><option value="fresh_account">立即查询最新账户（慢）</option><option value="prepare_leverage">准备/确认杠杆</option><option value="final_l2">内存盘口最终复查</option><option value="refresh_account_async">下单后后台刷新账户</option></select>
+        <button onclick="addExecutionStep()">插入步骤</button>
+        <button onclick="applyExecutionStyle(liveCfgEl('execution_style').value)">恢复当前风格默认顺序</button>
+        <span class="subtle">“发送真实IOC”和“记录模拟交易”不可删除；下单前检查不能移动到IOC之后。</span>
+      </div>
+    </details>
   </div>
   <h3>为什么这一轮没有交易</h3>
   <div id="liveDiagnosticSummary" class="detailText">读取服务器当前过滤结果中...</div>
@@ -3909,7 +3918,7 @@ async function savePaperConfig(){
     document.getElementById('pSaveStatus').textContent='保存失败：'+e;
   }
 }
-const liveConfigKeys=['live_enabled','live_execution_style','live_execution_steps','live_account_poll_seconds','live_account_cache_max_age_ms','live_leverage_cache_seconds','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_max_entry_spread_bps','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_strategy_entry_grace_ms','live_l2_max_spread_bps','live_l2_subscribe_limit','live_use_realtime_z','live_strategy_enabled'];
+const liveConfigKeys=['live_enabled','live_execution_style','live_execution_steps','live_account_poll_seconds','live_account_cache_max_age_ms','live_leverage_cache_seconds','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_max_entry_spread_bps','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_strategy_entry_grace_ms','live_l2_max_spread_bps','live_l2_subscribe_limit','live_use_realtime_z','live_realtime_strategy_interval_ms','live_strategy_enabled'];
 function liveCfgEl(key){return document.getElementById('cfg_'+key)}
 const executionStepLabels={cached_account:'读取后台账户缓存',fresh_account:'立即查询最新账户（慢）',prepare_leverage:'准备/确认杠杆',final_l2:'内存盘口最终复查',submit_real:'发送真实IOC订单',record_paper:'记录模拟交易',refresh_account_async:'下单后后台刷新账户'};
 const executionPresets={
@@ -3999,6 +4008,7 @@ function readLiveConfig(){
     live_l2_max_spread_bps:parseFloat(liveCfgEl('live_l2_max_spread_bps').value),
     live_l2_subscribe_limit:parseInt(liveCfgEl('live_l2_subscribe_limit').value,10),
     live_use_realtime_z:liveCfgEl('live_use_realtime_z').value==='true',
+    live_realtime_strategy_interval_ms:parseFloat(liveCfgEl('live_realtime_strategy_interval_ms').value),
     live_strategy_enabled:liveCfgEl('live_strategy_enabled').value==='true',
   };
 }
@@ -4138,6 +4148,12 @@ function renderLive(data){
   document.getElementById('liveStatus').textContent=cfg.live_enabled===true?(cfg.live_strategy_enabled===true?'已开启（真实策略运行中）':'已开启（策略开关关闭）'):'关闭（不会下真实单）';
   const executionStatus=document.getElementById('liveExecutionStatus');
   if(executionStatus)executionStatus.textContent=`${cfg.live_execution_style||'fast'}：${(cfg.live_execution_steps||[]).map(x=>executionStepLabels[x]||x).join(' → ')}`;
+  const engine=data.realtime_strategy||{},engineEl=document.getElementById('liveRealtimeEngine');
+  if(engineEl){
+    const evalAge=engine.last_eval_ts?Math.max(0,Date.now()-Number(engine.last_eval_ts)*1000):null;
+    engineEl.textContent=`${engine.running?'运行中':'未运行'}；判断间隔 ${fmt(cfg.live_realtime_strategy_interval_ms,0)}ms；最近判断 ${evalAge===null?'-':fmt(evalAge,0)+'ms前'}；事件 ${engine.events||0}`+(engine.last_error?`；错误 ${engine.last_error}`:'');
+    engineEl.className=engine.running&&!engine.last_error?'scoreGood':'scoreBad';
+  }
   document.getElementById('liveBlocker').textContent=cfg.blocker||'';
   document.getElementById('liveBalance').textContent=account.account_value===undefined?'暂无账户快照':(isUnified?`统一账户；可用 ${fmt(account.spot_available_usdc??account.spot_usdc,2)} U`:`合约 ${fmt(account.account_value,2)} U；现货 ${fmt(account.spot_available_usdc??account.spot_usdc,2)} U`);
   document.getElementById('livePositionCount').textContent=account.ts?`${positions.length} 个；快照 ${new Date(account.ts*1000).toLocaleString()}`:'暂无；填写主钱包公开地址后等下一轮采集';
@@ -4463,6 +4479,7 @@ class L2BookCache:
         self.connected = False
         self.error = ""
         self.last_message_at = 0.0
+        self.revision = 0
         self.connected_at = 0.0
 
     def start(self):
@@ -4553,6 +4570,7 @@ class L2BookCache:
             with self.lock:
                 self.books[coin] = book
                 self.last_message_at = now
+                self.revision += 1
                 self.error = ""
         except (ValueError, KeyError, TypeError) as exc:
             with self.lock:
@@ -4595,6 +4613,7 @@ class L2BookCache:
                 "desired": len(self.desired),
                 "subscribed": len(self.subscribed),
                 "books": len(self.books),
+                "revision": self.revision,
                 "last_message_age_ms": max(0.0, (time.time() - self.last_message_at) * 1000) if self.last_message_at else None,
             }
             selected = {str(c).upper() for c in coins if c} if coins else set(self.desired)
@@ -4620,17 +4639,113 @@ class AltServerState:
         self.live_error = None
         self.live_leverage_cache = {}
         self.last_live_account_db_save = 0.0
+        self.strategy_cycle_lock = threading.Lock()
+        self.realtime_strategy_status = {
+            "running": False, "last_eval_ts": None, "last_event_ts": None,
+            "last_error": None, "events": 0, "last_revision": 0,
+        }
         self.l2book = L2BookCache()
+
+
+def run_unified_strategy_cycle(state, payload, scan_id, *, skip_if_idle=False, source="scan"):
+    """Run one serialized strategy decision cycle for scan or WS-triggered data."""
+    with state.strategy_cycle_lock:
+        if state.config.get("paper_sync_live", True):
+            cycle = prepare_shared_strategy_cycle(state, payload, scan_id)
+            has_events = bool(payload.get("strategy_pending_entries") or payload.get("strategy_closed_events"))
+            if skip_if_idle and not has_events:
+                return None
+            steps = live_execution_steps(state.config)
+            real_first = steps.index("submit_real") < steps.index("record_paper")
+            if real_first:
+                try:
+                    live_snapshot = update_live_trading(state, payload, scan_id)
+                finally:
+                    paper_snapshot = finalize_shared_strategy_cycle(state, payload, scan_id, cycle)
+            else:
+                paper_snapshot = finalize_shared_strategy_cycle(state, payload, scan_id, cycle)
+                live_snapshot = update_live_trading(state, payload, scan_id)
+        else:
+            if skip_if_idle:
+                return None
+            paper_snapshot = update_paper_trading(state, payload, scan_id)
+            live_snapshot = update_live_trading(state, payload, scan_id)
+        return {"paper": paper_snapshot, "live_trades": live_snapshot, "source": source}
+
+
+def realtime_strategy_loop(state):
+    """Evaluate the latest statistical model against WS books between full scans."""
+    with state.lock:
+        state.realtime_strategy_status["running"] = True
+    last_revision = -1
+    try:
+        while state.running:
+            loop_started = time.time()
+            try:
+                l2_status = state.l2book.snapshot(["__STATUS_ONLY__"]).get("status", {})
+                revision = int(l2_status.get("revision") or 0)
+                with state.lock:
+                    latest = state.latest
+                    raw_rows = list((latest or {}).get("rows", []))
+                    scan_id = int((latest or {}).get("scan_id") or 0)
+                # A WebSocket may send many books in a burst.  Coalesce them
+                # into one decision per configured interval, but do not query
+                # SQLite again when no new book has arrived.
+                should_evaluate = revision != last_revision and revision > 0
+                if should_evaluate and raw_rows and scan_id and state.config.get("paper_sync_live", True):
+                    strategy_rows = prepare_live_rows(raw_rows, state.config, state.l2book)
+                    payload = {
+                        "ts": time.time(), "rows": raw_rows, "strategy_rows": strategy_rows,
+                        "scan_id": scan_id,
+                    }
+                    result = run_unified_strategy_cycle(
+                        state, payload, scan_id, skip_if_idle=True, source="ws_realtime",
+                    )
+                    event_count = len(payload.get("strategy_open_rows") or []) + len(payload.get("strategy_closed_keys") or [])
+                    with state.lock:
+                        state.realtime_strategy_status["last_eval_ts"] = time.time()
+                        state.realtime_strategy_status["last_error"] = None
+                        state.realtime_strategy_status["last_revision"] = revision
+                        if result:
+                            state.realtime_strategy_status["last_event_ts"] = time.time()
+                            state.realtime_strategy_status["events"] += event_count
+                            if state.latest:
+                                state.latest["paper"] = result["paper"]
+                                state.latest["live_trades"] = result["live_trades"]
+                    if result:
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] WS realtime strategy event "
+                            f"scan={scan_id} opens={len(payload.get('strategy_open_rows') or [])} "
+                            f"closes={len(payload.get('strategy_closed_keys') or [])}",
+                            flush=True,
+                        )
+                if should_evaluate:
+                    last_revision = revision
+            except Exception as exc:
+                with state.lock:
+                    state.realtime_strategy_status["last_error"] = str(exc)
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] realtime strategy failed: {exc}", flush=True)
+            interval = max(0.1, float(state.config.get("live_realtime_strategy_interval_ms", 500) or 500) / 1000)
+            while state.running and time.time() - loop_started < interval:
+                time.sleep(min(0.05, interval))
+    finally:
+        with state.lock:
+            state.realtime_strategy_status["running"] = False
 
 
 def collector_loop(state):
     init_alt_db(state.db_path)
     disk = load_latest_scan(state.db_path)
     if disk:
+        state.l2book.set_coins(l2book_subscription_coins(
+            disk["rows"], leaders=state.config.get("leaders", []),
+            limit=int(state.config.get("live_l2_subscribe_limit", 80) or 80),
+        ))
         with state.lock:
             state.latest = {
                 "ts": disk["scan"]["ts"], "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(disk["scan"]["ts"])),
-                "config": state.config, "rows": disk["rows"], "failures": [], "text": "loaded from sqlite"
+                "config": state.config, "rows": disk["rows"], "failures": [], "text": "loaded from sqlite",
+                "scan_id": int(disk["scan"]["id"]),
             }
             state.error = None
     while state.running:
@@ -4647,23 +4762,9 @@ def collector_loop(state):
             # decides continuously; the real executor later consumes only the
             # new-entry events produced from this same snapshot.
             payload["strategy_rows"] = prepare_live_rows(payload.get("rows", []), state.config, state.l2book)
-            if state.config.get("paper_sync_live", True):
-                cycle = prepare_shared_strategy_cycle(state, payload, scan_id)
-                steps = live_execution_steps(state.config)
-                real_first = steps.index("submit_real") < steps.index("record_paper")
-                if real_first:
-                    try:
-                        live_snapshot = update_live_trading(state, payload, scan_id)
-                    finally:
-                        paper_snapshot = finalize_shared_strategy_cycle(state, payload, scan_id, cycle)
-                else:
-                    paper_snapshot = finalize_shared_strategy_cycle(state, payload, scan_id, cycle)
-                    live_snapshot = update_live_trading(state, payload, scan_id)
-            else:
-                paper_snapshot = update_paper_trading(state, payload, scan_id)
-                live_snapshot = update_live_trading(state, payload, scan_id)
-            payload["paper"] = paper_snapshot
-            payload["live_trades"] = live_snapshot
+            result = run_unified_strategy_cycle(state, payload, scan_id, source="full_scan")
+            payload["paper"] = result["paper"]
+            payload["live_trades"] = result["live_trades"]
             payload.pop("strategy_rows", None)
             payload.pop("strategy_open_rows", None)
             payload.pop("strategy_closed_keys", None)
@@ -4748,6 +4849,7 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                 account = state.live_account
                 live_error = state.live_error
                 latest_rows = list((state.latest or {}).get("rows", []))
+                realtime_status = dict(state.realtime_strategy_status)
             latest_rows = prepare_live_rows(latest_rows, state.config, state.l2book)
             if (query.get("fresh") or [""])[0] in ("1", "true", "yes") and valid_evm_address(state.config.get("live_account_address")):
                 try:
@@ -4777,6 +4879,7 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                 "account_error": live_error,
                 "live_trades": live_trades,
                 "diagnostics": diagnostics,
+                "realtime_strategy": realtime_status,
                 "l2book": l2_snapshot,
                 "admin_enabled": bool(state.config.get("admin_token")),
             })
@@ -6082,6 +6185,7 @@ def build_server_config(args):
         "live_l2_max_spread_bps": env_float("LIVE_L2_MAX_SPREAD_BPS", 2.5),
         "live_l2_subscribe_limit": env_int("LIVE_L2_SUBSCRIBE_LIMIT", 80),
         "live_use_realtime_z": env_bool("LIVE_USE_REALTIME_Z", True),
+        "live_realtime_strategy_interval_ms": env_float("LIVE_REALTIME_STRATEGY_INTERVAL_MS", 500.0),
         "live_require_leverage_ok": env_bool("LIVE_REQUIRE_LEVERAGE_OK", True),
         "live_strategy_enabled": env_bool("LIVE_STRATEGY_ENABLED", False),
     }
@@ -6096,6 +6200,7 @@ def run_server(args):
     state.l2book.start()
     threading.Thread(target=live_account_cache_loop, args=(state,), daemon=True).start()
     threading.Thread(target=collector_loop, args=(state,), daemon=True).start()
+    threading.Thread(target=realtime_strategy_loop, args=(state,), daemon=True).start()
     server = ThreadingHTTPServer((args.host, int(args.port)), AltRequestHandler)
     server.state = state
     print("Hyperliquid 小币联动采集服务器已启动", flush=True)
