@@ -580,6 +580,10 @@ def init_alt_db(path=ALT_DB_FILE):
                 action TEXT NOT NULL,
                 notional_usdc REAL NOT NULL,
                 beta REAL NOT NULL,
+                asset_notional_usdc REAL,
+                hedge_notional_usdc REAL,
+                asset_entry_px REAL,
+                hedge_entry_px REAL,
                 entry_ts REAL NOT NULL,
                 exit_ts REAL,
                 entry_z REAL NOT NULL,
@@ -597,10 +601,15 @@ def init_alt_db(path=ALT_DB_FILE):
                 closed_scan_id INTEGER,
                 plan TEXT,
                 mode TEXT NOT NULL DEFAULT 'legacy',
-                sync_live_trade_id INTEGER
+                sync_live_trade_id INTEGER,
+                pnl_model TEXT
             )
         """)
-        for column in ("mode TEXT NOT NULL DEFAULT 'legacy'", "sync_live_trade_id INTEGER"):
+        for column in (
+            "mode TEXT NOT NULL DEFAULT 'legacy'", "sync_live_trade_id INTEGER",
+            "asset_notional_usdc REAL", "hedge_notional_usdc REAL",
+            "asset_entry_px REAL", "hedge_entry_px REAL", "pnl_model TEXT",
+        ):
             try:
                 db.execute(f"ALTER TABLE paper_trades ADD COLUMN {column}")
             except sqlite3.OperationalError:
@@ -617,13 +626,15 @@ def init_alt_db(path=ALT_DB_FILE):
                 unrealized_usdc REAL NOT NULL,
                 total_usdc REAL NOT NULL,
                 open_count INTEGER NOT NULL,
-                mode TEXT NOT NULL DEFAULT 'legacy'
+                mode TEXT NOT NULL DEFAULT 'legacy',
+                pnl_model TEXT
             )
         """)
-        try:
-            db.execute("ALTER TABLE paper_equity ADD COLUMN mode TEXT NOT NULL DEFAULT 'legacy'")
-        except sqlite3.OperationalError:
-            pass
+        for column in ("mode TEXT NOT NULL DEFAULT 'legacy'", "pnl_model TEXT"):
+            try:
+                db.execute(f"ALTER TABLE paper_equity ADD COLUMN {column}")
+            except sqlite3.OperationalError:
+                pass
         db.execute("CREATE INDEX IF NOT EXISTS idx_paper_equity_ts ON paper_equity(ts)")
         db.execute("""
             CREATE TABLE IF NOT EXISTS live_account_snapshots (
@@ -1034,26 +1045,102 @@ def paper_direction_label(action):
     return "模拟观察"
 
 
-def paper_trade_pnl_bps(trade, row, config, now_ts=None):
-    """Research-only residual PnL approximation; not executable fill PnL."""
-    entry_z = float(trade["entry_z"])
-    current_z = float(row.get("zscore") or 0)
-    z_value_bps = float(config.get("paper_z_value_bps", 18.0))
-    fee_bps = float(config.get("paper_fee_bps", 4.0))
-    if trade["action"] == "short_asset_long_hedge":
-        gross = (entry_z - current_z) * z_value_bps
-        funding_sign = 1.0
-    elif trade["action"] == "long_asset_short_hedge":
-        gross = (current_z - entry_z) * z_value_bps
-        funding_sign = -1.0
+def paper_trade_leg_notionals(trade):
+    """Return asset/hedge notionals, including a safe derivation for old rows."""
+    asset = float(trade.get("asset_notional_usdc") or 0)
+    hedge = float(trade.get("hedge_notional_usdc") or 0)
+    if asset > 0 and hedge > 0:
+        return asset, hedge
+    total = float(trade.get("total_notional_usdc") or trade.get("notional_usdc") or 0)
+    beta = abs(float(trade.get("beta") or 0))
+    if total > 0:
+        asset = total / max(1.0 + beta, 1e-9)
+        hedge = max(0.0, total - asset)
+    return asset, hedge
+
+
+def strategy_row_execution_prices(row, action, *, closing=False):
+    """Use executable bid/ask sides for the two-leg simulated fill."""
+    check_books = ((row.get("_strategy_l2_check") or {}).get("books") or {})
+    asset_book = check_books.get(row.get("asset")) or {}
+    hedge_book = check_books.get(row.get("leader")) or {}
+
+    def px(name, side, fallback_book):
+        value = row.get(name)
+        if value in (None, ""):
+            value = fallback_book.get(side)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    if action == "long_asset_short_hedge":
+        asset_side, hedge_side = (("bid", "ask") if closing else ("ask", "bid"))
+    elif action == "short_asset_long_hedge":
+        asset_side, hedge_side = (("ask", "bid") if closing else ("bid", "ask"))
     else:
-        gross = 0.0
-        funding_sign = 0.0
+        return None, None
+    return (
+        px(f"asset_l2_{asset_side}", asset_side, asset_book),
+        px(f"hedge_l2_{hedge_side}", hedge_side, hedge_book),
+    )
+
+
+def paper_trade_pnl_details(trade, row, config, now_ts=None):
+    """Prefer executable two-leg price PnL; fall back only for historical rows."""
+    fee_bps = float(config.get("paper_fee_bps", 4.0))
     now_ts = now_ts or time.time()
     hours = max(0.0, (now_ts - float(trade["entry_ts"])) / 3600)
     funding_hourly_bps = float(row.get("funding_hourly") or 0) * 10_000
-    funding = funding_sign * funding_hourly_bps * hours
-    return gross + funding - fee_bps
+    if trade["action"] == "short_asset_long_hedge":
+        funding_sign = 1.0
+    elif trade["action"] == "long_asset_short_hedge":
+        funding_sign = -1.0
+    else:
+        funding_sign = 0.0
+    funding_bps = funding_sign * funding_hourly_bps * hours
+
+    asset_entry = float(trade.get("asset_entry_px") or 0)
+    hedge_entry = float(trade.get("hedge_entry_px") or 0)
+    asset_exit, hedge_exit = strategy_row_execution_prices(row, trade.get("action"), closing=True)
+    asset_notional, hedge_notional = paper_trade_leg_notionals(trade)
+    total_notional = asset_notional + hedge_notional
+    if all((asset_entry > 0, hedge_entry > 0, asset_exit, hedge_exit, total_notional > 0)):
+        asset_buy = trade["action"] == "long_asset_short_hedge"
+        hedge_buy = not asset_buy
+        asset_size = asset_notional / asset_entry
+        hedge_size = hedge_notional / hedge_entry
+        gross_usdc = ((float(asset_exit) - asset_entry) * asset_size * (1 if asset_buy else -1)
+                      + (float(hedge_exit) - hedge_entry) * hedge_size * (1 if hedge_buy else -1))
+        gross_bps = gross_usdc / total_notional * 10_000
+        pnl_bps = gross_bps + funding_bps - fee_bps
+        return {
+            "pnl_bps": pnl_bps, "pnl_usdc": total_notional * pnl_bps / 10_000,
+            "gross_bps": gross_bps, "funding_bps": funding_bps, "fee_bps": fee_bps,
+            "pnl_model": "l2_executable", "asset_exit_px": asset_exit, "hedge_exit_px": hedge_exit,
+        }
+
+    entry_z = float(trade["entry_z"])
+    current_z = float(row.get("zscore") or 0)
+    z_value_bps = float(config.get("paper_z_value_bps", 18.0))
+    if trade["action"] == "short_asset_long_hedge":
+        gross_bps = (entry_z - current_z) * z_value_bps
+    elif trade["action"] == "long_asset_short_hedge":
+        gross_bps = (current_z - entry_z) * z_value_bps
+    else:
+        gross_bps = 0.0
+    pnl_bps = gross_bps + funding_bps - fee_bps
+    total = float(trade.get("notional_usdc") or total_notional or 0)
+    return {
+        "pnl_bps": pnl_bps, "pnl_usdc": total * pnl_bps / 10_000,
+        "gross_bps": gross_bps, "funding_bps": funding_bps, "fee_bps": fee_bps,
+        "pnl_model": "z_approx", "asset_exit_px": None, "hedge_exit_px": None,
+    }
+
+
+def paper_trade_pnl_bps(trade, row, config, now_ts=None):
+    return paper_trade_pnl_details(trade, row, config, now_ts)["pnl_bps"]
 
 
 def paper_close_reason(trade, row, config, now_ts=None):
@@ -1094,7 +1181,8 @@ def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, confi
     init_alt_db(db_path)
     sync_live = bool((config or {}).get("paper_sync_live", True))
     trade_mode_where = " AND mode = 'shared_strategy'" if sync_live else " AND mode = 'legacy'"
-    equity_mode_where = " WHERE mode = 'shared_strategy'" if sync_live else " WHERE mode = 'legacy'"
+    equity_mode_where = (" WHERE mode = 'shared_strategy' AND pnl_model='l2_executable'"
+                         if sync_live else " WHERE mode = 'legacy'")
     with sqlite3.connect(db_path) as db:
         db.row_factory = sqlite3.Row
         open_rows = [dict(row) for row in db.execute(
@@ -1106,6 +1194,7 @@ def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, confi
         equity_rows = [dict(row) for row in db.execute(
             "SELECT * FROM paper_equity" + equity_mode_where + " ORDER BY ts DESC LIMIT ?", (int(limit),)
         ).fetchall()][::-1]
+        stats_model_where = " AND pnl_model='l2_executable'" if sync_live else ""
         stats = db.execute("""
             SELECT
                 COUNT(*) AS trades,
@@ -1114,7 +1203,11 @@ def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, confi
                 COALESCE(AVG(pnl_bps), 0) AS avg_bps,
                 COALESCE(MIN(pnl_bps), 0) AS worst_bps
             FROM paper_trades WHERE status = 'closed'
-        """ + trade_mode_where).fetchone()
+        """ + trade_mode_where + stats_model_where).fetchone()
+        excluded_models = int(db.execute(
+            "SELECT COUNT(*) FROM paper_trades WHERE status='closed'" + trade_mode_where
+            + (" AND COALESCE(pnl_model, 'z_approx') != 'l2_executable'" if sync_live else " AND 1=0")
+        ).fetchone()[0])
     trades = int(stats["trades"] or 0)
     wins = int(stats["wins"] or 0)
     if current_rows and config:
@@ -1129,12 +1222,13 @@ def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, confi
             row = row_by_pair.get(paper_pair_key(trade))
             if not row:
                 continue
-            pnl_bps = paper_trade_pnl_bps(trade, row, config, now_ts)
+            pnl_details = paper_trade_pnl_details(trade, row, config, now_ts)
             trade["current_z"] = row.get("zscore")
             trade["current_corr"] = row.get("corr")
             trade["current_spread_bps"] = row.get("spread_bps")
-            trade["pnl_bps"] = pnl_bps
-            trade["pnl_usdc"] = float(trade["notional_usdc"]) * pnl_bps / 10_000
+            trade["pnl_bps"] = pnl_details["pnl_bps"]
+            trade["pnl_usdc"] = pnl_details["pnl_usdc"]
+            trade["pnl_model"] = pnl_details["pnl_model"]
     return {
         "enabled": True,
         "mode": "shared_strategy" if sync_live else "independent",
@@ -1148,6 +1242,7 @@ def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, confi
             "realized_usdc": float(stats["realized"] or 0),
             "avg_bps": float(stats["avg_bps"] or 0),
             "worst_bps": float(stats["worst_bps"] or 0),
+            "excluded_legacy_z_trades": excluded_models,
         },
     }
 
@@ -1162,24 +1257,32 @@ def notify_dingtalk_paper_trade(state, alert_type, trade, row=None, reason=None)
     dash = _dashboard_url(state.config)
     asset = trade.get("asset") or (row or {}).get("asset")
     leader = trade.get("leader") or (row or {}).get("leader")
+    asset_notional, hedge_notional = paper_trade_leg_notionals(trade)
+    pnl_model = str(trade.get("pnl_model") or "z_approx")
+    model_text = "盘口可成交价模型" if pnl_model == "l2_executable" else "历史Z理论模型"
     lines = [
         f"{keyword} Hyperliquid 模拟盘提醒",
         f"类型：{alert_type}",
         f"触发时间：{beijing_time_text()}（北京时间）",
         f"币对：{asset} vs {leader}",
         f"方向：{paper_direction_label(trade.get('action'))}",
-        f"名义本金：{_fmt_plain(trade.get('notional_usdc'), 0, ' USDC')}",
+        f"模拟名义金额：{_fmt_plain(asset_notional, 2, ' U')} + {_fmt_plain(hedge_notional, 2, ' U')}",
         f"入场Z：{_fmt_signed(trade.get('entry_z'), 2)}",
+        f"盈亏算法：{model_text}",
     ]
     if row:
         lines.append(f"当前Z：{_fmt_signed(row.get('zscore'), 2)} | corr：{_fmt_signed(row.get('corr'), 3)} | 点差：{_fmt_plain(row.get('spread_bps'), 2, ' bps')}")
-    if trade.get("pnl_bps") is not None:
-        lines.append(f"模拟盈亏：{_fmt_signed(trade.get('pnl_bps'), 1, ' bps')} / {_fmt_signed(trade.get('pnl_usdc'), 2, ' USDC')}")
+    if trade.get("pnl_bps") is not None and alert_type != "模拟开仓":
+        label = "模拟盘口盈亏" if pnl_model == "l2_executable" else "模拟Z理论盈亏"
+        lines.append(f"{label}：{_fmt_signed(trade.get('pnl_bps'), 1, ' bps')} / {_fmt_signed(trade.get('pnl_usdc'), 4, ' USDC')}")
     if reason:
         lines.append(f"原因：{reason}")
     if dash:
         lines.append(f"看图：{dash}")
-    lines.append("性质：模拟盘记录，不是真实下单。")
+    if pnl_model == "l2_executable":
+        lines.append("性质：模拟盘按当时买一/卖一估算成交；仍可能与真实IOC成交、手续费和资金费不同。")
+    else:
+        lines.append("性质：旧记录按Z变化折算，不代表真实价格利润，不纳入新版模拟胜率。")
     try:
         dingtalk_post(webhook, "\n".join(lines))
     except Exception as exc:
@@ -1256,7 +1359,9 @@ def load_live_trades_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None,
             row = row_by_pair.get(paper_pair_key(trade))
             if not row:
                 continue
-            pnl_bps = paper_trade_pnl_bps({**trade, "notional_usdc": trade["asset_notional_usdc"]}, row, config, now_ts)
+            pnl_details = paper_trade_pnl_details(
+                {**trade, "notional_usdc": trade.get("total_notional_usdc")}, row, config, now_ts,
+            )
             trade["current_z"] = row.get("zscore")
             trade["current_corr"] = row.get("corr")
             trade["current_beta"] = row.get("beta")
@@ -1266,8 +1371,9 @@ def load_live_trades_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None,
             trade["current_funding_hourly"] = row.get("funding_hourly")
             trade["current_plan"] = row.get("plan")
             trade["current_tag"] = row.get("tag")
-            trade["signal_pnl_bps"] = pnl_bps
-            trade["signal_pnl_usdc"] = float(trade["asset_notional_usdc"]) * pnl_bps / 10_000
+            trade["signal_pnl_bps"] = pnl_details["pnl_bps"]
+            trade["signal_pnl_usdc"] = pnl_details["pnl_usdc"]
+            trade["signal_pnl_model"] = pnl_details["pnl_model"]
     trades = int(stats["trades"] or 0)
     wins = int(stats["wins"] or 0)
     return {
@@ -1310,7 +1416,13 @@ def notify_dingtalk_live_trade(state, alert_type, trade, row=None, reason=None):
     if row:
         lines.append(f"当前Z：{_fmt_signed(row.get('zscore'), 2)} | corr：{_fmt_signed(row.get('corr'), 3)} | 点差：{_fmt_plain(row.get('spread_bps'), 2, ' bps')}")
     if trade.get("pnl_usdc") is not None and (alert_type != "真实开仓"):
-        lines.append(f"实际价格盈亏：{_fmt_signed(trade.get('pnl_usdc'), 4, ' U')} / {_fmt_signed(trade.get('pnl_bps'), 1, ' bps')}（未扣手续费、资金费）")
+        lines.append(f"实际价格毛盈亏：{_fmt_signed(trade.get('pnl_usdc'), 4, ' U')} / {_fmt_signed(trade.get('pnl_bps'), 1, ' bps')}（未扣官方手续费、资金费）")
+        fee_bps = float(state.config.get("paper_fee_bps", 4.0) or 0)
+        total_notional = float(trade.get("total_notional_usdc") or 0)
+        if total_notional > 0 and fee_bps > 0:
+            net_bps = float(trade.get("pnl_bps") or 0) - fee_bps
+            net_usdc = float(trade.get("pnl_usdc") or 0) - total_notional * fee_bps / 10_000
+            lines.append(f"扣配置成本后参考：{_fmt_signed(net_usdc, 4, ' U')} / {_fmt_signed(net_bps, 1, ' bps')}（仍以官方账单为准）")
     if reason:
         lines.append(f"原因：{reason}")
     dash = _dashboard_url(state.config)
@@ -1386,19 +1498,9 @@ def _live_apply_leverage(exchange, coins, leverage):
 
 
 def live_execution_steps(config):
-    raw = config.get("live_execution_steps")
-    if isinstance(raw, str):
-        steps = [item.strip() for item in raw.split(",") if item.strip()]
-    else:
-        steps = list(raw or [])
-    steps = [item for item in steps if item in LIVE_EXECUTION_STEP_IDS]
-    if not steps:
-        style = str(config.get("live_execution_style") or "fast")
-        steps = list(LIVE_EXECUTION_PRESETS.get(style, LIVE_EXECUTION_PRESETS["fast"]))
-    for required in ("submit_real", "record_paper"):
-        if required not in steps:
-            steps.append(required)
-    return steps
+    # Fixed, reviewed order.  The former browser step editor was too easy to
+    # misunderstand and could move or remove safety checks.
+    return list(LIVE_EXECUTION_PRESETS["fast"])
 
 
 def parse_live_execution_steps(value):
@@ -1578,6 +1680,10 @@ def realtime_row_from_l2book(row, l2book):
         out["realtime"] = True
         out["asset_l2_mid"] = asset_mid
         out["hedge_l2_mid"] = hedge_mid
+        out["asset_l2_bid"] = float(asset_book.get("bid") or 0)
+        out["asset_l2_ask"] = float(asset_book.get("ask") or 0)
+        out["hedge_l2_bid"] = float(hedge_book.get("bid") or 0)
+        out["hedge_l2_ask"] = float(hedge_book.get("ask") or 0)
         out["asset_l2_age_ms"] = asset_book.get("age_ms")
         out["hedge_l2_age_ms"] = hedge_book.get("age_ms")
         out["spread_bps"] = max(float(asset_book.get("spread_bps") or 0), float(hedge_book.get("spread_bps") or 0))
@@ -1599,6 +1705,24 @@ def prepare_live_rows(rows, config, l2book=None):
     that old candle tag/action.
     """
     prepared = realtime_rows_from_l2book(rows, l2book) if config.get("live_use_realtime_z", True) and l2book else [dict(row) for row in rows]
+    # Even when realtime Z is disabled, price-based simulation and stop-loss
+    # still need current executable bid/ask prices.
+    if l2book:
+        enriched = []
+        for source in prepared:
+            row = dict(source)
+            asset_book = l2book.get_book(row.get("asset"))
+            hedge_book = l2book.get_book(row.get("leader"))
+            if asset_book and hedge_book:
+                row.update({
+                    "asset_l2_bid": asset_book.get("bid"), "asset_l2_ask": asset_book.get("ask"),
+                    "asset_l2_mid": asset_book.get("mid"), "hedge_l2_bid": hedge_book.get("bid"),
+                    "hedge_l2_ask": hedge_book.get("ask"), "hedge_l2_mid": hedge_book.get("mid"),
+                    "asset_l2_age_ms": asset_book.get("age_ms"), "hedge_l2_age_ms": hedge_book.get("age_ms"),
+                    "spread_bps": max(float(asset_book.get("spread_bps") or 0), float(hedge_book.get("spread_bps") or 0)),
+                })
+            enriched.append(row)
+        prepared = enriched
     min_z = float(config.get("live_min_entry_z", 3.0) or 3.0)
     result = []
     for source in prepared:
@@ -1740,7 +1864,7 @@ def live_l2book_reject_reason(state, row, asset_notional, hedge_notional, *, all
 def open_live_strategy_trade(state, row, scan_id):
     config = state.config
     steps = live_execution_steps(config)
-    style = str(config.get("live_execution_style") or "fast")
+    style = "fixed_safe"
     account = None
     account_age_ms = None
     asset_notional = hedge_notional = None
@@ -2206,18 +2330,21 @@ def prepare_shared_strategy_cycle(state, payload, scan_id):
             reason, pnl_bps = paper_close_reason(trade, row, config, now_ts)
             if not reason:
                 continue
-            pnl_usdc = float(trade["notional_usdc"]) * pnl_bps / 10_000
+            pnl_details = paper_trade_pnl_details(trade, row, config, now_ts)
+            pnl_bps = float(pnl_details["pnl_bps"])
+            pnl_usdc = float(pnl_details["pnl_usdc"])
             db.execute("""
                 UPDATE paper_trades
                 SET status='closed', exit_ts=?, exit_z=?, exit_corr=?, exit_spread_bps=?, exit_funding_hourly=?,
-                    pnl_bps=?, pnl_usdc=?, close_reason=?, closed_scan_id=?
+                    pnl_bps=?, pnl_usdc=?, close_reason=?, closed_scan_id=?, pnl_model=?
                 WHERE id=?
             """, (
                 now_ts, row.get("zscore"), row.get("corr"), row.get("spread_bps"), row.get("funding_hourly"),
-                pnl_bps, pnl_usdc, reason, scan_id, trade["id"],
+                pnl_bps, pnl_usdc, reason, scan_id, pnl_details["pnl_model"], trade["id"],
             ))
             trade.update({"status": "closed", "exit_ts": now_ts, "exit_z": row.get("zscore"),
-                          "pnl_bps": pnl_bps, "pnl_usdc": pnl_usdc, "close_reason": reason})
+                          "pnl_bps": pnl_bps, "pnl_usdc": pnl_usdc, "close_reason": reason,
+                          "pnl_model": pnl_details["pnl_model"]})
             closed_now.append((trade, row, reason))
             closed_keys_this_round.add(trade["trade_key"])
             open_keys.discard(trade["trade_key"])
@@ -2252,12 +2379,19 @@ def prepare_shared_strategy_cycle(state, payload, scan_id):
                 notional = asset_notional + hedge_notional
             except (ValueError, RuntimeError, TypeError):
                 notional = float(config.get("paper_notional_usdc", DEFAULT_PAPER_NOTIONAL))
+                beta_abs = abs(float(row.get("beta") or 0))
+                asset_notional = notional / max(1.0 + beta_abs, 1e-9)
+                hedge_notional = max(0.0, notional - asset_notional)
+            asset_entry_px, hedge_entry_px = strategy_row_execution_prices(row, row.get("action"), closing=False)
+            pnl_model = "l2_executable" if asset_entry_px and hedge_entry_px else "z_approx"
             plan = f"统一策略：{row.get('plan', '')}；模拟与真实共用同一信号，真实开关只控制是否发送订单"
             trade = {
                 "id": None, "trade_key": key, "status": "open", "asset": row["asset"],
                 "leader": row["leader"], "action": row["action"], "notional_usdc": notional,
+                "asset_notional_usdc": asset_notional, "hedge_notional_usdc": hedge_notional,
+                "asset_entry_px": asset_entry_px, "hedge_entry_px": hedge_entry_px,
                 "beta": row["beta"], "entry_ts": now_ts, "entry_z": row["zscore"],
-                "pnl_bps": 0, "pnl_usdc": 0, "plan": plan,
+                "pnl_bps": 0, "pnl_usdc": 0, "plan": plan, "pnl_model": pnl_model,
             }
             opened_now.append((trade, row))
             open_keys.add(key)
@@ -2290,14 +2424,18 @@ def finalize_shared_strategy_cycle(state, payload, scan_id, cycle):
                 continue
             cursor = db.execute("""
                 INSERT INTO paper_trades (
-                    trade_key, status, asset, leader, action, notional_usdc, beta, entry_ts,
+                    trade_key, status, asset, leader, action, notional_usdc, beta,
+                    asset_notional_usdc, hedge_notional_usdc, asset_entry_px, hedge_entry_px, entry_ts,
                     entry_z, entry_corr, entry_spread_bps, entry_funding_hourly,
-                    pnl_bps, pnl_usdc, opened_scan_id, plan, mode
-                ) VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 'shared_strategy')
+                    pnl_bps, pnl_usdc, opened_scan_id, plan, mode, pnl_model
+                ) VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 'shared_strategy', ?)
             """, (
                 trade["trade_key"], trade["asset"], trade["leader"], trade["action"],
-                trade["notional_usdc"], trade["beta"], trade["entry_ts"], trade["entry_z"],
+                trade["notional_usdc"], trade["beta"], trade.get("asset_notional_usdc"),
+                trade.get("hedge_notional_usdc"), trade.get("asset_entry_px"), trade.get("hedge_entry_px"),
+                trade["entry_ts"], trade["entry_z"],
                 row.get("corr"), row.get("spread_bps"), row.get("funding_hourly"), scan_id, trade["plan"],
+                trade.get("pnl_model"),
             ))
             trade["id"] = cursor.lastrowid
         current_open = [dict(row) for row in db.execute("""
@@ -2306,16 +2444,17 @@ def finalize_shared_strategy_cycle(state, payload, scan_id, cycle):
         unrealized = 0.0
         for trade in current_open:
             row = row_by_pair.get(paper_pair_key(trade))
-            if row:
-                unrealized += float(trade["notional_usdc"]) * paper_trade_pnl_bps(trade, row, config, now_ts) / 10_000
+            if row and str(trade.get("pnl_model") or "") == "l2_executable":
+                unrealized += float(paper_trade_pnl_details(trade, row, config, now_ts)["pnl_usdc"])
         realized = float(db.execute("""
             SELECT COALESCE(SUM(pnl_usdc), 0) FROM paper_trades
-            WHERE status='closed' AND mode='shared_strategy'
+            WHERE status='closed' AND mode='shared_strategy' AND pnl_model='l2_executable'
         """).fetchone()[0])
         db.execute("""
-            INSERT INTO paper_equity (ts, scan_id, realized_usdc, unrealized_usdc, total_usdc, open_count, mode)
-            VALUES (?, ?, ?, ?, ?, ?, 'shared_strategy')
-        """, (now_ts, scan_id, realized, unrealized, realized + unrealized, len(current_open)))
+            INSERT INTO paper_equity (ts, scan_id, realized_usdc, unrealized_usdc, total_usdc, open_count, mode, pnl_model)
+            VALUES (?, ?, ?, ?, ?, ?, 'shared_strategy', 'l2_executable')
+        """, (now_ts, scan_id, realized, unrealized, realized + unrealized,
+              sum(str(trade.get("pnl_model") or "") == "l2_executable" for trade in current_open)))
 
     for trade, row in opened_now:
         notify_dingtalk_paper_trade(state, "模拟开仓", trade, row, "统一策略信号开仓；真实开关决定是否同时发送真实订单")
@@ -2623,8 +2762,6 @@ PAPER_CONFIG_FIELDS = {
 
 LIVE_CONFIG_FIELDS = {
     "live_enabled": {"env": "LIVE_ENABLED", "type": "bool", "label": "真实下单总开关"},
-    "live_execution_style": {"env": "LIVE_EXECUTION_STYLE", "type": "choice", "choices": ("fast", "balanced", "strict", "custom"), "label": "真实执行顺序风格"},
-    "live_execution_steps": {"env": "LIVE_EXECUTION_STEPS", "type": "steps", "label": "真实执行步骤"},
     "live_account_poll_seconds": {"env": "LIVE_ACCOUNT_POLL_SECONDS", "type": "float", "min": 1, "max": 300, "label": "后台账户刷新秒数"},
     "live_account_cache_max_age_ms": {"env": "LIVE_ACCOUNT_CACHE_MAX_AGE_MS", "type": "float", "min": 1000, "max": 300_000, "label": "账户缓存最大年龄 ms"},
     "live_leverage_cache_seconds": {"env": "LIVE_LEVERAGE_CACHE_SECONDS", "type": "float", "min": 0, "max": 604_800, "label": "杠杆预设缓存秒数"},
@@ -3132,7 +3269,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <button onclick="openLiveDialog()">打开统一策略 / 真实执行设置</button>
 <span id="pSaveStatus" class="subtle">模拟与真实只使用这一套策略控件；真实专属执行项放在同一弹窗后半部分。</span>
 </div>
-<div class="subtle">模拟盘始终运行。真实开关只决定是否把同一个统一策略信号发送成真实订单，不再维护第二套模拟参数。</div>
+<div class="subtle">模拟盘始终运行。新版模拟按两腿买一/卖一估算盈亏；历史 Z 折算记录保留查看，但不再计入新版胜率和累计收益。</div>
 </div>
 <div>
 <canvas id="paperChart" class="mini" width="760" height="190"></canvas>
@@ -3140,7 +3277,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 </div>
 </div>
 <div class="paperTableWrap">
-<table id="paperTbl"><thead><tr><th>状态</th><th>币对</th><th>方向</th><th>入场Z</th><th>当前/出场Z</th><th>盈亏</th><th>原因</th></tr></thead><tbody></tbody></table>
+<table id="paperTbl"><thead><tr><th>状态</th><th>币对</th><th>方向</th><th>入场Z</th><th>当前/出场Z</th><th>模拟算法</th><th>盈亏</th><th>原因</th></tr></thead><tbody></tbody></table>
 </div>
 </section>
 <section>
@@ -3207,57 +3344,54 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
   <p id="liveBlocker" class="scoreMid"></p>
   <div class="paperActions"><button onclick="saveLiveConfig()">保存统一策略 / 真实执行参数</button><button onclick="loadLive()">刷新真实账户</button><span id="liveSaveStatus" class="subtle">管理口令在“全局设置”里填写</span></div>
   <div class="settingBand">
-    <h3>① 统一策略参数（模拟与真实完全相同）</h3>
-    <div class="detailText">这里只决定“什么时候开、什么时候平、选哪个币对”。模拟盘始终使用；真实开关开启时也使用同一份决策。</div>
+    <h3>① 常用策略设置（模拟与真实共用）</h3>
+    <div class="detailText">日常只需要选择档位、最多持仓和退出规则。模拟与真实使用同一个开平仓信号；新版模拟盈亏改为按两腿买一/卖一估算，不再把 Z 回归直接当利润。</div>
     <div class="paperForm">
       <label>统一策略档位<select id="liveRiskPreset" onchange="applyLiveRiskPreset(this.value)"><option value="conservative">保守：少交易</option><option value="balanced">中等：测试</option><option value="aggressive">激进：多交易</option><option value="custom">自定义</option></select></label>
       <label>统一策略最多持仓<input id="cfg_live_max_open" type="number" step="1"></label>
-      <label>统一最低|Z|<input id="cfg_live_min_entry_z" type="number" min="0" max="20" step="0.1"></label>
-      <label>统一最低相关<input id="cfg_live_min_corr" type="number" min="-1" max="1" step="0.01"></label>
-      <label>统一最大点差bps<input id="cfg_live_max_entry_spread_bps" type="number" min="0" max="100" step="0.1"></label>
-      <label>统一最低预期边际bps<input id="cfg_live_min_expected_edge_bps" type="number" step="1"></label>
       <label>回归平仓Z<input id="cfg_paper_exit_z" type="number" step="0.1"></label>
       <label>固定止盈bps（0关闭）<input id="cfg_paper_take_profit_bps" type="number" step="1" min="0"></label>
       <label>止损bps<input id="cfg_paper_stop_bps" type="number" step="1"></label>
       <label>最长持仓分钟<input id="cfg_paper_max_hold_minutes" type="number" step="1"></label>
-      <label>理论成本bps<input id="cfg_paper_fee_bps" type="number" step="0.1"></label>
-      <label>每1Z折算bps<input id="cfg_paper_z_value_bps" type="number" step="0.1"></label>
-      <label>持仓最低相关<input id="cfg_paper_min_corr" type="number" step="0.01"></label>
-      <label>l2Book盘口校验<select id="cfg_live_use_l2book"><option value="true">开启（默认）</option><option value="false">关闭</option></select></label>
-      <label>l2Book最大延迟ms<input id="cfg_live_l2_max_age_ms" type="number" min="100" max="60000" step="100"></label>
-      <label>统一信号执行宽限ms<input id="cfg_live_strategy_entry_grace_ms" type="number" min="0" max="60000" step="100"></label>
-      <label>l2Book最大点差bps<input id="cfg_live_l2_max_spread_bps" type="number" min="0" max="100" step="0.1"></label>
-      <label>WS订阅数量<input id="cfg_live_l2_subscribe_limit" type="number" min="2" max="1000" step="1"></label>
-      <label>WS实时Z<select id="cfg_live_use_realtime_z"><option value="true">开启（默认）</option><option value="false">关闭</option></select></label>
-      <label>WS策略判断间隔ms<input id="cfg_live_realtime_strategy_interval_ms" type="number" min="100" max="10000" step="100" title="有新盘口时，最多按这个间隔合并判断一次。500ms不是行情延迟，而是策略计算节流。"></label>
     </div>
+    <details class="settingBand"><summary><b>高级策略过滤（一般不用改）</b></summary>
+      <div class="paperForm">
+        <label>开仓最低|Z|<input id="cfg_live_min_entry_z" type="number" min="0" max="20" step="0.1"></label>
+        <label>开仓最低相关<input id="cfg_live_min_corr" type="number" min="-1" max="1" step="0.01"></label>
+        <label>开仓最大点差bps<input id="cfg_live_max_entry_spread_bps" type="number" min="0" max="100" step="0.1"></label>
+        <label>最低预期边际bps<input id="cfg_live_min_expected_edge_bps" type="number" step="1"></label>
+        <label>模拟手续费/额外滑点bps<input id="cfg_paper_fee_bps" type="number" step="0.1"></label>
+        <label>旧记录回退：每1Z折算bps<input id="cfg_paper_z_value_bps" type="number" step="0.1"></label>
+        <label>持仓最低相关<input id="cfg_paper_min_corr" type="number" step="0.01"></label>
+        <label>l2Book盘口校验<select id="cfg_live_use_l2book"><option value="true">开启（推荐）</option><option value="false">关闭</option></select></label>
+        <label>盘口最大年龄ms<input id="cfg_live_l2_max_age_ms" type="number" min="100" max="60000" step="100"></label>
+        <label>已确认盘口宽限ms<input id="cfg_live_strategy_entry_grace_ms" type="number" min="0" max="60000" step="100"></label>
+        <label>盘口最大点差bps<input id="cfg_live_l2_max_spread_bps" type="number" min="0" max="100" step="0.1"></label>
+        <label>WS订阅数量<input id="cfg_live_l2_subscribe_limit" type="number" min="2" max="1000" step="1"></label>
+        <label>WS实时Z<select id="cfg_live_use_realtime_z"><option value="true">开启（推荐）</option><option value="false">关闭</option></select></label>
+        <label>策略判断节流ms<input id="cfg_live_realtime_strategy_interval_ms" type="number" min="100" max="10000" step="100" title="有新盘口时，最多按这个间隔合并判断一次。500ms不是行情延迟。"></label>
+      </div>
+    </details>
   </div>
   <div class="settingBand">
-    <h3>② 真实执行追加项</h3>
-    <div class="detailText">这些控件只影响真实订单，不改变模拟信号。默认“极速锁定”使用后台账户缓存，不在商机出现后同步查询账户。</div>
+    <h3>② 真实下单设置</h3>
+    <div class="detailText">这些项目只决定是否真的发送订单、下多大和用多少杠杆，不改变策略信号。</div>
     <div class="paperForm">
       <label>真实下单总开关<select id="cfg_live_enabled"><option value="false">关闭</option><option value="true">开启</option></select></label>
       <label>真实策略开关<select id="cfg_live_strategy_enabled"><option value="false">关闭（默认）</option><option value="true">开启</option></select></label>
       <label>主钱包公开地址<input id="cfg_live_account_address" placeholder="0x...（不是 API 钱包）"></label>
       <label>每笔小币腿USDC<input id="cfg_live_notional_usdc" type="number" min="1" step="0.1"></label>
       <label>低于交易所最低<select id="cfg_live_auto_min_notional"><option value="false">跳过，不下单（默认）</option><option value="true">自动补到最低</option></select></label>
-      <label>最大滑点bps<input id="cfg_live_max_slippage_bps" type="number" step="1"></label>
       <label>杠杆倍数<input id="cfg_live_leverage" type="number" min="1" max="50" step="1"></label>
-      <label>杠杆失败处理<select id="cfg_live_require_leverage_ok"><option value="true">跳过，不下单（默认）</option><option value="false">继续下单</option></select></label>
-      <label>执行顺序风格<select id="cfg_live_execution_style" onchange="applyExecutionStyle(this.value)"><option value="fast">极速锁定（默认）</option><option value="balanced">平衡</option><option value="strict">严格复查</option><option value="custom" hidden>专家自定义</option></select></label>
-      <label>后台账户刷新秒<input id="cfg_live_account_poll_seconds" type="number" min="1" max="300" step="1"></label>
-      <label>账户缓存最大年龄ms<input id="cfg_live_account_cache_max_age_ms" type="number" min="1000" max="300000" step="1000"></label>
-      <label>杠杆预设缓存秒<input id="cfg_live_leverage_cache_seconds" type="number" min="0" max="604800" step="60"></label>
     </div>
-    <details class="settingBand">
-      <summary><b>专家调试模式：查看/调整底层执行步骤</b></summary>
-      <p class="scoreMid">日常交易不需要打开。它主要用于定位漏单和测量耗时；错误删除检查会提高真实交易风险。</p>
-      <div id="executionStepList" class="detailText"></div>
-      <div class="paperActions">
-        <select id="executionStepAdd"><option value="cached_account">读取后台账户缓存</option><option value="fresh_account">立即查询最新账户（慢）</option><option value="prepare_leverage">准备/确认杠杆</option><option value="final_l2">内存盘口最终复查</option><option value="refresh_account_async">下单后后台刷新账户</option></select>
-        <button onclick="addExecutionStep()">插入步骤</button>
-        <button onclick="applyExecutionStyle(liveCfgEl('execution_style').value)">恢复当前风格默认顺序</button>
-        <span class="subtle">“发送真实IOC”和“记录模拟交易”不可删除；下单前检查不能移动到IOC之后。</span>
+    <div class="detailText"><b>固定执行步骤：</b>读取后台账户缓存 → 准备杠杆 → 复查最新盘口 → 发送真实 IOC → 保存模拟记录 → 后台刷新账户。这个顺序已经固定，不再提供容易误操作的专家编辑器。</div>
+    <details class="settingBand"><summary><b>高级真实执行（一般不用改）</b></summary>
+      <div class="paperForm">
+        <label>最大滑点bps<input id="cfg_live_max_slippage_bps" type="number" step="1"></label>
+        <label>杠杆失败处理<select id="cfg_live_require_leverage_ok"><option value="true">跳过，不下单（推荐）</option><option value="false">继续下单</option></select></label>
+        <label>后台账户刷新秒<input id="cfg_live_account_poll_seconds" type="number" min="1" max="300" step="1"></label>
+        <label>账户缓存最大年龄ms<input id="cfg_live_account_cache_max_age_ms" type="number" min="1000" max="300000" step="1000"></label>
+        <label>杠杆预设缓存秒<input id="cfg_live_leverage_cache_seconds" type="number" min="0" max="604800" step="60"></label>
       </div>
     </details>
   </div>
@@ -3369,36 +3503,59 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <h3>真实交易为什么看起来没赚没亏</h3>
 <p>你现在每笔很小，通常十几 USDC 一条腿。价格动一点点，显示出来可能只有几分钱，手续费、点差和资金费会很容易吃掉它。</p>
 <p>所以小仓位阶段主要是在验证：能不能正确开平仓、滑点多大、异常能不能及时发现，而不是马上看大额利润。</p>
-<p>更关键的是：模拟盘的收益是按“Z 回归幅度”折算出来的；真实盘是按 Hyperliquid 实际成交价算。Z 回归不等于真实价格组合一定赚钱，所以实盘必须有更高门槛。</p>
+<p><b>旧版模拟为什么总显得赚钱：</b>旧算法把 Z 的变化直接乘以“每1Z折算bps”。例如入场 Z=-4.72、出场 Z=-0.38，旧算法约为 <code>(-0.38 - -4.72) × 18 - 4 = 74.1bps</code>。这只是指标回归分数，不是 LTC 与 ETH 两腿的价格利润。</p>
+<p><b>新版模拟怎么计算：</b>做多的一腿按卖一价模拟买入、按买一价模拟卖出；做空的一腿按买一价模拟卖出、按卖一价模拟买回，再按两腿名义金额计算 bps，并扣除“模拟手续费/额外滑点”。因此 ADA 即使 Z 从 2.01 回到 -0.17，如果 ADA 与 ETH 的实际价格组合亏损，新模拟也会显示亏损。</p>
+<p>真实盘仍可能和新版模拟差几 bps，因为真实 IOC 从判断到成交有时间差，还存在真实成交档位、手续费和资金费。新版的目标是接近真实，而不是制造漂亮胜率。</p>
+
+<h3>真实面板顶部每一项是什么</h3>
+<p><code>真实下单状态</code>：总开关和策略开关是否同时开启。</p>
+<p><code>账户模式 / 可用USDC</code>：Hyperliquid 当前可用于保证金和下单的余额，不等于你愿意承担的最大亏损。</p>
+<p><code>当前真实仓位数</code>：官方账户当前非零合约仓位；程序记录和官方仓位不一致时应优先看官方。</p>
+<p><code>真实已平仓 / 胜率</code>：只统计程序真实成交并正常平仓的记录。胜率高不代表赚钱，仍要看平均 bps。</p>
+<p><code>真实已实现</code>：按成交价格粗算的累计盈亏，目前不含官方手续费和资金费。</p>
+<p><code>真实平均 / 最差</code>：平均每笔 bps 和历史最差单笔。平均长期为正比单看胜率更重要。</p>
+<p><code>l2Book WS盘口</code>：WebSocket 是否连接、订阅了多少币、最新消息年龄。</p>
+<p><code>本轮真实机会</code>：目前有多少组合通过基础过滤；通过后仍要检查账户、最低金额、盘口深度和杠杆。</p>
+<p><code>当前执行顺序</code>：固定安全流程，只用于查看，不能再编辑。</p>
+<p><code>WS实时策略引擎</code>：实时判断是否在运行、多久判断一次、最近是否报错。</p>
 
 <h3>为什么杠杆 5x 不会让它更容易赚钱</h3>
 <p>杠杆只放大仓位，不提高信号胜率。原本一笔亏 0.02U，放大后会亏更多；如果方向正确，也会赚更多。</p>
 <p>部分小币不支持你设置的杠杆倍数，交易所会返回 Invalid leverage value。现在软件默认遇到杠杆设置失败就跳过，不再继续下单。</p>
 
-<h3>实盘过滤参数怎么理解</h3>
-<p><code>实盘风控档位</code>：快捷填充下面几个核心过滤参数。保守=少交易、质量高；中等=测试更多机会；激进=交易更多但容易把噪声和成本也放进来。选择后要点击保存才生效。</p>
+<h3>策略设置怎么理解</h3>
+<p><code>统一策略档位</code>：一次填好开仓 Z、相关性、点差和预期边际。保守=机会少、过滤严；中等=用于小额测试；激进=交易多，但更容易交易到噪声。选择后仍要点击保存。</p>
 <p><code>保守档</code>：|Z| 3.0、相关 0.75、最大点差 2.5bps、最低预期边际 25bps。</p>
 <p><code>中等档</code>：|Z| 2.5、相关 0.70、最大点差 3.5bps、最低预期边际 18bps。</p>
 <p><code>激进档</code>：|Z| 2.0、相关 0.65、最大点差 5bps、最低预期边际 10bps。小资金研究可以看，实盘要谨慎。</p>
 <p><code>每笔小币腿USDC</code>：小币这一腿想下多少名义金额。保护腿会按 beta 自动折算，不是固定同样金额。</p>
 <p><code>低于交易所最低</code>：Hyperliquid 单腿最低约 10U。选择“跳过”时，小额不下单；选择“自动补到最低”时，会把金额抬到两条腿都满足最低订单。</p>
-<p><code>最多真实仓位</code>：同时允许多少组真实双腿策略。小资金阶段建议 1。</p>
+<p><code>统一策略最多持仓</code>：模拟和真实共用的最多组合数。小资金阶段建议 1。</p>
 <p><code>最大滑点bps</code>：IOC 限价单最多允许比当前可成交价差多少。太小容易不成交，太大容易成交很差。</p>
 <p><code>杠杆倍数</code>：放大仓位，不提高胜率。小资金测试建议先 1x，确认策略真实转正后再考虑提高。</p>
 <p><code>杠杆失败处理</code>：有些小币不支持设置的杠杆。默认“跳过”更安全，避免你以为是 5x，实际交易所没接受。</p>
-<p><code>实盘最低|Z|</code>：真实开仓要比模拟盘更极端，默认 3。2 左右的信号太多，噪声和手续费容易吃掉收益。</p>
-<p><code>实盘最低相关</code>：小币和保护腿关系要足够稳定，默认 0.75。</p>
-<p><code>实盘最大点差</code>：盘口买卖差太大时不做，默认 2.5 bps。</p>
-<p><code>实盘最低预期边际</code>：用 Z 回归空间减去估算成本后的粗略安全垫，默认 25 bps。</p>
+<p><code>开仓最低|Z|</code>：偏离至少多极端才允许开仓。越高交易越少。</p>
+<p><code>开仓最低相关</code>：小币和保护腿过去的联动至少多稳定。</p>
+<p><code>开仓最大点差</code>：任意一腿盘口买卖差太大就不做。</p>
+<p><code>最低预期边际</code>：仍是基于 Z 的入场过滤分数，只负责筛选，不再拿来计算新版模拟盈亏。</p>
+<p><code>回归平仓Z</code>：例如 0.5，表示 |Z| 回到 0.5 以内就退出。注意：Z 回归时价格组合仍可能亏，所以退出原因和盈亏是两件事。</p>
+<p><code>固定止盈/止损bps</code>：新版按两腿盘口价格收益判断；不是按 Z 变化判断。</p>
+<p><code>最长持仓分钟</code>：超过时间无论盈亏都退出，避免关系长期不回归。</p>
+<p><code>模拟手续费/额外滑点bps</code>：买一卖一已经包含盘口点差；这里再扣交易手续费和额外成交误差。设置太低仍会使模拟偏乐观。</p>
+<p><code>旧记录回退：每1Z折算bps</code>：只用于没有保存入场盘口的历史旧记录。新版盘口模型不使用它，旧记录也不计入新版胜率。</p>
+<p><code>持仓最低相关</code>：持仓后相关性明显破坏时提前退出。</p>
 <p><code>l2Book盘口校验</code>：开仓前检查实时买一/卖一、点差、数据年龄、盘口深度。不合格就跳过真实下单。</p>
 <p><code>l2Book最大延迟ms</code>：盘口数据允许多旧。3000ms 表示超过 3 秒没更新就不拿来开仓。</p>
-<p><code>统一信号执行宽限ms</code>：策略已经在 3000ms 门槛内确认过盘口后，准备杠杆或网络发送仍可能花几秒。默认宽限 10000ms；只有 WS 仍连接、买一卖一与刚才完全相同、点差和深度仍合格时才允许继续，不是无条件放宽旧盘口。</p>
-<p><code>执行顺序风格</code>：极速锁定默认使用后台账户缓存，顺序是“缓存账户 → 杠杆预设 → 内存盘口复查 → 真实IOC → 模拟记录 → 后台刷新账户”；严格复查会在商机出现后同步查询最新账户，因此更慢。</p>
-<p><code>真实执行步骤</code>：可以上下移动、删除可选步骤或重新插入。发送真实IOC和记录模拟交易不可删除。若把模拟记录放到真实IOC前面，模拟会先落库；默认放在真实IOC后面以优先锁定真实商机。</p>
-<p><code>后台账户刷新</code>：服务器平时独立刷新余额和仓位，不占用商机出现后的关键时间。删除所有账户步骤会失去余额和外部净仓预检查，只应在明确理解风险时使用。</p>
+<p><code>已确认盘口宽限ms</code>：盘口刚刚通过新鲜度检查后，准备杠杆和发送订单仍需要时间。只有 WS 连接正常、买一卖一没变、点差和深度仍合格时才允许短暂宽限。</p>
+<p><code>固定执行步骤</code>：后台缓存账户 → 准备杠杆 → 复查最新盘口 → 发送真实 IOC → 保存模拟记录 → 后台刷新账户。步骤编辑器已经删除，避免误删风控或把检查放到下单之后。</p>
+<p><code>后台账户刷新秒</code>：平时多久更新一次余额和仓位，默认约 3 秒。它在后台进行，不阻塞商机。</p>
+<p><code>账户缓存最大年龄ms</code>：缓存超过多旧就拒绝开仓。不是行情延迟。</p>
+<p><code>杠杆预设缓存秒</code>：同一币种杠杆已经设置成功后，多长时间内不重复调用设置接口。</p>
 <p><code>l2Book最大点差bps</code>：实时盘口点差上限。超过这个值说明进出场成本太高，跳过。</p>
 <p><code>WS订阅数量</code>：服务器实时监听多少个重点币盘口。不是模拟扫描数量；模拟可以扫 150+，WS 默认只盯前 80 个重点币加 BTC/ETH。</p>
 <p><code>WS实时Z</code>：用最近一次历史K线计算出的 beta/均值/波动率作为基准，再用 l2Book 最新 mid 估算当前偏离。它适合开仓前/平仓前快速确认，但不是完整历史回测。</p>
+<p><code>策略判断节流ms</code>：WS 行情本身持续接收；500ms 表示把这段时间内的新盘口合并判断一次，避免每条消息都重复查库。它不是 500ms 网络延迟。</p>
+<p><code>真实下单总开关</code>：最外层保险。关闭后绝不会发送新的真实订单。</p>
 <p><code>真实策略开关</code>：总开关开启后还要这个开关开启，才会按规则真实下单。关闭时只监控和模拟。</p>
 
 <h3>l2Book 表格怎么读</h3>
@@ -3418,11 +3575,9 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <h3>模拟盘参数怎么读</h3>
 <p><code>统一策略</code>：模拟盘始终运行并产生唯一的开平仓决定。真实开关关闭时只模拟；真实开关开启时，真实模块只把本轮刚出现的同一个模拟开仓事件发送成真实订单。</p>
 <p>统一模式下，WS Z、相关性、点差、预期边际、方向、止盈止损和最多持仓都共用一套参数。真实盘额外检查余额、最低订单、杠杆和实际成交；这些属于执行条件，不会改变模拟策略本身。</p>
-<p><code>每笔名义本金</code>：模拟每笔按多少 USDC 计算盈亏，不是真实下单。</p>
-<p><code>回归平仓Z</code>：Z 回到多小就认为偏离回归并平仓。比如 0.5 表示 |Z| <= 0.5 出场。</p>
-<p><code>固定止盈bps/止损bps</code>：模拟盘按残差收益估算的止盈止损。真实盘仍以实际成交价为准。</p>
-<p><code>模拟成本bps</code>：模拟里扣掉的手续费/滑点估算。设太低会让模拟过于好看。</p>
-<p><code>每 1Z 折算bps</code>：模拟把 Z 回归换算成收益的粗略系数。它只是研究近似，不等于真实成交收益。</p>
+<p><code>盘口可成交价</code>：新版记录。模拟多头按卖一买、买一卖；模拟空头按买一卖、卖一买。新版累计收益、胜率和利润曲线只统计这种记录。</p>
+<p><code>历史Z理论</code>：旧版记录。它只根据 Z 变化折算，可能出现模拟 +35bps、真实只有几 bps 甚至亏损。保留用于复盘，但不再混入新版统计。</p>
+<p><code>双腿名义金额</code>：模拟与真实会显示同样的“小币腿 + 保护腿”格式，例如 18.9U + 10.5U，不再一个显示总额、另一个显示两腿。</p>
 
 <h3>推送参数怎么读</h3>
 <p><code>候选首次出现</code>：某个币对第一次达到候选条件时推送。</p>
@@ -3792,14 +3947,15 @@ function paperActionText(action){
   if(action==='long_asset_short_hedge') return '多小币/空保护';
   return action||'-';
 }
+function paperPnlModelText(model){return model==='l2_executable'?'盘口可成交价':'历史Z理论'}
 function renderPaper(data){
   const cfg=data.config||{}, stats=data.stats||{};
   const open=data.open||[], closed=data.closed||[], equity=data.equity||[];
   fillPaperConfig(cfg, false);
   const synced=cfg.paper_sync_live!==false;
   document.getElementById('pStatus').textContent=(synced?'统一策略模拟：始终运行':(cfg.paper_enabled===false?'独立模拟关闭':'独立模拟运行'))+`；持仓 ${open.length} 个`;
-  document.getElementById('pPnl').textContent=`已实现 ${fmt(stats.realized_usdc,2)} USDC`;
-  document.getElementById('pWin').textContent=`${fmt((stats.win_rate||0)*100,1)}% / ${stats.trades||0} 次`;
+  document.getElementById('pPnl').textContent=`新版盘口模型已实现 ${fmt(stats.realized_usdc,2)} USDC`;
+  document.getElementById('pWin').textContent=`新版 ${fmt((stats.win_rate||0)*100,1)}% / ${stats.trades||0} 次`+(stats.excluded_legacy_z_trades?`；旧Z记录 ${stats.excluded_legacy_z_trades} 笔未计入`:'');
   const tp=Number(cfg.paper_take_profit_bps||0);
   document.getElementById('pConfig').textContent=(synced?'与真实盘共用入场/退出信号；真实关闭时仍模拟；':`每笔 ${fmt(cfg.paper_notional_usdc,0)}U；`)+`固定止盈 ${tp>0?fmt(tp,0)+'bps':'关闭'}；止损 ${fmt(cfg.paper_stop_bps,0)}bps；回归Z ${fmt(cfg.paper_exit_z,2)}；最长 ${cfg.paper_max_hold_minutes||'-'}分`;
   drawPaperEquity(equity, true);
@@ -3808,7 +3964,7 @@ function renderPaper(data){
   rows.forEach(row=>{
     const tr=document.createElement('tr');
     const zNow=row.exit_z ?? row.current_z ?? '-';
-    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${paperActionText(row.action)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td class="${Number(row.pnl_usdc)>=0?'scoreGood':'scoreBad'}">${fmt(row.pnl_bps,1)} bps / ${fmt(row.pnl_usdc,2)}U</td><td style="text-align:left">${row.close_reason||row.plan||''}</td>`;
+    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${paperActionText(row.action)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td>${paperPnlModelText(row.pnl_model)}</td><td class="${Number(row.pnl_usdc)>=0?'scoreGood':'scoreBad'}">${fmt(row.pnl_bps,1)} bps / ${fmt(row.pnl_usdc,4)}U</td><td style="text-align:left">${row.close_reason||row.plan||''}</td>`;
     tr.onclick=()=>showPaperTradeDetail(row);
     tb.appendChild(tr);
   });
@@ -3817,22 +3973,24 @@ function showPaperTradeDetail(row){
   document.getElementById('detailTitle').textContent=`模拟交易：${row.asset} vs ${row.leader}`;
   const entryTime=row.entry_ts?new Date(row.entry_ts*1000).toLocaleString():'-';
   const exitTime=row.exit_ts?new Date(row.exit_ts*1000).toLocaleString():'未平仓';
+  const assetNotional=Number(row.asset_notional_usdc||0),hedgeNotional=Number(row.hedge_notional_usdc||0);
   document.getElementById('detailBody').innerHTML=`
     <div class="detailGrid">
       <div class="detailBox"><div class="muted">状态</div><div>${row._status||row.status}</div></div>
       <div class="detailBox"><div class="muted">方向</div><div>${paperActionText(row.action)}</div></div>
-      <div class="detailBox"><div class="muted">名义本金</div><div>${fmt(row.notional_usdc,0)} USDC</div></div>
+      <div class="detailBox"><div class="muted">双腿名义金额</div><div>${assetNotional&&hedgeNotional?fmt(assetNotional,2)+'U + '+fmt(hedgeNotional,2)+'U':fmt(row.notional_usdc,2)+'U（旧记录）'}</div></div>
       <div class="detailBox"><div class="muted">入场时间</div><div>${entryTime}</div></div>
       <div class="detailBox"><div class="muted">出场时间</div><div>${exitTime}</div></div>
       <div class="detailBox"><div class="muted">Beta</div><div>${fmt(row.beta,2)}</div></div>
       <div class="detailBox"><div class="muted">入场Z</div><div>${fmt(row.entry_z,2)}</div></div>
       <div class="detailBox"><div class="muted">当前/出场Z</div><div>${fmt(row.exit_z ?? row.current_z,2)}</div></div>
-      <div class="detailBox"><div class="muted">模拟盈亏</div><div class="${Number(row.pnl_usdc)>=0?'scoreGood':'scoreBad'}">${fmt(row.pnl_bps,1)} bps / ${fmt(row.pnl_usdc,2)} USDC</div></div>
+      <div class="detailBox"><div class="muted">模拟算法</div><div>${paperPnlModelText(row.pnl_model)}</div></div>
+      <div class="detailBox"><div class="muted">模拟盈亏</div><div class="${Number(row.pnl_usdc)>=0?'scoreGood':'scoreBad'}">${fmt(row.pnl_bps,1)} bps / ${fmt(row.pnl_usdc,4)} USDC</div></div>
     </div>
     <h3>原因/计划</h3>
     <div class="detailText">${row.close_reason||row.plan||'持仓观察中'}</div>
     <h3>注意</h3>
-    <div class="detailText">这是模拟盘残差收益，不是真实成交。真实下单还要看盘口深度、滑点、手续费、资金费、爆仓距离和网络执行失败。</div>
+    <div class="detailText">${row.pnl_model==='l2_executable'?'新版记录按开仓和当前/平仓时的买一卖一估算两腿收益，并扣除配置成本；真实IOC仍会因下单耗时、实际成交、手续费和资金费略有不同。':'这是旧版 Z 变化折算收益，不是两腿价格利润，已不纳入新版模拟胜率与累计收益。'}</div>
   `;
   detailDlg.showModal();
 }
@@ -3890,7 +4048,7 @@ async function openGlobalDialog(){
   if(saved) document.getElementById('globalAdminToken').value=saved;
   document.getElementById('globalApiStatus').textContent='读取中...';
   try{
-    const r=await fetch('live'+(silent?'':'?fresh=1'));const data=await r.json();
+    const r=await fetch('live?fresh=1');const data=await r.json();
     const cfg=data.config||{};
     document.getElementById('globalApiStatus').textContent=cfg.api_key_configured?(cfg.sdk_ready?'API 私钥已加密配置，可交易':'API 私钥已配置，但缺 SDK'):'未配置 API 钱包私钥';
     document.getElementById('globalAccountAddress').textContent=cfg.live_account_address||'-';
@@ -3918,32 +4076,8 @@ async function savePaperConfig(){
     document.getElementById('pSaveStatus').textContent='保存失败：'+e;
   }
 }
-const liveConfigKeys=['live_enabled','live_execution_style','live_execution_steps','live_account_poll_seconds','live_account_cache_max_age_ms','live_leverage_cache_seconds','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_max_entry_spread_bps','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_strategy_entry_grace_ms','live_l2_max_spread_bps','live_l2_subscribe_limit','live_use_realtime_z','live_realtime_strategy_interval_ms','live_strategy_enabled'];
+const liveConfigKeys=['live_enabled','live_account_poll_seconds','live_account_cache_max_age_ms','live_leverage_cache_seconds','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_max_entry_spread_bps','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_strategy_entry_grace_ms','live_l2_max_spread_bps','live_l2_subscribe_limit','live_use_realtime_z','live_realtime_strategy_interval_ms','live_strategy_enabled'];
 function liveCfgEl(key){return document.getElementById('cfg_'+key)}
-const executionStepLabels={cached_account:'读取后台账户缓存',fresh_account:'立即查询最新账户（慢）',prepare_leverage:'准备/确认杠杆',final_l2:'内存盘口最终复查',submit_real:'发送真实IOC订单',record_paper:'记录模拟交易',refresh_account_async:'下单后后台刷新账户'};
-const executionPresets={
-  fast:['cached_account','prepare_leverage','final_l2','submit_real','record_paper','refresh_account_async'],
-  balanced:['cached_account','prepare_leverage','final_l2','submit_real','record_paper','refresh_account_async'],
-  strict:['fresh_account','prepare_leverage','final_l2','submit_real','record_paper','refresh_account_async']
-};
-let executionSteps=[...executionPresets.fast];
-function renderExecutionSteps(){
-  const box=document.getElementById('executionStepList');if(!box)return;
-  box.innerHTML=executionSteps.map((step,i)=>{
-    const mandatory=['submit_real','record_paper'].includes(step);
-    return `<div class="settingBand" style="display:flex;align-items:center;gap:8px;margin:5px 0;padding:7px"><b>${i+1}</b><span style="flex:1">${executionStepLabels[step]||step}</span><button onclick="moveExecutionStep(${i},-1)" ${i===0?'disabled':''}>↑</button><button onclick="moveExecutionStep(${i},1)" ${i===executionSteps.length-1?'disabled':''}>↓</button><button onclick="removeExecutionStep(${i})" ${mandatory?'disabled title="必需步骤"':''}>删除</button></div>`;
-  }).join('');
-}
-function moveExecutionStep(index,delta){const target=index+delta;if(target<0||target>=executionSteps.length)return;[executionSteps[index],executionSteps[target]]=[executionSteps[target],executionSteps[index]];liveCfgEl('execution_style').value='custom';renderExecutionSteps()}
-function removeExecutionStep(index){if(['submit_real','record_paper'].includes(executionSteps[index]))return;executionSteps.splice(index,1);liveCfgEl('execution_style').value='custom';renderExecutionSteps()}
-function addExecutionStep(){const step=document.getElementById('executionStepAdd').value;if(executionSteps.includes(step))return;const orderIndex=executionSteps.indexOf('submit_real');executionSteps.splice(orderIndex<0?executionSteps.length:orderIndex,0,step);liveCfgEl('execution_style').value='custom';renderExecutionSteps()}
-function applyExecutionStyle(style){
-  if(style==='custom')return;
-  executionSteps=[...(executionPresets[style]||executionPresets.fast)];
-  const tuning={fast:[3,60000],balanced:[5,30000],strict:[5,10000]}[style];
-  if(tuning){liveCfgEl('account_poll_seconds').value=tuning[0];liveCfgEl('account_cache_max_age_ms').value=tuning[1]}
-  renderExecutionSteps();
-}
 const liveRiskPresets={
   conservative:{live_min_entry_z:3.0,live_min_corr:0.75,live_max_entry_spread_bps:2.5,live_min_expected_edge_bps:25,live_l2_max_spread_bps:2.5},
   balanced:{live_min_entry_z:2.5,live_min_corr:0.70,live_max_entry_spread_bps:3.5,live_min_expected_edge_bps:18,live_l2_max_spread_bps:3.5},
@@ -3973,21 +4107,15 @@ function applyLiveRiskPreset(name){
   if(status)status.textContent=`已套用${name==='conservative'?'保守':name==='balanced'?'中等':'激进'}档；点击“保存真实交易参数”后生效`;
 }
 function fillLiveConfig(cfg){
-  if(Array.isArray(cfg.live_execution_steps))executionSteps=[...cfg.live_execution_steps];
-  else if(typeof cfg.live_execution_steps==='string')executionSteps=cfg.live_execution_steps.split(',').filter(Boolean);
   liveConfigKeys.forEach(key=>{
-    if(key==='live_execution_steps')return;
     const el=liveCfgEl(key); if(!el || cfg[key]===undefined) return;
     el.value=['live_enabled','live_strategy_enabled','live_auto_min_notional','live_require_leverage_ok','live_use_l2book','live_use_realtime_z'].includes(key) ? (cfg[key]===true?'true':'false') : cfg[key];
   });
-  renderExecutionSteps();
   updateLiveRiskPresetSelect(cfg);
 }
 function readLiveConfig(){
   return {
     live_enabled:liveCfgEl('live_enabled').value==='true',
-    live_execution_style:liveCfgEl('execution_style').value,
-    live_execution_steps:[...executionSteps],
     live_account_poll_seconds:parseFloat(liveCfgEl('account_poll_seconds').value),
     live_account_cache_max_age_ms:parseFloat(liveCfgEl('account_cache_max_age_ms').value),
     live_leverage_cache_seconds:parseFloat(liveCfgEl('leverage_cache_seconds').value),
@@ -4147,7 +4275,7 @@ function renderLive(data){
   fillLiveConfig(cfg);
   document.getElementById('liveStatus').textContent=cfg.live_enabled===true?(cfg.live_strategy_enabled===true?'已开启（真实策略运行中）':'已开启（策略开关关闭）'):'关闭（不会下真实单）';
   const executionStatus=document.getElementById('liveExecutionStatus');
-  if(executionStatus)executionStatus.textContent=`${cfg.live_execution_style||'fast'}：${(cfg.live_execution_steps||[]).map(x=>executionStepLabels[x]||x).join(' → ')}`;
+  if(executionStatus)executionStatus.textContent='缓存账户 → 杠杆准备 → 最新盘口复查 → 真实IOC → 模拟记录 → 后台刷新';
   const engine=data.realtime_strategy||{},engineEl=document.getElementById('liveRealtimeEngine');
   if(engineEl){
     const evalAge=engine.last_eval_ts?Math.max(0,Date.now()-Number(engine.last_eval_ts)*1000):null;
@@ -4205,7 +4333,7 @@ function renderLiveTrades(snapshot){
     const entryTime=fmtBeijingDateTime(row.entry_ts);
     const exitTime=row.status==='open'?'持仓中':fmtBeijingDateTime(row.exit_ts);
     const holdTime=fmtDuration(row.entry_ts,row.status==='open'?null:row.exit_ts);
-    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${liveActionText(row.action)}</td><td>${entryTime}</td><td>${exitTime}</td><td>${holdTime}</td><td>${fmt(corr,3)}</td><td>${fmt(beta,2)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td>${fmt(row.current_asset_15m_bps,1)} bps</td><td>${fmt(row.current_hedge_15m_bps,1)} bps</td><td>${fmt(spread,2)}</td><td>${fmt(fundingBps,3)} bps</td><td>${fmt(row.asset_notional_usdc,1)}U / ${fmt(row.hedge_notional_usdc,1)}U</td><td class="${Number(pnl)>=0?'scoreGood':'scoreBad'}">${row.status==='open'?'信号 ':''}${fmt(pnlBps,1)} bps / ${fmt(pnl,4)}U</td><td style="text-align:left">${row.close_reason||row.current_plan||row.note||''}</td>`;
+    tr.innerHTML=`<td>${row._status}</td><td>${row.asset} vs ${row.leader}</td><td>${liveActionText(row.action)}</td><td>${entryTime}</td><td>${exitTime}</td><td>${holdTime}</td><td>${fmt(corr,3)}</td><td>${fmt(beta,2)}</td><td>${fmt(row.entry_z,2)}</td><td>${fmt(zNow,2)}</td><td>${fmt(row.current_asset_15m_bps,1)} bps</td><td>${fmt(row.current_hedge_15m_bps,1)} bps</td><td>${fmt(spread,2)}</td><td>${fmt(fundingBps,3)} bps</td><td>${fmt(row.asset_notional_usdc,1)}U / ${fmt(row.hedge_notional_usdc,1)}U</td><td class="${Number(pnl)>=0?'scoreGood':'scoreBad'}">${row.status==='open'?'盘口估算 ':'实际成交 '}${fmt(pnlBps,1)} bps / ${fmt(pnl,4)}U</td><td style="text-align:left">${row.close_reason||row.current_plan||row.note||''}</td>`;
     tr.onclick=()=>showLiveTradeDetail(row);
     tb.appendChild(tr);
   });

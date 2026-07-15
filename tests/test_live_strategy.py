@@ -145,6 +145,29 @@ class LiveStrategySignalTests(unittest.TestCase):
         self.assertEqual(account["spot_available_usdc"], 50.0)
         self.assertLess(age_ms, 1000)
 
+    def test_price_model_can_lose_even_when_z_reverts(self):
+        trade = {
+            "asset": "ADA", "leader": "ETH", "action": "short_asset_long_hedge",
+            "entry_ts": 1000.0, "entry_z": 2.01, "beta": 0.5,
+            "notional_usdc": 30.0, "asset_notional_usdc": 20.0,
+            "hedge_notional_usdc": 10.0, "asset_entry_px": 10.0,
+            "hedge_entry_px": 100.0,
+        }
+        row = self.row(
+            asset="ADA", leader="ETH", zscore=-0.17,
+            asset_l2_bid=10.01, asset_l2_ask=10.02,
+            hedge_l2_bid=100.1, hedge_l2_ask=100.2,
+            funding_hourly=0,
+        )
+        details = monitor.paper_trade_pnl_details(
+            trade, row, {**self.config, "paper_fee_bps": 0}, now_ts=1001.0,
+        )
+        # Old Z math would report roughly +39bps here.  Executable two-leg
+        # prices correctly show a loss: short ADA -0.04U, long ETH +0.01U.
+        self.assertEqual(details["pnl_model"], "l2_executable")
+        self.assertAlmostEqual(details["pnl_usdc"], -0.03, places=6)
+        self.assertAlmostEqual(details["pnl_bps"], -10.0, places=6)
+
     def unified_state(self, db_path):
         config = {
             **self.config,
@@ -205,6 +228,48 @@ class LiveStrategySignalTests(unittest.TestCase):
             self.assertIsNotNone(closed)
             self.assertEqual(len(closed["paper"]["open"]), 0)
             self.assertEqual(closed["paper"]["closed"][0]["close_reason"], "偏离回归")
+
+    def test_unified_cycle_persists_executable_price_model(self):
+        class MutableBook:
+            def __init__(self):
+                self.prices = {"TEST": (10.0, 10.01), "ETH": (99.99, 100.0)}
+
+            def get_book(self, coin):
+                bid, ask = self.prices[coin]
+                return {
+                    "coin": coin, "bid": bid, "ask": ask, "mid": (bid + ask) / 2,
+                    "spread_bps": (ask / bid - 1) * 10_000, "age_ms": 10,
+                    "bid_size": 1000, "ask_size": 1000,
+                }
+
+            def snapshot(self, _coins=None):
+                return {"status": {"connected": True}, "books": []}
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db_path = Path(tmp) / "monitor.sqlite3"
+            monitor.init_alt_db(db_path)
+            state = self.unified_state(db_path)
+            state.config.update({
+                "live_use_l2book": True, "live_l2_max_age_ms": 3000,
+                "live_l2_max_spread_bps": 20, "live_max_entry_spread_bps": 20,
+                "paper_fee_bps": 4,
+            })
+            state.l2book = MutableBook()
+            opened = monitor.run_unified_strategy_cycle(
+                state, {"ts": 1000.0, "rows": [self.row()]}, 1,
+                skip_if_idle=True, source="ws_realtime",
+            )
+            self.assertEqual(opened["paper"]["open"][0]["pnl_model"], "l2_executable")
+
+            state.l2book.prices = {"TEST": (10.01, 10.02), "ETH": (100.1, 100.2)}
+            closed = monitor.run_unified_strategy_cycle(
+                state, {"ts": 1001.0, "rows": [self.row(zscore=0.2)]}, 1,
+                skip_if_idle=True, source="ws_realtime",
+            )
+            trade = closed["paper"]["closed"][0]
+            self.assertEqual(trade["pnl_model"], "l2_executable")
+            self.assertLess(trade["pnl_bps"], 0)
+            self.assertEqual(closed["paper"]["stats"]["trades"], 1)
 
 
 if __name__ == "__main__":
