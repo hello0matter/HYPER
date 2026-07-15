@@ -14,7 +14,7 @@ class LiveStrategySignalTests(unittest.TestCase):
             "live_use_realtime_z": False,
             "live_min_entry_z": 2.0,
             "live_min_corr": 0.65,
-            "live_max_entry_spread_bps": 5.0,
+            "live_l2_max_spread_bps": 5.0,
             "live_min_expected_edge_bps": 10.0,
             "paper_exit_z": 0.5,
             "paper_z_value_bps": 18.0,
@@ -126,15 +126,11 @@ class LiveStrategySignalTests(unittest.TestCase):
         self.assertIn("数据过旧", blocked)
         self.assertEqual(allowed, "")
 
-    def test_execution_pipeline_requires_safe_preflight_order(self):
-        fast = monitor.parse_live_execution_steps(
-            "cached_account,prepare_leverage,final_l2,submit_real,record_paper,refresh_account_async"
-        )
-        self.assertLess(fast.index("submit_real"), fast.index("record_paper"))
-        with self.assertRaises(ValueError):
-            monitor.parse_live_execution_steps(
-                ["submit_real", "final_l2", "record_paper"]
-            )
+    def test_execution_pipeline_is_fixed_and_safe(self):
+        steps = monitor.live_execution_steps({"live_execution_steps": ["submit_real"]})
+        self.assertEqual(steps, list(monitor.LIVE_EXECUTION_STEPS))
+        self.assertLess(steps.index("final_l2"), steps.index("submit_real"))
+        self.assertLess(steps.index("submit_real"), steps.index("record_paper"))
 
     def test_cached_account_is_read_without_network(self):
         state = SimpleNamespace(
@@ -251,7 +247,7 @@ class LiveStrategySignalTests(unittest.TestCase):
             state = self.unified_state(db_path)
             state.config.update({
                 "live_use_l2book": True, "live_l2_max_age_ms": 3000,
-                "live_l2_max_spread_bps": 20, "live_max_entry_spread_bps": 20,
+                "live_l2_max_spread_bps": 20,
                 "paper_fee_bps": 4,
             })
             state.l2book = MutableBook()

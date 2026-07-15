@@ -77,15 +77,10 @@ DEFAULT_ALT_LEADERS = "BTC, ETH"
 DEFAULT_ALT_ASSETS = "ALL"
 DEFAULT_PAPER_NOTIONAL = 1000.0
 LIVE_MIN_ORDER_USDC = 10.50
-LIVE_EXECUTION_STEP_IDS = (
-    "cached_account", "fresh_account", "prepare_leverage", "final_l2",
+LIVE_EXECUTION_STEPS = (
+    "cached_account", "prepare_leverage", "final_l2",
     "submit_real", "record_paper", "refresh_account_async",
 )
-LIVE_EXECUTION_PRESETS = {
-    "fast": ["cached_account", "prepare_leverage", "final_l2", "submit_real", "record_paper", "refresh_account_async"],
-    "balanced": ["cached_account", "prepare_leverage", "final_l2", "submit_real", "record_paper", "refresh_account_async"],
-    "strict": ["fresh_account", "prepare_leverage", "final_l2", "submit_real", "record_paper", "refresh_account_async"],
-}
 
 
 def base_asset(symbol):
@@ -601,12 +596,11 @@ def init_alt_db(path=ALT_DB_FILE):
                 closed_scan_id INTEGER,
                 plan TEXT,
                 mode TEXT NOT NULL DEFAULT 'legacy',
-                sync_live_trade_id INTEGER,
                 pnl_model TEXT
             )
         """)
         for column in (
-            "mode TEXT NOT NULL DEFAULT 'legacy'", "sync_live_trade_id INTEGER",
+            "mode TEXT NOT NULL DEFAULT 'legacy'",
             "asset_notional_usdc REAL", "hedge_notional_usdc REAL",
             "asset_entry_px REAL", "hedge_entry_px REAL", "pnl_model TEXT",
         ):
@@ -616,7 +610,6 @@ def init_alt_db(path=ALT_DB_FILE):
                 pass
         db.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status, trade_key)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_paper_trades_ts ON paper_trades(entry_ts, exit_ts)")
-        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_sync_live_id ON paper_trades(sync_live_trade_id) WHERE sync_live_trade_id IS NOT NULL")
         db.execute("""
             CREATE TABLE IF NOT EXISTS paper_equity (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -657,24 +650,6 @@ def init_alt_db(path=ALT_DB_FILE):
             except sqlite3.OperationalError:
                 pass
         db.execute("CREATE INDEX IF NOT EXISTS idx_live_account_snapshots_ts ON live_account_snapshots(ts)")
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS live_test_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts REAL NOT NULL,
-                asset TEXT NOT NULL,
-                leader TEXT NOT NULL,
-                action TEXT NOT NULL,
-                beta REAL NOT NULL,
-                asset_notional_usdc REAL NOT NULL,
-                hedge_notional_usdc REAL NOT NULL,
-                status TEXT NOT NULL,
-                entry_json TEXT,
-                exit_json TEXT,
-                gross_pnl_usdc REAL,
-                note TEXT
-            )
-        """)
-        db.execute("CREATE INDEX IF NOT EXISTS idx_live_test_runs_ts ON live_test_runs(ts DESC)")
         db.execute("""
             CREATE TABLE IF NOT EXISTS live_trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1169,14 +1144,6 @@ def paper_close_reason(trade, row, config, now_ts=None):
     return None, pnl
 
 
-def load_open_paper_trades(db_path=ALT_DB_FILE):
-    init_alt_db(db_path)
-    with sqlite3.connect(db_path) as db:
-        db.row_factory = sqlite3.Row
-        rows = db.execute("SELECT * FROM paper_trades WHERE status = 'open' ORDER BY entry_ts ASC").fetchall()
-    return [dict(row) for row in rows]
-
-
 def load_paper_snapshot(db_path=ALT_DB_FILE, limit=200, current_rows=None, config=None):
     init_alt_db(db_path)
     sync_live = bool((config or {}).get("paper_sync_live", True))
@@ -1295,14 +1262,6 @@ def live_direction_label(action):
     if action == "long_asset_short_hedge":
         return "真实做多小币 / 做空保护腿"
     return "真实观察"
-
-
-def live_trade_actual_pnl(trade, asset_exit_px, hedge_exit_px):
-    asset_buy = trade["action"] == "long_asset_short_hedge"
-    hedge_buy = not asset_buy
-    asset_pnl = (float(asset_exit_px) - float(trade["asset_entry_px"])) * float(trade["asset_size"]) * (1 if asset_buy else -1)
-    hedge_pnl = (float(hedge_exit_px) - float(trade["hedge_entry_px"])) * float(trade["hedge_size"]) * (1 if hedge_buy else -1)
-    return asset_pnl + hedge_pnl
 
 
 def _live_position_size_map(account):
@@ -1500,31 +1459,7 @@ def _live_apply_leverage(exchange, coins, leverage):
 def live_execution_steps(config):
     # Fixed, reviewed order.  The former browser step editor was too easy to
     # misunderstand and could move or remove safety checks.
-    return list(LIVE_EXECUTION_PRESETS["fast"])
-
-
-def parse_live_execution_steps(value):
-    if isinstance(value, str):
-        items = [item.strip() for item in value.split(",") if item.strip()]
-    elif isinstance(value, (list, tuple)):
-        items = [str(item).strip() for item in value if str(item).strip()]
-    else:
-        raise ValueError("真实执行步骤必须是列表或逗号分隔文本")
-    unknown = [item for item in items if item not in LIVE_EXECUTION_STEP_IDS]
-    if unknown:
-        raise ValueError("未知真实执行步骤：" + ", ".join(unknown))
-    deduped = list(dict.fromkeys(items))
-    for required in ("submit_real", "record_paper"):
-        if required not in deduped:
-            raise ValueError(f"真实执行步骤不能删除 {required}")
-    submit_index = deduped.index("submit_real")
-    preflight = {"cached_account", "fresh_account", "prepare_leverage", "final_l2"}
-    misplaced = [step for step in preflight if step in deduped and deduped.index(step) > submit_index]
-    if misplaced:
-        raise ValueError("这些下单前检查不能放到真实IOC之后：" + ", ".join(misplaced))
-    if "refresh_account_async" in deduped and deduped.index("refresh_account_async") < submit_index:
-        raise ValueError("下单后后台刷新账户必须放在真实IOC之后")
-    return deduped
+    return list(LIVE_EXECUTION_STEPS)
 
 
 def cached_live_account(state, *, max_age_ms=None):
@@ -1634,7 +1569,7 @@ def live_candidate_reject_reasons(row, config):
     spread = float(row.get("spread_bps")) if row.get("spread_bps") is not None else 999.0
     min_z = float(config.get("live_min_entry_z", 3.0) or 3.0)
     min_corr = float(config.get("live_min_corr", 0.75) or 0.75)
-    max_spread = float(config.get("live_max_entry_spread_bps", 2.5) or 2.5)
+    max_spread = float(config.get("live_l2_max_spread_bps", 2.5) or 2.5)
     min_edge = float(config.get("live_min_expected_edge_bps", 25.0) or 25.0)
     edge = live_expected_edge_bps(row, config)
     reasons = []
@@ -1826,7 +1761,7 @@ def live_l2book_reject_reason(state, row, asset_notional, hedge_notional, *, all
         return "", {}
     max_age_ms = float(config.get("live_l2_max_age_ms", 3000) or 3000)
     grace_ms = float(config.get("live_strategy_entry_grace_ms", 10_000) or 0)
-    max_spread_bps = float(config.get("live_l2_max_spread_bps", config.get("live_max_entry_spread_bps", 2.5)) or 2.5)
+    max_spread_bps = float(config.get("live_l2_max_spread_bps", 2.5) or 2.5)
     strategy_check = row.get("_strategy_l2_check") or {}
     checked_at = float(strategy_check.get("checked_at") or 0)
     checked_books = strategy_check.get("books") or {}
@@ -1864,7 +1799,6 @@ def live_l2book_reject_reason(state, row, asset_notional, hedge_notional, *, all
 def open_live_strategy_trade(state, row, scan_id):
     config = state.config
     steps = live_execution_steps(config)
-    style = "fixed_safe"
     account = None
     account_age_ms = None
     asset_notional = hedge_notional = None
@@ -1893,16 +1827,13 @@ def open_live_strategy_trade(state, row, scan_id):
             auto_min_notional=bool(config.get("live_auto_min_notional", False)),
         )
 
-    for step in steps:
+    for step in (item for item in steps if item != "record_paper"):
         step_started = time.perf_counter()
         if step == "cached_account":
             max_age = float(config.get("live_account_cache_max_age_ms", 15_000) or 15_000)
             account, account_age_ms = cached_live_account(state, max_age_ms=max_age)
             if not account:
                 raise RuntimeError(f"后台账户缓存不可用或过旧（约 {float(account_age_ms or 0):.0f}ms），极速流程不进行同步HTTP查询")
-        elif step == "fresh_account":
-            account = refresh_live_account_cache(state)
-            account_age_ms = 0.0
         elif step == "prepare_leverage":
             exchange = exchange or _live_sdk_exchange(config)
             leverage_result = live_prepare_leverage(
@@ -1983,12 +1914,12 @@ def open_live_strategy_trade(state, row, scan_id):
         "asset_entry_px": fills[row["asset"]]["price"], "hedge_entry_px": fills[row["leader"]]["price"],
         "entry_json": json.dumps({
             "response": response, "fills": fills, "leverage_result": leverage_result,
-            "l2_books": l2_books, "execution_style": style, "execution_steps": steps,
+            "l2_books": l2_books, "execution_steps": steps,
             "execution_timing": execution_timing, "account_cache_age_ms": account_age_ms,
         }, ensure_ascii=False),
         "opened_scan_id": scan_id,
         "note": (f"{row.get('plan', '')}；目标杠杆 {target_leverage}x；入场预期边际 "
-                 f"{live_expected_edge_bps(row, config):.1f}bps；执行风格 {style}；流程耗时 "
+                 f"{live_expected_edge_bps(row, config):.1f}bps；固定安全流程耗时 "
                  f"{sum(item['ms'] for item in execution_timing):.0f}ms"),
     }
     with sqlite3.connect(state.db_path) as db:
@@ -2205,7 +2136,7 @@ def update_live_trading(state, payload, scan_id):
         )
         return load_live_trades_snapshot(state.db_path, current_rows=rows, config=config)
     execution_steps = live_execution_steps(config)
-    if "cached_account" in execution_steps or "fresh_account" in execution_steps:
+    if "cached_account" in execution_steps:
         account, account_age_ms = cached_live_account(
             state, max_age_ms=float(config.get("live_account_cache_max_age_ms", 15_000) or 15_000),
         )
@@ -2773,12 +2704,11 @@ LIVE_CONFIG_FIELDS = {
     "live_auto_min_notional": {"env": "LIVE_AUTO_MIN_NOTIONAL", "type": "bool", "label": "低于交易所最低时自动补足"},
     "live_min_entry_z": {"env": "LIVE_MIN_ENTRY_Z", "type": "float", "min": 0, "max": 20, "label": "实盘最低入场 |Z|"},
     "live_min_corr": {"env": "LIVE_MIN_CORR", "type": "float", "min": -1, "max": 1, "label": "实盘最低相关性"},
-    "live_max_entry_spread_bps": {"env": "LIVE_MAX_ENTRY_SPREAD_BPS", "type": "float", "min": 0, "max": 100, "label": "实盘最大入场点差 bps"},
     "live_min_expected_edge_bps": {"env": "LIVE_MIN_EXPECTED_EDGE_BPS", "type": "float", "min": -1000, "max": 10000, "label": "实盘最低预期边际 bps"},
     "live_use_l2book": {"env": "LIVE_USE_L2BOOK", "type": "bool", "label": "真实开仓使用 l2Book 盘口校验"},
     "live_l2_max_age_ms": {"env": "LIVE_L2_MAX_AGE_MS", "type": "float", "min": 100, "max": 60_000, "label": "l2Book 最大延迟 ms"},
     "live_strategy_entry_grace_ms": {"env": "LIVE_STRATEGY_ENTRY_GRACE_MS", "type": "float", "min": 0, "max": 60_000, "label": "统一信号真实执行宽限 ms"},
-    "live_l2_max_spread_bps": {"env": "LIVE_L2_MAX_SPREAD_BPS", "type": "float", "min": 0, "max": 100, "label": "l2Book 最大点差 bps"},
+    "live_l2_max_spread_bps": {"env": "LIVE_L2_MAX_SPREAD_BPS", "type": "float", "min": 0, "max": 100, "label": "最大允许点差 bps"},
     "live_l2_subscribe_limit": {"env": "LIVE_L2_SUBSCRIBE_LIMIT", "type": "int", "min": 2, "max": 1000, "label": "WS订阅数量"},
     "live_use_realtime_z": {"env": "LIVE_USE_REALTIME_Z", "type": "bool", "label": "使用 l2Book 实时近似 Z"},
     "live_realtime_strategy_interval_ms": {"env": "LIVE_REALTIME_STRATEGY_INTERVAL_MS", "type": "float", "min": 100, "max": 10_000, "label": "WS策略判断间隔 ms"},
@@ -2893,19 +2823,13 @@ def coerce_live_config(raw):
             parsed = value.strip().lower() not in ("0", "false", "no", "off", "关闭") if isinstance(value, str) else bool(value)
         elif meta["type"] == "int":
             parsed = int(value)
-        elif meta["type"] == "choice":
-            parsed = str(value or "").strip()
-            if parsed not in meta["choices"]:
-                raise ValueError(f"{meta['label']} 无效")
-        elif meta["type"] == "steps":
-            parsed = parse_live_execution_steps(value)
         elif meta["type"] == "address":
             parsed = str(value or "").strip()
             if parsed and not valid_evm_address(parsed):
                 raise ValueError("主钱包公开地址格式不正确，应为 0x 开头的 42 位地址")
         else:
             parsed = float(value)
-        if meta["type"] not in ("bool", "address", "choice", "steps"):
+        if meta["type"] not in ("bool", "address"):
             if parsed < meta["min"] or parsed > meta["max"]:
                 raise ValueError(f"{meta['label']} 超出允许范围")
         updates[key] = parsed
@@ -3221,7 +3145,7 @@ tr:hover{background:#f8fafc}
 canvas{width:100%;height:220px;border:1px solid #e5e7eb;background:#fff;border-radius:6px;margin-bottom:8px;cursor:crosshair}
 button,input{font-size:13px;padding:6px 8px}button{cursor:pointer}
 .toolbar{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
-.mini{height:170px}.wideMetric{grid-column:span 2}.scoreGood{color:#16a34a}.scoreBad{color:#dc2626}.scoreMid{color:#b45309}
+.mini{height:170px}.scoreGood{color:#16a34a}.scoreBad{color:#dc2626}.scoreMid{color:#b45309}
 .subtle{font-size:12px;color:#64748b}.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0 10px}
 .topPanel{width:auto}
 .tableWrap{overflow:auto;max-height:76vh;border:1px solid #edf0f3;border-radius:6px}
@@ -3249,11 +3173,11 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 .helpBody{padding:14px 18px;max-height:72vh;overflow:auto;line-height:1.65;font-size:14px}.helpBody h3{margin:16px 0 6px}.helpBody p{margin:6px 0}.helpBody code{background:#f1f5f9;padding:2px 4px;border-radius:4px}
 .pill{display:inline-block;padding:2px 6px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px}
 .passChip{color:#15803d;font-weight:600}.blockChip{color:#b45309}.reasonCell{text-align:left;white-space:normal;min-width:260px}
-@media(max-width:1000px){main{grid-template-columns:1fr}th,td{font-size:12px;padding:6px 4px}}
+@media(max-width:1000px){th,td{font-size:12px;padding:6px 4px}}
 </style>
 </head>
 <body>
-<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openLiveDialog()">真实交易</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
+<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
 <main>
 <section class="topPanel">
 <h2>模拟盘 / 纸面交易</h2>
@@ -3266,7 +3190,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <div class="metric"><div class="muted">当前参数</div><div id="pConfig">-</div></div>
 </div>
 <div class="paperActions">
-<button onclick="openLiveDialog()">打开统一策略 / 真实执行设置</button>
+<button onclick="openLiveDialog()">打开策略 / 实盘设置</button>
 <span id="pSaveStatus" class="subtle">模拟与真实只使用这一套策略控件；真实专属执行项放在同一弹窗后半部分。</span>
 </div>
 <div class="subtle">模拟盘始终运行。新版模拟按两腿买一/卖一估算盈亏；历史 Z 折算记录保留查看，但不再计入新版胜率和累计收益。</div>
@@ -3318,16 +3242,10 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <p><code>cd /opt/hyperliquid-monitor &amp;&amp; .venv/bin/python hyperliquid_correlation_monitor.py --set-live-api-key</code></p>
     <p>替换时执行：<code>--change-live-api-key</code>，必须输入旧私钥。</p>
   </div>
-  <div class="settingBand">
-    <h3>页面说明</h3>
-    <p>交易页：只管真实下单参数、仓位和紧急平仓。</p>
-    <p>推送页：只管钉钉群、关键词、推送类型和冷却时间。</p>
-    <p>全局设置：只管管理口令、API 钱包说明和全局状态。</p>
-  </div>
 </div>
 </dialog>
 <dialog id="liveDlg" class="wideDialog">
-<div class="helpHead"><h2>真实交易面板</h2><button onclick="liveDlg.close()">关闭</button></div>
+<div class="helpHead"><h2>统一策略 / 真实交易</h2><button onclick="liveDlg.close()">关闭</button></div>
 <div class="helpBody">
   <div class="grid">
     <div class="metric"><div class="muted">真实下单状态</div><div id="liveStatus">读取中...</div></div>
@@ -3338,7 +3256,6 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">真实平均 / 最差</div><div id="liveAvgWorst">-</div></div>
     <div class="metric"><div class="muted">l2Book WS 盘口</div><div id="liveL2Status">-</div></div>
     <div class="metric"><div class="muted">本轮真实机会</div><div id="liveOpportunityStatus">-</div></div>
-    <div class="metric"><div class="muted">当前执行顺序</div><div id="liveExecutionStatus">-</div></div>
     <div class="metric"><div class="muted">WS实时策略引擎</div><div id="liveRealtimeEngine">-</div></div>
   </div>
   <p id="liveBlocker" class="scoreMid"></p>
@@ -3358,15 +3275,14 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
       <div class="paperForm">
         <label>开仓最低|Z|<input id="cfg_live_min_entry_z" type="number" min="0" max="20" step="0.1"></label>
         <label>开仓最低相关<input id="cfg_live_min_corr" type="number" min="-1" max="1" step="0.01"></label>
-        <label>开仓最大点差bps<input id="cfg_live_max_entry_spread_bps" type="number" min="0" max="100" step="0.1"></label>
         <label>最低预期边际bps<input id="cfg_live_min_expected_edge_bps" type="number" step="1"></label>
         <label>模拟手续费/额外滑点bps<input id="cfg_paper_fee_bps" type="number" step="0.1"></label>
-        <label>旧记录回退：每1Z折算bps<input id="cfg_paper_z_value_bps" type="number" step="0.1"></label>
+        <label>Z边际估算系数bps<input id="cfg_paper_z_value_bps" type="number" step="0.1"></label>
         <label>持仓最低相关<input id="cfg_paper_min_corr" type="number" step="0.01"></label>
         <label>l2Book盘口校验<select id="cfg_live_use_l2book"><option value="true">开启（推荐）</option><option value="false">关闭</option></select></label>
         <label>盘口最大年龄ms<input id="cfg_live_l2_max_age_ms" type="number" min="100" max="60000" step="100"></label>
         <label>已确认盘口宽限ms<input id="cfg_live_strategy_entry_grace_ms" type="number" min="0" max="60000" step="100"></label>
-        <label>盘口最大点差bps<input id="cfg_live_l2_max_spread_bps" type="number" min="0" max="100" step="0.1"></label>
+        <label>最大允许点差bps<input id="cfg_live_l2_max_spread_bps" type="number" min="0" max="100" step="0.1"></label>
         <label>WS订阅数量<input id="cfg_live_l2_subscribe_limit" type="number" min="2" max="1000" step="1"></label>
         <label>WS实时Z<select id="cfg_live_use_realtime_z"><option value="true">开启（推荐）</option><option value="false">关闭</option></select></label>
         <label>策略判断节流ms<input id="cfg_live_realtime_strategy_interval_ms" type="number" min="100" max="10000" step="100" title="有新盘口时，最多按这个间隔合并判断一次。500ms不是行情延迟。"></label>
@@ -3384,7 +3300,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
       <label>低于交易所最低<select id="cfg_live_auto_min_notional"><option value="false">跳过，不下单（默认）</option><option value="true">自动补到最低</option></select></label>
       <label>杠杆倍数<input id="cfg_live_leverage" type="number" min="1" max="50" step="1"></label>
     </div>
-    <div class="detailText"><b>固定执行步骤：</b>读取后台账户缓存 → 准备杠杆 → 复查最新盘口 → 发送真实 IOC → 保存模拟记录 → 后台刷新账户。这个顺序已经固定，不再提供容易误操作的专家编辑器。</div>
+    <div class="detailText"><b>固定执行步骤：</b>读取后台账户缓存 → 准备杠杆 → 复查最新盘口 → 发送真实 IOC → 保存模拟记录 → 后台刷新账户。顺序固定，不能编辑。</div>
     <details class="settingBand"><summary><b>高级真实执行（一般不用改）</b></summary>
       <div class="paperForm">
         <label>最大滑点bps<input id="cfg_live_max_slippage_bps" type="number" step="1"></label>
@@ -3395,6 +3311,10 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
       </div>
     </details>
   </div>
+  <h3>当前 / 历史真实交易</h3>
+  <div class="detailText">持仓显示“盘口估算”，已平仓显示真实成交毛盈亏。点击任意一行可查看两腿成交价和原始订单回执。</div>
+  <div class="paperTableWrap" style="max-height:440px"><table id="liveTradeTbl"><thead><tr><th>状态</th><th>币对</th><th>方向</th><th>开仓时间</th><th>平仓时间</th><th>持仓时长</th><th>相关</th><th>Beta</th><th>入场Z</th><th>当前/出场Z</th><th>小币15m</th><th>保护15m</th><th>点差</th><th>资金费/小时</th><th>名义金额</th><th>盈亏</th><th>原因</th></tr></thead><tbody></tbody></table></div>
+  <p id="liveStatsNote" class="subtle">真实统计只计算已平仓真实策略记录；真实盈亏按成交价粗算，未扣交易所手续费与资金费；最终以 Hyperliquid 官方记录为准。</p>
   <h3>为什么这一轮没有交易</h3>
   <div id="liveDiagnosticSummary" class="detailText">读取服务器当前过滤结果中...</div>
   <div class="paperTableWrap" style="max-height:360px"><table id="liveDiagnosticTbl"><thead><tr><th>结果</th><th>币对</th><th>WS Z</th><th>K线Z</th><th>相关</th><th>点差</th><th>预期边际</th><th>方向</th><th>具体原因</th></tr></thead><tbody></tbody></table></div>
@@ -3404,8 +3324,6 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <span id="liveAutoRefreshStatus" class="subtle">盘口每 1 秒刷新；账户/交易每 15 秒刷新。</span>
   </div>
   <div class="paperTableWrap"><table id="liveL2Tbl"><thead><tr><th>币种</th><th>买一 bid</th><th>卖一 ask</th><th>点差</th><th>买一深度</th><th>卖一深度</th><th>数据年龄</th></tr></thead><tbody></tbody></table></div>
-  <h3>真实策略持仓（使用模拟盘同款逻辑）</h3>
-  <div class="detailText">真实策略开关开启后，服务器每轮扫描当前候选，按模拟盘规则真实开双腿仓；满足偏离回归、固定止盈、止损、最长持仓、相关性恶化或点差恶化时自动 reduce-only 平仓。Hyperliquid 官方每条腿最低订单价值约 10U；默认低于最低值会跳过，不发真实订单。只有你打开“自动补到最低”时，软件才会把小币腿抬到让两条腿都满足最低订单。</div>
   <h3>真实交易走势</h3>
   <div id="liveChartSummary" class="detailText">读取真实交易记录后显示。</div>
   <div class="detailCharts">
@@ -3417,8 +3335,6 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <h3>紧急风控</h3>
     <div class="paperActions"><input id="emergencyConfirm" placeholder="输入 CLOSE"><button class="dangerBtn" onclick="runEmergencyClose()">紧急全部平仓</button><span id="emergencyStatus" class="subtle">只发送 reduce-only 平仓单，不会主动开反向仓。</span></div>
   </div>
-  <div class="paperTableWrap"><table id="liveTradeTbl"><thead><tr><th>状态</th><th>币对</th><th>方向</th><th>开仓时间</th><th>平仓时间</th><th>持仓时长</th><th>相关</th><th>Beta</th><th>入场Z</th><th>当前/出场Z</th><th>小币15m</th><th>保护15m</th><th>点差</th><th>资金费/小时</th><th>名义金额</th><th>盈亏</th><th>原因</th></tr></thead><tbody></tbody></table></div>
-  <p id="liveStatsNote" class="subtle">真实统计只计算已平仓真实策略记录；真实盈亏按成交价粗算，未扣交易所手续费与资金费；最终以 Hyperliquid 官方记录为准。点击行查看原始成交回执。</p>
   <h3>真实账户仓位（只读快照）</h3>
   <div class="tableWrap"><table id="livePosTbl"><thead><tr><th>合约</th><th>方向/数量</th><th>开仓价</th><th>仓位价值</th><th>未实现盈亏</th><th>杠杆</th><th>强平价</th></tr></thead><tbody></tbody></table></div>
   <p class="subtle">真实下单总开关即使开启，也只允许策略使用服务器已加密保存的唯一 API 钱包。API 钱包状态在“全局设置”查看。</p>
@@ -3516,7 +3432,6 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>真实平均 / 最差</code>：平均每笔 bps 和历史最差单笔。平均长期为正比单看胜率更重要。</p>
 <p><code>l2Book WS盘口</code>：WebSocket 是否连接、订阅了多少币、最新消息年龄。</p>
 <p><code>本轮真实机会</code>：目前有多少组合通过基础过滤；通过后仍要检查账户、最低金额、盘口深度和杠杆。</p>
-<p><code>当前执行顺序</code>：固定安全流程，只用于查看，不能再编辑。</p>
 <p><code>WS实时策略引擎</code>：实时判断是否在运行、多久判断一次、最近是否报错。</p>
 
 <h3>为什么杠杆 5x 不会让它更容易赚钱</h3>
@@ -3536,13 +3451,13 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>杠杆失败处理</code>：有些小币不支持设置的杠杆。默认“跳过”更安全，避免你以为是 5x，实际交易所没接受。</p>
 <p><code>开仓最低|Z|</code>：偏离至少多极端才允许开仓。越高交易越少。</p>
 <p><code>开仓最低相关</code>：小币和保护腿过去的联动至少多稳定。</p>
-<p><code>开仓最大点差</code>：任意一腿盘口买卖差太大就不做。</p>
+<p><code>最大允许点差</code>：小币腿或保护腿任意一边的实时买卖差超过它就不做。之前重复的“开仓最大点差”和“盘口最大点差”已经合并。</p>
 <p><code>最低预期边际</code>：仍是基于 Z 的入场过滤分数，只负责筛选，不再拿来计算新版模拟盈亏。</p>
 <p><code>回归平仓Z</code>：例如 0.5，表示 |Z| 回到 0.5 以内就退出。注意：Z 回归时价格组合仍可能亏，所以退出原因和盈亏是两件事。</p>
 <p><code>固定止盈/止损bps</code>：新版按两腿盘口价格收益判断；不是按 Z 变化判断。</p>
 <p><code>最长持仓分钟</code>：超过时间无论盈亏都退出，避免关系长期不回归。</p>
 <p><code>模拟手续费/额外滑点bps</code>：买一卖一已经包含盘口点差；这里再扣交易手续费和额外成交误差。设置太低仍会使模拟偏乐观。</p>
-<p><code>旧记录回退：每1Z折算bps</code>：只用于没有保存入场盘口的历史旧记录。新版盘口模型不使用它，旧记录也不计入新版胜率。</p>
+<p><code>Z边际估算系数bps</code>：把 Z 到回归线的空间粗略换算成“预期边际”，只用于开仓过滤；也用于没有保存盘口的历史旧记录。新版模拟实际盈亏不使用它。</p>
 <p><code>持仓最低相关</code>：持仓后相关性明显破坏时提前退出。</p>
 <p><code>l2Book盘口校验</code>：开仓前检查实时买一/卖一、点差、数据年龄、盘口深度。不合格就跳过真实下单。</p>
 <p><code>l2Book最大延迟ms</code>：盘口数据允许多旧。3000ms 表示超过 3 秒没更新就不拿来开仓。</p>
@@ -3684,14 +3599,14 @@ async function selectRow(row, showDetail=false){
 }
 function showRowDetail(row, stats={}, seriesRows=[], candleRows=[]){
   document.getElementById('detailTitle').textContent=`${row.asset} vs ${row.leader} 完整详情`;
-  const notional=Number(document.getElementById('cfg_paper_notional_usdc')?.value||1000);
+  const notional=Number(document.getElementById('cfg_live_notional_usdc')?.value||10.5);
   const hedge=Math.abs(Number(row.beta||0))*notional;
   const fundingBps=(Number(row.funding_hourly)||0)*10000;
   const html=`
     <div class="detailGrid">
       <div class="detailBox"><div class="muted">状态</div><div class="${row.tag}">${tagText(row.tag)}</div></div>
       <div class="detailBox"><div class="muted">方向</div><div>${dirText(row.action)}</div></div>
-      <div class="detailBox"><div class="muted">模拟仓位</div><div>小币 ${fmt(notional,0)}U / 保护腿约 ${fmt(hedge,0)}U</div></div>
+      <div class="detailBox"><div class="muted">目标双腿粗算</div><div>小币 ${fmt(notional,2)}U / 保护腿约 ${fmt(hedge,2)}U</div></div>
       <div class="detailBox"><div class="muted">WS实时Z / K线Z</div><div>${row.realtime?fmt(row.zscore,2):'-'} / ${fmt(row.kline_zscore??row.zscore,2)}</div></div>
       <div class="detailBox"><div class="muted">相关性 corr</div><div>${fmt(row.corr,3)}</div></div>
       <div class="detailBox"><div class="muted">Beta</div><div>${fmt(row.beta,2)}</div></div>
@@ -4001,14 +3916,13 @@ function drawPaperEquity(rows, reset=false){
     {label:'未实现U', color:'#f97316', value:r=>r.unrealized_usdc, digits:2}
   ], {marks:[0], footer:`模拟利润曲线：${(rows||[]).length} 点`, reset});
 }
-const paperConfigKeys=['paper_enabled','paper_sync_live','paper_notional_usdc','paper_exit_z','paper_take_profit_bps','paper_stop_bps','paper_max_hold_minutes','paper_max_open','paper_fee_bps','paper_z_value_bps','paper_min_corr'];
+const paperConfigKeys=['paper_exit_z','paper_take_profit_bps','paper_stop_bps','paper_max_hold_minutes','paper_fee_bps','paper_z_value_bps','paper_min_corr'];
 function cfgEl(key){return document.getElementById('cfg_'+key)}
 function fillPaperConfig(cfg, force=true){
   paperConfigKeys.forEach(key=>{
     const el=cfgEl(key); if(!el || cfg[key]===undefined) return;
     if(!force && document.activeElement===el) return;
-    if(['paper_enabled','paper_sync_live'].includes(key)) el.value=cfg[key]===false?'false':'true';
-    else el.value=cfg[key];
+    el.value=cfg[key];
   });
 }
 async function loadPaperConfig(){
@@ -4026,8 +3940,7 @@ function readPaperConfigForm(){
   const cfg={};
   paperConfigKeys.forEach(key=>{
     const el=cfgEl(key); if(!el) return;
-    if(['paper_enabled','paper_sync_live'].includes(key)) cfg[key]=el.value==='true';
-    else if(['paper_max_hold_minutes','paper_max_open'].includes(key)) cfg[key]=parseInt(el.value,10);
+    if(key==='paper_max_hold_minutes') cfg[key]=parseInt(el.value,10);
     else cfg[key]=parseFloat(el.value);
   });
   return cfg;
@@ -4056,32 +3969,12 @@ async function openGlobalDialog(){
     document.getElementById('globalApiStatus').textContent='读取失败：'+e.message;
   }
 }
-async function savePaperConfig(){
-  const token=adminTokenValue();
-  if(!token){document.getElementById('pSaveStatus').textContent='请先在“全局设置”填写管理口令';return}
-  if(token) localStorage.setItem('hlm_admin_token', token);
-  document.getElementById('pSaveStatus').textContent='正在保存...';
-  try{
-    const r=await fetch('paper_config',{
-      method:'POST',
-      headers:{'Content-Type':'application/json','X-Admin-Token':token},
-      body:JSON.stringify({config:readPaperConfigForm()})
-    });
-    const data=await r.json();
-    if(!data.ok){document.getElementById('pSaveStatus').textContent=data.error||'保存失败';return}
-    fillPaperConfig(data.config||{}, true);
-    document.getElementById('pSaveStatus').textContent='已保存，下一轮扫描立即按新参数运行';
-    loadPaper();
-  }catch(e){
-    document.getElementById('pSaveStatus').textContent='保存失败：'+e;
-  }
-}
-const liveConfigKeys=['live_enabled','live_account_poll_seconds','live_account_cache_max_age_ms','live_leverage_cache_seconds','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_max_entry_spread_bps','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_strategy_entry_grace_ms','live_l2_max_spread_bps','live_l2_subscribe_limit','live_use_realtime_z','live_realtime_strategy_interval_ms','live_strategy_enabled'];
+const liveConfigKeys=['live_enabled','live_account_poll_seconds','live_account_cache_max_age_ms','live_leverage_cache_seconds','live_account_address','live_notional_usdc','live_auto_min_notional','live_max_open','live_max_slippage_bps','live_leverage','live_require_leverage_ok','live_min_entry_z','live_min_corr','live_min_expected_edge_bps','live_use_l2book','live_l2_max_age_ms','live_strategy_entry_grace_ms','live_l2_max_spread_bps','live_l2_subscribe_limit','live_use_realtime_z','live_realtime_strategy_interval_ms','live_strategy_enabled'];
 function liveCfgEl(key){return document.getElementById('cfg_'+key)}
 const liveRiskPresets={
-  conservative:{live_min_entry_z:3.0,live_min_corr:0.75,live_max_entry_spread_bps:2.5,live_min_expected_edge_bps:25,live_l2_max_spread_bps:2.5},
-  balanced:{live_min_entry_z:2.5,live_min_corr:0.70,live_max_entry_spread_bps:3.5,live_min_expected_edge_bps:18,live_l2_max_spread_bps:3.5},
-  aggressive:{live_min_entry_z:2.0,live_min_corr:0.65,live_max_entry_spread_bps:5.0,live_min_expected_edge_bps:10,live_l2_max_spread_bps:5.0}
+  conservative:{live_min_entry_z:3.0,live_min_corr:0.75,live_min_expected_edge_bps:25,live_l2_max_spread_bps:2.5},
+  balanced:{live_min_entry_z:2.5,live_min_corr:0.70,live_min_expected_edge_bps:18,live_l2_max_spread_bps:3.5},
+  aggressive:{live_min_entry_z:2.0,live_min_corr:0.65,live_min_expected_edge_bps:10,live_l2_max_spread_bps:5.0}
 };
 function sameLivePreset(cfg,preset){
   return Object.entries(preset).every(([k,v])=>Math.abs(Number(cfg[k])-Number(v))<1e-9);
@@ -4128,7 +4021,6 @@ function readLiveConfig(){
     live_require_leverage_ok:liveCfgEl('live_require_leverage_ok').value==='true',
     live_min_entry_z:parseFloat(liveCfgEl('live_min_entry_z').value),
     live_min_corr:parseFloat(liveCfgEl('live_min_corr').value),
-    live_max_entry_spread_bps:parseFloat(liveCfgEl('live_max_entry_spread_bps').value),
     live_min_expected_edge_bps:parseFloat(liveCfgEl('live_min_expected_edge_bps').value),
     live_use_l2book:liveCfgEl('live_use_l2book').value==='true',
     live_l2_max_age_ms:parseFloat(liveCfgEl('live_l2_max_age_ms').value),
@@ -4274,8 +4166,6 @@ function renderLive(data){
   const isUnified=account.account_mode==='unifiedAccount';
   fillLiveConfig(cfg);
   document.getElementById('liveStatus').textContent=cfg.live_enabled===true?(cfg.live_strategy_enabled===true?'已开启（真实策略运行中）':'已开启（策略开关关闭）'):'关闭（不会下真实单）';
-  const executionStatus=document.getElementById('liveExecutionStatus');
-  if(executionStatus)executionStatus.textContent='缓存账户 → 杠杆准备 → 最新盘口复查 → 真实IOC → 模拟记录 → 后台刷新';
   const engine=data.realtime_strategy||{},engineEl=document.getElementById('liveRealtimeEngine');
   if(engineEl){
     const evalAge=engine.last_eval_ts?Math.max(0,Date.now()-Number(engine.last_eval_ts)*1000):null;
@@ -4506,63 +4396,11 @@ async function changeAdminToken(){
 }
 const savedToken=localStorage.getItem('hlm_admin_token');
 if(savedToken && document.getElementById('globalAdminToken')) document.getElementById('globalAdminToken').value=savedToken;
-['live_min_entry_z','live_min_corr','live_max_entry_spread_bps','live_min_expected_edge_bps','live_l2_max_spread_bps'].forEach(key=>{
+['live_min_entry_z','live_min_corr','live_min_expected_edge_bps','live_l2_max_spread_bps'].forEach(key=>{
   const el=liveCfgEl(key);
   if(el)el.addEventListener('input', markLiveRiskCustom);
 });
 loadPaperConfig();
-/*
-function drawZSeriesOld(rows){
-  const c=document.getElementById('zChart'),ctx=c.getContext('2d'),w=c.width,h=c.height;
-  ctx.clearRect(0,0,w,h); ctx.fillStyle='#fff'; ctx.fillRect(0,0,w,h);
-  const padL=44,padR=12,padT=18,padB=30;
-  const vals=rows.map(r=>Number(r.zscore)).filter(v=>!isNaN(v));
-  const max=Math.max(3, ...vals.map(v=>Math.abs(v))); const min=-max;
-  function x(i){return padL+(w-padL-padR)*(rows.length<=1?0:i/(rows.length-1))}
-  function y(v){return padT+(h-padT-padB)*(1-(v-min)/(max-min))}
-  drawAxes(ctx,w,h,padL,padR,padT,padB,[-2,0,2].map(v=>({y:y(v),label:String(v)})));
-  if(rows.length){
-    ctx.strokeStyle='#7c3aed'; ctx.lineWidth=2; ctx.beginPath();
-    rows.forEach((r,i)=>{const xx=x(i),yy=y(Number(r.zscore)); if(i===0)ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy)});
-    ctx.stroke();
-  }
-  ctx.fillStyle='#334155'; ctx.fillText(`Z 偏离：${rows.length} 个采样点`, w-150, h-10);
-}
-function drawQuality(rows){
-  const c=document.getElementById('qualityChart'),ctx=c.getContext('2d'),w=c.width,h=c.height;
-  ctx.clearRect(0,0,w,h); ctx.fillStyle='#fff'; ctx.fillRect(0,0,w,h);
-  const padL=44,padR=12,padT=16,padB=26;
-  function x(i){return padL+(w-padL-padR)*(rows.length<=1?0:i/(rows.length-1))}
-  function yCorr(v){return padT+(h-padT-padB)*(1-(Number(v)||0))}
-  function ySpread(v){return padT+(h-padT-padB)*(1-Math.min(Number(v)||0,20)/20)}
-  drawAxes(ctx,w,h,padL,padR,padT,padB,[{y:yCorr(1),label:'1.0'},{y:yCorr(.5),label:'0.5'},{y:yCorr(0),label:'0'}]);
-  if(rows.length){
-    ctx.strokeStyle='#2563eb'; ctx.lineWidth=2; ctx.beginPath();
-    rows.forEach((r,i)=>{const xx=x(i),yy=yCorr(r.corr); if(i===0)ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy)}); ctx.stroke();
-    ctx.strokeStyle='#ea580c'; ctx.lineWidth=1.5; ctx.beginPath();
-    rows.forEach((r,i)=>{const xx=x(i),yy=ySpread(r.spread_bps); if(i===0)ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy)}); ctx.stroke();
-  }
-  ctx.fillStyle='#2563eb'; ctx.fillText('蓝=相关性', w-170, h-10);
-  ctx.fillStyle='#ea580c'; ctx.fillText('橙=点差(越低越好)', w-100, h-10);
-}
-function drawPrice(rows){
-  const c=document.getElementById('priceChart'),ctx=c.getContext('2d'),w=c.width,h=c.height;
-  ctx.clearRect(0,0,w,h); ctx.fillStyle='#fff'; ctx.fillRect(0,0,w,h);
-  const padL=44,padR=12,padT=18,padB=30;
-  const vals=rows.flatMap(r=>[Number(r.asset_norm),Number(r.leader_norm)]).filter(v=>!isNaN(v));
-  if(!vals.length){ctx.fillStyle='#64748b';ctx.fillText('暂无K线数据',20,40);return}
-  let min=Math.min(...vals),max=Math.max(...vals); const p=Math.max((max-min)*.15,.02); min-=p; max+=p;
-  function x(i){return padL+(w-padL-padR)*(rows.length<=1?0:i/(rows.length-1))}
-  function y(v){return padT+(h-padT-padB)*(1-(v-min)/(max-min))}
-  drawAxes(ctx,w,h,padL,padR,padT,padB,[{y:y(max),label:fmt(max,2)},{y:y(100),label:'100'},{y:y(min),label:fmt(min,2)}]);
-  ctx.strokeStyle='#16a34a'; ctx.lineWidth=2; ctx.beginPath();
-  rows.forEach((r,i)=>{const xx=x(i),yy=y(r.asset_norm); if(i===0)ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy)}); ctx.stroke();
-  ctx.strokeStyle='#0f172a'; ctx.lineWidth=2; ctx.beginPath();
-  rows.forEach((r,i)=>{const xx=x(i),yy=y(r.leader_norm); if(i===0)ctx.moveTo(xx,yy); else ctx.lineTo(xx,yy)}); ctx.stroke();
-  ctx.fillStyle='#16a34a'; ctx.fillText('绿=小币', w-150, h-10);
-  ctx.fillStyle='#0f172a'; ctx.fillText('黑=保护腿', w-85, h-10);
-}
-*/
 loadLatest(); setInterval(loadLatest,60000);
 setInterval(()=>{if(liveDlg.open) refreshLiveL2Only();},1000);
 setInterval(()=>{if(liveDlg.open) loadLive(true);},15000);
@@ -6115,7 +5953,6 @@ beta：
             threshold = max(int(self.monitor.config["alert_bps"]), costs)
             alert = abs(latest["spread_bps"]) >= threshold
             lag = "—" if latest["server_lag_ms"] is None else f"{latest['server_lag_ms']:.0f} ms"
-            remaining = max(0, 9 - metrics["n"])
             observation_minutes = metrics["duration"] / 60
             min_minutes = self.monitor.config["min_observation_minutes"]
             gap_usd = latest["dex"] - latest["ref"]
@@ -6189,7 +6026,7 @@ beta：
         """不依赖第三方库，用 Canvas 画两条归一化价格曲线和价差曲线。"""
         canvas = self.chart
         canvas.delete("all")
-        width, height = max(canvas.winfo_width(), 800), 300
+        width = max(canvas.winfo_width(), 800)
         left, right = 68, width - 18
         top1, bottom1, top2, bottom2 = 28, 158, 198, 278
         canvas.create_text(left, 12, text="走势：蓝线=市场价，橙线=参考价；两线接近属于正常", anchor="w", fill="#333333", font=("Microsoft YaHei UI", 10))
@@ -6290,10 +6127,6 @@ def build_server_config(args):
         "paper_z_value_bps": env_float("PAPER_Z_VALUE_BPS", float(args.paper_z_value_bps)),
         "paper_min_corr": env_float("PAPER_MIN_CORR", float(args.paper_min_corr)),
         "live_enabled": env_bool("LIVE_ENABLED", False),
-        "live_execution_style": env_text("LIVE_EXECUTION_STYLE", "fast"),
-        "live_execution_steps": parse_live_execution_steps(env_text(
-            "LIVE_EXECUTION_STEPS", ",".join(LIVE_EXECUTION_PRESETS["fast"]),
-        )),
         "live_account_poll_seconds": env_float("LIVE_ACCOUNT_POLL_SECONDS", 3.0),
         "live_account_cache_max_age_ms": env_float("LIVE_ACCOUNT_CACHE_MAX_AGE_MS", 60_000.0),
         "live_leverage_cache_seconds": env_float("LIVE_LEVERAGE_CACHE_SECONDS", 86_400.0),
@@ -6305,12 +6138,13 @@ def build_server_config(args):
         "live_auto_min_notional": env_bool("LIVE_AUTO_MIN_NOTIONAL", False),
         "live_min_entry_z": env_float("LIVE_MIN_ENTRY_Z", 3.0),
         "live_min_corr": env_float("LIVE_MIN_CORR", 0.75),
-        "live_max_entry_spread_bps": env_float("LIVE_MAX_ENTRY_SPREAD_BPS", 2.5),
         "live_min_expected_edge_bps": env_float("LIVE_MIN_EXPECTED_EDGE_BPS", 25.0),
         "live_use_l2book": env_bool("LIVE_USE_L2BOOK", True),
         "live_l2_max_age_ms": env_float("LIVE_L2_MAX_AGE_MS", 3000.0),
         "live_strategy_entry_grace_ms": env_float("LIVE_STRATEGY_ENTRY_GRACE_MS", 10_000.0),
-        "live_l2_max_spread_bps": env_float("LIVE_L2_MAX_SPREAD_BPS", 2.5),
+        "live_l2_max_spread_bps": env_float(
+            "LIVE_L2_MAX_SPREAD_BPS", env_float("LIVE_MAX_ENTRY_SPREAD_BPS", 2.5),
+        ),
         "live_l2_subscribe_limit": env_int("LIVE_L2_SUBSCRIBE_LIMIT", 80),
         "live_use_realtime_z": env_bool("LIVE_USE_REALTIME_Z", True),
         "live_realtime_strategy_interval_ms": env_float("LIVE_REALTIME_STRATEGY_INTERVAL_MS", 500.0),
