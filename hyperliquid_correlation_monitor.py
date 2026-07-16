@@ -1998,6 +1998,10 @@ def l2book_subscription_coins(rows, open_trades=None, leaders=None):
     return {coin for coin in coins if coin}
 
 
+def configured_ws_leaders(config):
+    return set(config.get("leaders", [])) | set(split_symbols(str(config.get("leadlag_leaders") or ""))) | {"BTC", "ETH"}
+
+
 def live_l2book_reject_reason(state, row, asset_notional, hedge_notional, *, allow_strategy_grace=False):
     config = state.config
     if not config.get("live_use_l2book", True):
@@ -2862,14 +2866,15 @@ def leadlag_pair_state(row, l2book, config):
     needed = ("ret_1s_bps", "ret_3s_bps", "ret_15s_bps")
     if any(asset_motion.get(key) is None or leader_motion.get(key) is None for key in needed):
         return {**base, "reason": "正在积累至少 15 秒盘口历史"}
-    if max(float(asset_motion.get("age_ms") or 0), float(leader_motion.get("age_ms") or 0)) > 3000:
+    max_age_ms = float(config.get("leadlag_max_data_age_ms", 10_000) or 10_000)
+    if max(float(asset_motion.get("age_ms") or 0), float(leader_motion.get("age_ms") or 0)) > max_age_ms:
         return {**base, "reason": "盘口数据过旧"}
     l1, l3, l15 = (float(leader_motion[key]) for key in needed)
     a1, a3, a15 = (float(asset_motion[key]) for key in needed)
     beta = max(0.25, min(3.0, base["beta"]))
     candidates = []
-    threshold_3s = float(config.get("leadlag_leader_3s_bps", 12) or 12)
-    threshold_15s = float(config.get("leadlag_leader_15s_bps", 25) or 25)
+    threshold_3s = float(config.get("leadlag_leader_3s_bps", 2) or 2)
+    threshold_15s = float(config.get("leadlag_leader_15s_bps", 4) or 4)
     if abs(l3) >= threshold_3s:
         direction = 1 if l3 > 0 else -1
         if direction * l1 >= 0:
@@ -2905,18 +2910,18 @@ def leadlag_pair_state(row, l2book, config):
         "entry_px": float((asset_motion.get("ask") if direction > 0 else asset_motion.get("bid")) or 0),
     }
     checks = [
-        (base["corr"] >= float(config.get("leadlag_min_corr", 0.75) or 0.75),
+        (base["corr"] >= float(config.get("leadlag_min_corr", 0.60) or 0.60),
          f"相关 {base['corr']:.3f} 低于门槛"),
-        (lag_bps >= float(config.get("leadlag_min_lag_bps", 15) or 15),
+        (lag_bps >= float(config.get("leadlag_min_lag_bps", 6) or 6),
          f"跟随缺口 {lag_bps:.1f}bps 不足"),
         (direction * a1 >= 0, "小币 1 秒盘口尚未同向确认"),
-        (direction * imbalance >= float(config.get("leadlag_min_imbalance", 0.05) or 0),
+        (direction * imbalance >= float(config.get("leadlag_min_imbalance", -1.0)),
          f"盘口倾斜 {imbalance:+.2f} 未同向确认"),
-        (spread <= float(config.get("leadlag_max_spread_bps", 1.5) or 1.5),
+        (spread <= float(config.get("leadlag_max_spread_bps", 2.5) or 2.5),
          f"点差 {spread:.2f}bps 过大"),
-        (depth_multiple >= float(config.get("leadlag_min_depth_multiple", 5) or 0),
+        (depth_multiple >= float(config.get("leadlag_min_depth_multiple", 2) or 0),
          f"同向顶层深度只有目标金额 {depth_multiple:.1f} 倍"),
-        (expected_edge >= float(config.get("leadlag_min_edge_bps", 18) or 18),
+        (expected_edge >= float(config.get("leadlag_min_edge_bps", 6) or 6),
          f"扣费预期空间 {expected_edge:.1f}bps 不足"),
         (out["entry_px"] > 0, "没有可执行入场价"),
     ]
@@ -2953,18 +2958,18 @@ def leadlag_close_reason(trade, metrics, leader_motion, config, now_ts=None):
     now_ts = float(now_ts or time.time())
     net_bps = float(metrics["net_bps"])
     max_net = max(float(trade.get("max_net_bps") or 0), net_bps)
-    if net_bps >= float(config.get("leadlag_take_profit_bps", 30) or 30):
+    if net_bps >= float(config.get("leadlag_take_profit_bps", 18) or 18):
         return "达到单腿止盈"
-    if net_bps <= -abs(float(config.get("leadlag_stop_bps", 18) or 18)):
+    if net_bps <= -abs(float(config.get("leadlag_stop_bps", 14) or 14)):
         return "触发单腿止损"
-    trail_start = float(config.get("leadlag_trail_start_bps", 15) or 0)
-    trail_gap = float(config.get("leadlag_trail_gap_bps", 10) or 10)
+    trail_start = float(config.get("leadlag_trail_start_bps", 8) or 0)
+    trail_gap = float(config.get("leadlag_trail_gap_bps", 6) or 6)
     if trail_start > 0 and max_net >= trail_start and net_bps <= max_net - trail_gap:
         return "移动止盈回撤"
     direction = 1 if trade.get("side") == "long" else -1
     if leader_motion and leader_motion.get("ret_1s_bps") is not None and direction * float(leader_motion["ret_1s_bps"]) <= -5:
         return "龙头短线反向"
-    if now_ts - float(trade.get("entry_ts") or now_ts) >= float(config.get("leadlag_max_hold_minutes", 10) or 10) * 60:
+    if now_ts - float(trade.get("entry_ts") or now_ts) >= float(config.get("leadlag_max_hold_minutes", 8) or 8) * 60:
         return "超过最长持仓"
     return None
 
@@ -3007,8 +3012,32 @@ def update_leadlag_strategy(state, rows, now_ts=None):
     now_ts = float(now_ts or time.time())
     config = state.config
     init_alt_db(state.db_path)
-    row_by_pair = {paper_pair_key(row): row for row in rows}
-    signals = [leadlag_pair_state(row, state.l2book, config) for row in rows]
+    row_by_asset = {str(row.get("asset") or "").upper(): row for row in rows}
+    leader_coins = split_symbols(str(config.get("leadlag_leaders") or "BTC,ETH,SOL,HYPE,DOGE,BNB"))
+    signals = []
+    for row in rows:
+        asset = str(row.get("asset") or "").upper()
+        alternatives = []
+        for leader in leader_coins:
+            if not asset or leader == asset:
+                continue
+            relationship = (state.l2book.recent_relationship(asset, leader)
+                            if hasattr(state.l2book, "recent_relationship") else None)
+            if relationship:
+                virtual_row = {**row, "leader": leader, "corr": relationship["corr"], "beta": relationship["beta"]}
+            elif leader == str(row.get("leader") or "").upper():
+                virtual_row = row
+            else:
+                continue
+            signal = leadlag_pair_state(virtual_row, state.l2book, config)
+            signal["relationship_samples"] = (relationship or {}).get("samples")
+            alternatives.append(signal)
+        if alternatives:
+            alternatives.sort(key=lambda item: (
+                bool(item.get("eligible")), float(item.get("expected_edge_bps") or -999999),
+                max(abs(float(item.get("leader_3s_bps") or 0)), abs(float(item.get("leader_15s_bps") or 0))),
+            ), reverse=True)
+            signals.append(alternatives[0])
     signals.sort(key=lambda item: float(item.get("expected_edge_bps") or -999999), reverse=True)
     opened_now, closed_now = [], []
     with state.leadlag_lock:
@@ -3018,7 +3047,7 @@ def update_leadlag_strategy(state, rows, now_ts=None):
                 "SELECT * FROM leadlag_trades WHERE status='open' ORDER BY entry_ts"
             ).fetchall()]
             for trade in open_trades:
-                row = row_by_pair.get(f"{trade['asset']}:{trade['leader']}") or {}
+                row = row_by_asset.get(str(trade.get("asset") or "").upper()) or {}
                 metrics = leadlag_trade_metrics(trade, row, state.l2book, config, now_ts)
                 if not metrics:
                     continue
@@ -3075,7 +3104,7 @@ def update_leadlag_strategy(state, rows, now_ts=None):
                         signal.get("asset_3s_bps"), signal.get("lag_bps"), signal.get("expected_edge_bps"),
                         signal.get("corr"), signal.get("beta"), signal.get("spread_bps"),
                         signal.get("imbalance"), fee_bps,
-                        json.dumps({**signal, "funding_hourly": row_by_pair.get(f"{asset}:{signal['leader']}", {}).get("funding_hourly")}, ensure_ascii=False),
+                        json.dumps({**signal, "funding_hourly": row_by_asset.get(asset, {}).get("funding_hourly")}, ensure_ascii=False),
                     ))
                     opened_now.append({**signal, "id": cursor.lastrowid, "status": "open",
                                        "entry_ts": now_ts, "entry_px": entry_px,
@@ -3296,12 +3325,14 @@ LEADLAG_CONFIG_FIELDS = {
     "leadlag_enabled": {"env": "LEADLAG_ENABLED", "type": "bool", "label": "V2 模拟策略开关"},
     "leadlag_notional_usdc": {"env": "LEADLAG_NOTIONAL_USDC", "type": "float", "min": 1, "max": 100_000, "label": "单腿模拟金额 USDC"},
     "leadlag_max_open": {"env": "LEADLAG_MAX_OPEN", "type": "int", "min": 0, "max": 50, "label": "最多同时持仓"},
+    "leadlag_leaders": {"env": "LEADLAG_LEADERS", "type": "str", "label": "V2 龙头币列表"},
     "leadlag_leader_3s_bps": {"env": "LEADLAG_LEADER_3S_BPS", "type": "float", "min": 1, "max": 1000, "label": "龙头3秒启动 bps"},
     "leadlag_leader_15s_bps": {"env": "LEADLAG_LEADER_15S_BPS", "type": "float", "min": 1, "max": 5000, "label": "龙头15秒启动 bps"},
     "leadlag_min_lag_bps": {"env": "LEADLAG_MIN_LAG_BPS", "type": "float", "min": 1, "max": 5000, "label": "最小跟随缺口 bps"},
     "leadlag_min_corr": {"env": "LEADLAG_MIN_CORR", "type": "float", "min": -1, "max": 1, "label": "最低相关性"},
     "leadlag_max_spread_bps": {"env": "LEADLAG_MAX_SPREAD_BPS", "type": "float", "min": 0, "max": 100, "label": "最大点差 bps"},
-    "leadlag_min_imbalance": {"env": "LEADLAG_MIN_IMBALANCE", "type": "float", "min": 0, "max": 1, "label": "最小同向盘口倾斜"},
+    "leadlag_max_data_age_ms": {"env": "LEADLAG_MAX_DATA_AGE_MS", "type": "float", "min": 500, "max": 60000, "label": "V2 行情最大年龄 ms"},
+    "leadlag_min_imbalance": {"env": "LEADLAG_MIN_IMBALANCE", "type": "float", "min": -1, "max": 1, "label": "最小同向盘口倾斜（-1关闭）"},
     "leadlag_min_depth_multiple": {"env": "LEADLAG_MIN_DEPTH_MULTIPLE", "type": "float", "min": 0, "max": 1000, "label": "最小盘口深度倍数"},
     "leadlag_fee_bps": {"env": "LEADLAG_FEE_BPS", "type": "float", "min": 0, "max": 1000, "label": "单腿往返成本 bps"},
     "leadlag_min_edge_bps": {"env": "LEADLAG_MIN_EDGE_BPS", "type": "float", "min": 0, "max": 5000, "label": "最低扣费预期空间 bps"},
@@ -3350,11 +3381,15 @@ def coerce_leadlag_config(raw):
         value = raw[key]
         if meta["type"] == "bool":
             parsed = value.strip().lower() not in ("0", "false", "no", "off", "关闭") if isinstance(value, str) else bool(value)
+        elif meta["type"] == "str":
+            parsed = ",".join(split_symbols(str(value or "")))
+            if not parsed:
+                raise ValueError(f"{meta['label']} 不能为空")
         elif meta["type"] == "int":
             parsed = int(value)
         else:
             parsed = float(value)
-        if meta["type"] != "bool" and not (meta["min"] <= parsed <= meta["max"]):
+        if meta["type"] not in ("bool", "str") and not (meta["min"] <= parsed <= meta["max"]):
             raise ValueError(f"{meta['label']} 超出允许范围")
         updates[key] = parsed
     if not updates:
@@ -3987,17 +4022,19 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">当前合格信号</div><div id="llEligible">-</div></div>
   </div>
   <p class="scoreMid">V2 当前只做独立单腿模拟，不会发送真实订单，也不会占用旧双腿策略仓位。先收集足够样本，再决定是否开放真实单腿开关。</p>
-  <div class="paperActions"><button onclick="saveLeadlagConfig()">保存 V2 参数</button><button onclick="loadLeadlag()">刷新</button><span id="llSaveStatus" class="subtle">保存需要全局管理口令</span></div>
+  <div class="paperActions"><label>参数档位 <select id="llPreset" onchange="applyLeadlagPreset(this.value)"><option value="sampling">取样激进（推荐）</option><option value="standard">标准</option><option value="strict">严格</option><option value="custom">自定义</option></select></label><button onclick="saveLeadlagConfig()">保存 V2 参数</button><button onclick="loadLeadlag()">刷新</button><span id="llSaveStatus" class="subtle">保存需要全局管理口令</span></div>
   <details class="settingBand" open><summary><b>V2 参数</b></summary>
     <div class="paperForm">
       <label>模拟策略开关<select id="cfg_leadlag_enabled"><option value="true">开启</option><option value="false">关闭</option></select></label>
       <label>每笔单腿金额U<input id="cfg_leadlag_notional_usdc" type="number" step="1"></label>
       <label>最多持仓<input id="cfg_leadlag_max_open" type="number" step="1"></label>
+      <label>龙头币列表<input id="cfg_leadlag_leaders" placeholder="BTC,ETH,SOL,HYPE,DOGE,BNB"></label>
       <label>龙头3秒启动bps<input id="cfg_leadlag_leader_3s_bps" type="number" step="1"></label>
       <label>龙头15秒启动bps<input id="cfg_leadlag_leader_15s_bps" type="number" step="1"></label>
       <label>最小跟随缺口bps<input id="cfg_leadlag_min_lag_bps" type="number" step="1"></label>
       <label>最低相关性<input id="cfg_leadlag_min_corr" type="number" step="0.01"></label>
       <label>最大点差bps<input id="cfg_leadlag_max_spread_bps" type="number" step="0.1"></label>
+      <label>行情最大年龄ms<input id="cfg_leadlag_max_data_age_ms" type="number" step="500"></label>
       <label>盘口同向倾斜<input id="cfg_leadlag_min_imbalance" type="number" step="0.01"></label>
       <label>盘口深度倍数<input id="cfg_leadlag_min_depth_multiple" type="number" step="1"></label>
       <label>单腿往返成本bps<input id="cfg_leadlag_fee_bps" type="number" step="0.1"></label>
@@ -4184,9 +4221,14 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <h3>联动传播 V2 是什么</h3>
 <p>V2 不再看到 Z 极端就反向交易。它监听 BTC/ETH 的 1 秒、3 秒、15 秒盘口变化：龙头已经快速启动，而相关小币还没有完全跟上，并且小币盘口开始出现同方向力量时，模拟做多或做空小币。</p>
 <p><code>跟随缺口</code>：按历史 beta 推算小币本应移动的幅度，减去小币实际移动幅度。缺口越大，理论补涨/补跌空间越大。</p>
+<p><code>龙头币列表</code>：V2 不再只看 BTC/ETH。默认同时比较 BTC、ETH、SOL、HYPE、DOGE、BNB，并用最近约3分钟 allMids 自动计算每个小币与各龙头的实时相关和 beta，选择当前最有传播空间的组合。</p>
 <p><code>扣费预期空间</code>：跟随缺口减去单腿往返成本和两次盘口点差。只有剩余空间达到门槛才模拟开仓。</p>
-<p><code>盘口同向倾斜</code>：买一和卖一顶层数量的差异。做多时希望买方更强，做空时希望卖方更强；它只是确认条件，不是单独信号。</p>
+<p><code>盘口同向倾斜</code>：买一和卖一顶层数量的差异。做多时希望买方更强，做空时希望卖方更强；它只是确认条件，不是单独信号。设置为 <code>-1</code> 代表关闭硬过滤：界面仍展示倾斜数据，但不会仅因顶层数量瞬时反向而拦截信号。取样档默认使用 -1，标准档和严格档仍会检查。</p>
 <p><code>盘口深度倍数</code>：当前可成交顶层金额是模拟下单金额的多少倍，防止看到信号却交易在太薄的盘口。</p>
+<p><code>取样激进档</code>：按服务器真实波动分布调整为3秒2bps、15秒4bps、相关0.60、点差2.5bps、扣费空间6bps。目的是先产生足够模拟样本；它大约关注当前市场最活跃的10%左右短时波动，也更容易包含噪声。</p>
+<p><code>标准档</code>：3秒4bps、15秒8bps，并提高相关和扣费空间要求。</p>
+<p><code>严格档</code>：保留第一版12bps/25bps门槛，信号非常少，只适合高波动行情。</p>
+<p><code>行情最大年龄</code>：allMids 通常按价格变化推送，不保证每秒来一条。取样档允许10秒以内，但真正入场仍使用 l2Book 当前买一卖一和点差。</p>
 <p>V2 默认单腿、目标空间更大，并使用固定止盈、止损、移动止盈、龙头反向退出和最长持仓；不会因为 Z 回到零自动平仓。当前版本只模拟，不会发送真实订单。</p>
 
 <h3>推送参数怎么读</h3>
@@ -4767,7 +4809,8 @@ function renderL2Book(l2){
   if(el){
     const age=status.last_message_age_ms===null||status.last_message_age_ms===undefined?'-':fmt(status.last_message_age_ms,0)+'ms';
     const scanText=status.scan_rows!==undefined?`；扫描 ${status.scan_rows}`:'';
-    el.textContent=`${status.connected?'已连接':'未连接'}；订阅 ${status.subscribed||0}/${status.desired||0}${scanText}；盘口 ${status.books||0}；最新 ${age}`;
+    const midsAge=status.all_mids_age_ms===null||status.all_mids_age_ms===undefined?'-':fmt(status.all_mids_age_ms,0)+'ms';
+    el.textContent=`${status.connected?'已连接':'未连接'}；订阅 ${status.subscribed||0}/${status.desired||0}${scanText}；盘口 ${status.books||0}；allMids ${status.all_mids||0} / ${midsAge}；最新 ${age}`;
     el.className=status.connected?'scoreGood':'scoreBad';
   }
   const tb=document.querySelector('#liveL2Tbl tbody'); if(!tb)return; tb.innerHTML='';
@@ -5008,13 +5051,28 @@ async function runEmergencyClose(){
     loadLive();
   }
 }
-const leadlagConfigKeys=['leadlag_enabled','leadlag_notional_usdc','leadlag_max_open','leadlag_leader_3s_bps','leadlag_leader_15s_bps','leadlag_min_lag_bps','leadlag_min_corr','leadlag_max_spread_bps','leadlag_min_imbalance','leadlag_min_depth_multiple','leadlag_fee_bps','leadlag_min_edge_bps','leadlag_take_profit_bps','leadlag_stop_bps','leadlag_trail_start_bps','leadlag_trail_gap_bps','leadlag_max_hold_minutes','leadlag_cooldown_minutes'];
+const leadlagConfigKeys=['leadlag_enabled','leadlag_notional_usdc','leadlag_max_open','leadlag_leaders','leadlag_leader_3s_bps','leadlag_leader_15s_bps','leadlag_min_lag_bps','leadlag_min_corr','leadlag_max_spread_bps','leadlag_max_data_age_ms','leadlag_min_imbalance','leadlag_min_depth_multiple','leadlag_fee_bps','leadlag_min_edge_bps','leadlag_take_profit_bps','leadlag_stop_bps','leadlag_trail_start_bps','leadlag_trail_gap_bps','leadlag_max_hold_minutes','leadlag_cooldown_minutes'];
+const leadlagPresets={
+  sampling:{leadlag_leader_3s_bps:2,leadlag_leader_15s_bps:4,leadlag_min_lag_bps:6,leadlag_min_corr:.60,leadlag_max_spread_bps:2.5,leadlag_max_data_age_ms:10000,leadlag_min_imbalance:-1,leadlag_min_depth_multiple:2,leadlag_min_edge_bps:6,leadlag_take_profit_bps:18,leadlag_stop_bps:14,leadlag_trail_start_bps:8,leadlag_trail_gap_bps:6,leadlag_max_hold_minutes:8,leadlag_cooldown_minutes:8},
+  standard:{leadlag_leader_3s_bps:4,leadlag_leader_15s_bps:8,leadlag_min_lag_bps:8,leadlag_min_corr:.65,leadlag_max_spread_bps:2.5,leadlag_max_data_age_ms:8000,leadlag_min_imbalance:0,leadlag_min_depth_multiple:2,leadlag_min_edge_bps:8,leadlag_take_profit_bps:20,leadlag_stop_bps:15,leadlag_trail_start_bps:10,leadlag_trail_gap_bps:7,leadlag_max_hold_minutes:8,leadlag_cooldown_minutes:10},
+  strict:{leadlag_leader_3s_bps:12,leadlag_leader_15s_bps:25,leadlag_min_lag_bps:15,leadlag_min_corr:.75,leadlag_max_spread_bps:1.5,leadlag_max_data_age_ms:5000,leadlag_min_imbalance:.05,leadlag_min_depth_multiple:5,leadlag_min_edge_bps:18,leadlag_take_profit_bps:30,leadlag_stop_bps:18,leadlag_trail_start_bps:15,leadlag_trail_gap_bps:10,leadlag_max_hold_minutes:10,leadlag_cooldown_minutes:20}
+};
+function updateLeadlagPreset(cfg){
+  const el=document.getElementById('llPreset');if(!el)return;let match='custom';
+  for(const [name,preset] of Object.entries(leadlagPresets)){if(Object.entries(preset).every(([k,v])=>Math.abs(Number(cfg[k])-Number(v))<1e-9)){match=name;break;}}
+  el.value=match;
+}
+function applyLeadlagPreset(name){
+  const preset=leadlagPresets[name];if(!preset)return;Object.entries(preset).forEach(([k,v])=>{const el=document.getElementById('cfg_'+k);if(el)el.value=v;});
+  const status=document.getElementById('llSaveStatus');if(status)status.textContent='已套用档位，点击保存后生效';
+}
 function fillLeadlagConfig(cfg){
   leadlagConfigKeys.forEach(key=>{const el=document.getElementById('cfg_'+key);if(!el||cfg[key]===undefined)return;el.value=key==='leadlag_enabled'?(cfg[key]===true?'true':'false'):cfg[key];});
+  updateLeadlagPreset(cfg);
 }
 function readLeadlagConfig(){
   const out={};
-  leadlagConfigKeys.forEach(key=>{const el=document.getElementById('cfg_'+key);if(!el)return;if(key==='leadlag_enabled')out[key]=el.value==='true';else if(['leadlag_max_open','leadlag_max_hold_minutes','leadlag_cooldown_minutes'].includes(key))out[key]=parseInt(el.value,10);else out[key]=parseFloat(el.value);});
+  leadlagConfigKeys.forEach(key=>{const el=document.getElementById('cfg_'+key);if(!el)return;if(key==='leadlag_enabled')out[key]=el.value==='true';else if(key==='leadlag_leaders')out[key]=el.value.trim();else if(['leadlag_max_open','leadlag_max_hold_minutes','leadlag_cooldown_minutes'].includes(key))out[key]=parseInt(el.value,10);else out[key]=parseFloat(el.value);});
   return out;
 }
 function leadlagSideText(side){return side==='long'?'做多小币':'做空小币'}
@@ -5186,6 +5244,7 @@ class L2BookCache:
     def __init__(self, url=HL_WS):
         self.url = url
         self.books = {}
+        self.market_mids = {}
         self.history = {}
         self.desired = set()
         self.subscribed = set()
@@ -5245,6 +5304,11 @@ class L2BookCache:
             coins = sorted(self.desired)[:1000]
         for coin in coins:
             self._send_subscribe(ws, coin)
+        try:
+            ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
+        except Exception as exc:
+            with self.lock:
+                self.error = f"allMids 订阅失败：{exc}"
 
     def _on_close(self, _ws, *_args):
         with self.lock:
@@ -5259,6 +5323,27 @@ class L2BookCache:
     def _on_message(self, _ws, raw_message):
         try:
             msg = json.loads(raw_message)
+            if msg.get("channel") == "allMids":
+                data = msg.get("data") or {}
+                mids = data.get("mids") or {}
+                now = time.time()
+                with self.lock:
+                    for name, value in mids.items():
+                        coin = str(name or "").upper()
+                        try:
+                            mid = float(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if not coin or mid <= 0:
+                            continue
+                        self.market_mids[coin] = (now, mid)
+                        history = self.history.setdefault(coin, deque(maxlen=600))
+                        if not history or now - history[-1][0] >= 0.10:
+                            history.append((now, mid))
+                    self.last_message_at = now
+                    self.revision += 1
+                    self.error = ""
+                return
             if msg.get("channel") != "l2Book":
                 return
             data = msg.get("data") or {}
@@ -5331,10 +5416,14 @@ class L2BookCache:
         with self.lock:
             book = dict(self.books.get(coin) or {})
             history = list(self.history.get(coin) or ())
+            market_mid = self.market_mids.get(coin)
         if not book or not history:
             return None
-        current_ts = float(book.get("received_at") or history[-1][0])
-        current_mid = float(book.get("mid") or 0)
+        if market_mid and time.time() - float(market_mid[0]) <= 5:
+            current_ts, current_mid = float(market_mid[0]), float(market_mid[1])
+        else:
+            current_ts = float(book.get("received_at") or history[-1][0])
+            current_mid = float(book.get("mid") or 0)
         if current_mid <= 0:
             return None
         out = {"coin": coin, "mid": current_mid, "age_ms": max(0.0, (time.time() - current_ts) * 1000)}
@@ -5354,6 +5443,56 @@ class L2BookCache:
         out["ask_size"] = ask_size
         return out
 
+    def recent_relationship(self, asset, leader, lookback_seconds=180, step_seconds=5):
+        """Estimate short-horizon corr/beta from synchronized allMids history."""
+        asset = str(asset or "").upper()
+        leader = str(leader or "").upper()
+        with self.lock:
+            asset_history = list(self.history.get(asset) or ())
+            leader_history = list(self.history.get(leader) or ())
+        if len(asset_history) < 8 or len(leader_history) < 8:
+            return None
+        end_ts = min(asset_history[-1][0], leader_history[-1][0])
+        start_ts = max(end_ts - float(lookback_seconds), asset_history[0][0], leader_history[0][0])
+        if end_ts - start_ts < 30:
+            return None
+        targets = []
+        ts = start_ts
+        while ts <= end_ts:
+            targets.append(ts)
+            ts += float(step_seconds)
+
+        def sampled(history):
+            values, index, last = [], 0, None
+            for target in targets:
+                while index < len(history) and history[index][0] <= target:
+                    last = history[index][1]
+                    index += 1
+                values.append(last)
+            return values
+
+        asset_prices = sampled(asset_history)
+        leader_prices = sampled(leader_history)
+        asset_returns, leader_returns = [], []
+        previous = None
+        for asset_px, leader_px in zip(asset_prices, leader_prices):
+            if not asset_px or not leader_px:
+                previous = None
+                continue
+            if previous:
+                previous_asset, previous_leader = previous
+                if previous_asset > 0 and previous_leader > 0:
+                    asset_returns.append(math.log(asset_px / previous_asset))
+                    leader_returns.append(math.log(leader_px / previous_leader))
+            previous = (asset_px, leader_px)
+        if len(asset_returns) < 6:
+            return None
+        corr = pearson(asset_returns, leader_returns)
+        beta = beta_against(asset_returns, leader_returns)
+        if corr is None or beta is None:
+            return None
+        return {"corr": corr, "beta": beta, "samples": len(asset_returns)}
+
     def snapshot(self, coins=None):
         with self.lock:
             status = {
@@ -5363,6 +5502,8 @@ class L2BookCache:
                 "subscribed": len(self.subscribed),
                 "books": len(self.books),
                 "revision": self.revision,
+                "all_mids": len(self.market_mids),
+                "all_mids_age_ms": max(0.0, (time.time() - max((item[0] for item in self.market_mids.values()), default=0)) * 1000) if self.market_mids else None,
                 "last_message_age_ms": max(0.0, (time.time() - self.last_message_at) * 1000) if self.last_message_at else None,
             }
             selected = {str(c).upper() for c in coins if c} if coins else set(self.desired)
@@ -5502,7 +5643,7 @@ def collector_loop(state):
     disk = load_latest_scan(state.db_path)
     if disk:
         state.l2book.set_coins(l2book_subscription_coins(
-            disk["rows"], leaders=state.config.get("leaders", []),
+            disk["rows"], leaders=configured_ws_leaders(state.config),
         ))
         with state.lock:
             state.latest = {
@@ -5516,7 +5657,7 @@ def collector_loop(state):
         try:
             payload = make_alt_scan_payload(state.config)
             state.l2book.set_coins(l2book_subscription_coins(
-                payload.get("rows", []), leaders=state.config.get("leaders", []),
+                payload.get("rows", []), leaders=configured_ws_leaders(state.config),
             ))
             scan_id = save_alt_scan(payload, state.config, db_path=state.db_path)
             payload["scan_id"] = scan_id
@@ -5641,7 +5782,7 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                     live_error = str(exc)
             account = account or load_latest_live_account_snapshot(state.db_path)
             l2_coins = l2book_subscription_coins(
-                latest_rows, leaders=state.config.get("leaders", []),
+                latest_rows, leaders=configured_ws_leaders(state.config),
             )
             l2_snapshot = state.l2book.snapshot(l2_coins)
             l2_snapshot.setdefault("status", {})["scan_rows"] = len(latest_rows)
@@ -5820,7 +5961,7 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                     with state.lock:
                         latest_rows = list((state.latest or {}).get("rows", []))
                     state.l2book.set_coins(l2book_subscription_coins(
-                        latest_rows, leaders=state.config.get("leaders", []),
+                        latest_rows, leaders=configured_ws_leaders(state.config),
                     ))
                 except Exception as exc:
                     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] l2Book resubscribe failed after config update: {exc}", flush=True)
@@ -5836,6 +5977,11 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                 json_response(self, {"ok": True, "config": notify_config_public(state.config)})
             elif parsed.path == "/leadlag_config":
                 update_leadlag_env_file(updates)
+                with state.lock:
+                    latest_rows = list((state.latest or {}).get("rows", []))
+                state.l2book.set_coins(l2book_subscription_coins(
+                    latest_rows, leaders=configured_ws_leaders(state.config),
+                ))
                 json_response(self, {"ok": True, "config": leadlag_config_public(state.config)})
             else:
                 update_env_file(updates)
@@ -6970,21 +7116,23 @@ def build_server_config(args):
         "leadlag_enabled": env_bool("LEADLAG_ENABLED", True),
         "leadlag_notional_usdc": env_float("LEADLAG_NOTIONAL_USDC", 20.0),
         "leadlag_max_open": env_int("LEADLAG_MAX_OPEN", 3),
-        "leadlag_leader_3s_bps": env_float("LEADLAG_LEADER_3S_BPS", 12.0),
-        "leadlag_leader_15s_bps": env_float("LEADLAG_LEADER_15S_BPS", 25.0),
-        "leadlag_min_lag_bps": env_float("LEADLAG_MIN_LAG_BPS", 15.0),
-        "leadlag_min_corr": env_float("LEADLAG_MIN_CORR", 0.75),
-        "leadlag_max_spread_bps": env_float("LEADLAG_MAX_SPREAD_BPS", 1.5),
-        "leadlag_min_imbalance": env_float("LEADLAG_MIN_IMBALANCE", 0.05),
-        "leadlag_min_depth_multiple": env_float("LEADLAG_MIN_DEPTH_MULTIPLE", 5.0),
+        "leadlag_leaders": env_text("LEADLAG_LEADERS", "BTC,ETH,SOL,HYPE,DOGE,BNB"),
+        "leadlag_leader_3s_bps": env_float("LEADLAG_LEADER_3S_BPS", 2.0),
+        "leadlag_leader_15s_bps": env_float("LEADLAG_LEADER_15S_BPS", 4.0),
+        "leadlag_min_lag_bps": env_float("LEADLAG_MIN_LAG_BPS", 6.0),
+        "leadlag_min_corr": env_float("LEADLAG_MIN_CORR", 0.60),
+        "leadlag_max_spread_bps": env_float("LEADLAG_MAX_SPREAD_BPS", 2.5),
+        "leadlag_max_data_age_ms": env_float("LEADLAG_MAX_DATA_AGE_MS", 10_000.0),
+        "leadlag_min_imbalance": env_float("LEADLAG_MIN_IMBALANCE", -1.0),
+        "leadlag_min_depth_multiple": env_float("LEADLAG_MIN_DEPTH_MULTIPLE", 2.0),
         "leadlag_fee_bps": env_float("LEADLAG_FEE_BPS", 5.0),
-        "leadlag_min_edge_bps": env_float("LEADLAG_MIN_EDGE_BPS", 18.0),
-        "leadlag_take_profit_bps": env_float("LEADLAG_TAKE_PROFIT_BPS", 30.0),
-        "leadlag_stop_bps": env_float("LEADLAG_STOP_BPS", 18.0),
-        "leadlag_trail_start_bps": env_float("LEADLAG_TRAIL_START_BPS", 15.0),
-        "leadlag_trail_gap_bps": env_float("LEADLAG_TRAIL_GAP_BPS", 10.0),
-        "leadlag_max_hold_minutes": env_int("LEADLAG_MAX_HOLD_MINUTES", 10),
-        "leadlag_cooldown_minutes": env_int("LEADLAG_COOLDOWN_MINUTES", 20),
+        "leadlag_min_edge_bps": env_float("LEADLAG_MIN_EDGE_BPS", 6.0),
+        "leadlag_take_profit_bps": env_float("LEADLAG_TAKE_PROFIT_BPS", 18.0),
+        "leadlag_stop_bps": env_float("LEADLAG_STOP_BPS", 14.0),
+        "leadlag_trail_start_bps": env_float("LEADLAG_TRAIL_START_BPS", 8.0),
+        "leadlag_trail_gap_bps": env_float("LEADLAG_TRAIL_GAP_BPS", 6.0),
+        "leadlag_max_hold_minutes": env_int("LEADLAG_MAX_HOLD_MINUTES", 8),
+        "leadlag_cooldown_minutes": env_int("LEADLAG_COOLDOWN_MINUTES", 8),
     }
 
 
@@ -6995,7 +7143,7 @@ def run_server(args):
     reconcile_shared_paper_from_live(db_path, config.get("paper_fee_bps", 9.0))
     state = AltServerState(config, db_path=db_path)
     state.live_account = load_latest_live_account_snapshot(db_path)
-    state.l2book.set_coins(set(config.get("leaders", [])) | {"BTC", "ETH"})
+    state.l2book.set_coins(configured_ws_leaders(config))
     state.l2book.start()
     threading.Thread(target=live_account_cache_loop, args=(state,), daemon=True).start()
     threading.Thread(target=reconcile_live_trade_costs, args=(state,), daemon=True).start()

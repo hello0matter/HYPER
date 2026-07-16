@@ -226,6 +226,63 @@ class LiveStrategySignalTests(unittest.TestCase):
         self.assertGreaterEqual(signal["lag_bps"], 15)
         self.assertGreaterEqual(signal["expected_edge_bps"], 18)
 
+    def test_sampling_preset_can_disable_imbalance_gate(self):
+        class FakeMotion:
+            def motion(self, coin, windows=(1, 3, 15)):
+                if coin == "BTC":
+                    return {"ret_1s_bps": 5, "ret_3s_bps": 20, "ret_15s_bps": 30,
+                            "age_ms": 10, "mid": 60000, "bid": 59999, "ask": 60001,
+                            "spread_bps": .3, "imbalance": .1, "bid_size": 10, "ask_size": 10}
+                return {"ret_1s_bps": 1, "ret_3s_bps": 2, "ret_15s_bps": 5,
+                        "age_ms": 10, "mid": 10, "bid": 9.9995, "ask": 10.0005,
+                        "spread_bps": 1.0, "imbalance": -.53, "bid_size": 100, "ask_size": 100}
+
+        config = self.leadlag_config()
+        config.update({
+            "leadlag_leader_3s_bps": 2, "leadlag_leader_15s_bps": 4,
+            "leadlag_min_lag_bps": 6, "leadlag_min_corr": .60,
+            "leadlag_max_spread_bps": 2.5, "leadlag_min_imbalance": -1,
+            "leadlag_min_depth_multiple": 2, "leadlag_min_edge_bps": 6,
+        })
+        signal = monitor.leadlag_pair_state(
+            self.row(asset="TEST", leader="BTC", corr=.82, beta=1.5), FakeMotion(), config,
+        )
+        self.assertTrue(signal["eligible"])
+        self.assertAlmostEqual(signal["imbalance"], -.53)
+
+    def test_all_mids_updates_motion_price_history(self):
+        cache = monitor.L2BookCache()
+        cache._on_message(None, json.dumps({
+            "channel": "l2Book", "data": {"coin": "BTC", "time": int(time.time() * 1000),
+            "levels": [[{"px": "100", "sz": "10", "n": 1}], [{"px": "101", "sz": "8", "n": 1}]]},
+        }))
+        now = time.time()
+        with cache.lock:
+            cache.history["BTC"] = monitor.deque([(now - 16, 100.0), (now - 4, 100.5), (now - 2, 101.0)], maxlen=600)
+        cache._on_message(None, json.dumps({"channel": "allMids", "data": {"mids": {"BTC": "102"}}}))
+        motion = cache.motion("BTC")
+        self.assertAlmostEqual(motion["mid"], 102.0)
+        self.assertIsNotNone(motion["ret_3s_bps"])
+        self.assertIsNotNone(motion["ret_15s_bps"])
+
+    def test_recent_relationship_finds_dynamic_leader(self):
+        cache = monitor.L2BookCache()
+        now = time.time()
+        leader, asset = [], []
+        for i in range(40):
+            ts = now - (39 - i) * 5
+            leader_px = 100 + i * .1 + (i % 3) * .02
+            asset_px = 10 + i * .02 + (i % 3) * .004
+            leader.append((ts, leader_px))
+            asset.append((ts, asset_px))
+        with cache.lock:
+            cache.history["SOL"] = monitor.deque(leader, maxlen=600)
+            cache.history["TEST"] = monitor.deque(asset, maxlen=600)
+        relationship = cache.recent_relationship("TEST", "SOL")
+        self.assertIsNotNone(relationship)
+        self.assertGreater(relationship["corr"], .9)
+        self.assertGreater(relationship["samples"], 20)
+
     def test_leadlag_paper_trade_opens_and_takes_profit(self):
         class MutableMotion:
             def __init__(self):
