@@ -1,5 +1,7 @@
 import math
 import unittest
+from io import BytesIO
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 import crypto_strategy_lab as lab
@@ -19,6 +21,27 @@ def candles_from_closes(closes):
 
 
 class CryptoStrategyLabTests(unittest.TestCase):
+    def test_rate_limit_retries_before_proxy_fallback(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            @staticmethod
+            def read():
+                return b'{"ok": true}'
+
+        rate_limit = HTTPError(lab.HL_INFO, 429, "Too Many Requests", {}, BytesIO())
+        with patch.object(lab, "USE_LOCAL_PROXY", False), patch.object(
+            lab, "urlopen", side_effect=[rate_limit, Response()],
+        ) as request, patch.object(lab.time, "sleep") as sleep:
+            result = lab._request_json({"type": "test"})
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1.5)
+
     def test_history_fetch_paginates_beyond_exchange_page_limit(self):
         def item(ts):
             return {"t": ts, "o": "1", "h": "2", "l": ".5", "c": "1.5", "v": "10"}

@@ -14,6 +14,7 @@ import math
 import statistics
 import time
 from dataclasses import dataclass
+from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 
@@ -47,20 +48,30 @@ def _request_json(payload):
             except OSError as exc:
                 last_error = exc
         raise RuntimeError(f"Hyperliquid K线 7891 代理连续失败：{last_error}") from last_error
-    try:
-        with urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except OSError as direct_error:
-        # Local Windows research machines in this project commonly expose a
-        # proxy on 7891.  Production servers normally succeed on the direct
-        # attempt and never enter this fallback.
+    direct_error = None
+    for attempt in range(4):
         try:
-            with LOCAL_PROXY_OPENER.open(req, timeout=30) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            USE_LOCAL_PROXY = True
-            return data
-        except OSError as proxy_error:
-            raise RuntimeError(f"Hyperliquid K线直连失败：{direct_error}；7891代理失败：{proxy_error}") from proxy_error
+            with urlopen(req, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            direct_error = exc
+            if exc.code == 429 and attempt < 3:
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+            break
+        except OSError as exc:
+            direct_error = exc
+            break
+    # Local Windows research machines in this project commonly expose a
+    # proxy on 7891.  Production servers normally succeed on the direct
+    # attempt and never enter this fallback.
+    try:
+        with LOCAL_PROXY_OPENER.open(req, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        USE_LOCAL_PROXY = True
+        return data
+    except OSError as proxy_error:
+        raise RuntimeError(f"Hyperliquid K线直连失败：{direct_error}；7891代理失败：{proxy_error}") from proxy_error
 
 
 def fetch_hl_ohlcv(coin, *, days=30, interval="15m"):
@@ -365,6 +376,7 @@ def run_strategy_lab(coins=("BTC", "ETH", "SOL"), *, days=30, interval="15m", ro
             rows.extend(evaluated)
         except Exception as exc:  # Keep the other markets usable after one API failure.
             failures.append({"coin": coin, "error": str(exc)})
+        time.sleep(0.35)
     rows.sort(key=lambda item: (bool(item["promotable"]), item["score"]), reverse=True)
     truncated = [item for item in coverage if item["actual_days"] + 1 < float(days)]
     coverage_note = ""
