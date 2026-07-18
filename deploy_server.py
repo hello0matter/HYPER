@@ -7,8 +7,9 @@ import paramiko
 
 HOST = "50.114.113.121"
 USER = "root"
-LOCAL_FILE = Path(__file__).resolve().parent / "hyperliquid_correlation_monitor.py"
-REMOTE_FILE = "/opt/hyperliquid-monitor/hyperliquid_correlation_monitor.py"
+LOCAL_ROOT = Path(__file__).resolve().parent
+REMOTE_ROOT = "/opt/hyperliquid-monitor"
+DEPLOY_FILES = ("hyperliquid_correlation_monitor.py", "crypto_strategy_lab.py")
 SERVICE = "hyperliquid-alt-monitor.service"
 
 
@@ -30,10 +31,14 @@ def main():
     try:
         sftp = ssh.open_sftp()
         try:
-            sftp.put(str(LOCAL_FILE), REMOTE_FILE)
+            for name in DEPLOY_FILES:
+                sftp.put(str(LOCAL_ROOT / name), f"{REMOTE_ROOT}/{name}.new")
         finally:
             sftp.close()
-        print(run(ssh, f"python3 -m py_compile {REMOTE_FILE}") or "py_compile ok")
+        remote_new = " ".join(f"{REMOTE_ROOT}/{name}.new" for name in DEPLOY_FILES)
+        print(run(ssh, f"python3 -m py_compile {remote_new}") or "py_compile ok")
+        for name in DEPLOY_FILES:
+            run(ssh, f"mv {REMOTE_ROOT}/{name}.new {REMOTE_ROOT}/{name}")
         run(ssh, f"systemctl restart {SERVICE}")
         print(run(ssh, f"systemctl is-active {SERVICE}"))
     finally:

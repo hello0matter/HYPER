@@ -30,6 +30,8 @@ from zoneinfo import ZoneInfo
 
 import websocket
 
+from crypto_strategy_lab import run_strategy_lab
+
 try:
     import tkinter as tk
     from tkinter import messagebox, ttk
@@ -736,6 +738,18 @@ def init_alt_db(path=ALT_DB_FILE):
         """)
         db.execute("CREATE INDEX IF NOT EXISTS idx_leadlag_status ON leadlag_trades(status, asset)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_leadlag_ts ON leadlag_trades(entry_ts, exit_ts)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_lab_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                coins TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                round_trip_cost_bps REAL NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_strategy_lab_runs_ts ON strategy_lab_runs(ts)")
 
 
 def save_alt_scan(payload, config, *, db_path=ALT_DB_FILE):
@@ -761,6 +775,33 @@ def save_alt_scan(payload, config, *, db_path=ALT_DB_FILE):
                 row["ask"], row["mid"], row["plan"],
             ))
     return scan_id
+
+
+def save_strategy_lab_run(payload, *, db_path=ALT_DB_FILE):
+    init_alt_db(db_path)
+    with sqlite3.connect(db_path) as db:
+        cursor = db.execute("""
+            INSERT INTO strategy_lab_runs (
+                ts, coins, interval, days, round_trip_cost_bps, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            float(payload.get("ts") or time.time()), ",".join(payload.get("coins") or []),
+            str(payload.get("interval") or "15m"), int(payload.get("days") or 30),
+            float(payload.get("round_trip_cost_bps") or 0), json.dumps(payload, ensure_ascii=False),
+        ))
+        return cursor.lastrowid
+
+
+def load_latest_strategy_lab_run(*, db_path=ALT_DB_FILE):
+    init_alt_db(db_path)
+    with sqlite3.connect(db_path) as db:
+        row = db.execute("SELECT payload_json FROM strategy_lab_runs ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        return None
 
 
 def fetch_live_account_snapshot(account_address, account_mode_hint=None):
@@ -3842,7 +3883,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 </style>
 </head>
 <body>
-<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openLeadlagDialog()">联动传播 V2</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
+<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openStrategyLabDialog()">策略实验室</button><button onclick="openLeadlagDialog()">联动传播 V2</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
 <main>
 <section class="topPanel">
 <h2>模拟盘 / 纸面交易</h2>
@@ -3885,6 +3926,29 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <dialog id="detailDlg" class="wideDialog">
 <div class="helpHead"><h2 id="detailTitle">详情</h2><button onclick="detailDlg.close()">关闭</button></div>
 <div class="helpBody" id="detailBody"></div>
+</dialog>
+<dialog id="strategyLabDlg" class="wideDialog">
+<div class="helpHead"><h2>虚拟货币策略实验室</h2><button onclick="strategyLabDlg.close()">关闭</button></div>
+<div class="helpBody">
+  <p>统一使用 Hyperliquid K线测试常见趋势、动量、突破和均值回归策略。信号在本根收盘计算、下一根开盘成交，避免偷看未来；排名只看后40%的样本外区间，并扣除配置的往返成本。</p>
+  <div class="paperActions">
+    <label>币种<input id="labCoins" value="BTC,ETH,SOL" style="width:180px"></label>
+    <label>周期<select id="labInterval"><option value="5m">5分钟</option><option value="15m" selected>15分钟</option><option value="1h">1小时</option><option value="4h">4小时</option></select></label>
+    <label>历史天数<input id="labDays" type="number" min="7" max="180" value="30" style="width:75px"></label>
+    <label>往返成本bps<input id="labCost" type="number" min="0" max="500" value="12" step="0.5" style="width:75px"></label>
+    <button onclick="runStrategyLab(true)">运行新回测</button><button onclick="runStrategyLab(false)">读取上次</button>
+    <span id="labStatus" class="subtle">真实交易未授权；先看样本外结果。</span>
+  </div>
+  <div class="grid">
+    <div class="metric"><div class="muted">策略参数组合</div><div id="labEvaluations">-</div></div>
+    <div class="metric"><div class="muted">达到研究门槛</div><div id="labPromotable">-</div></div>
+    <div class="metric"><div class="muted">数据源</div><div id="labSource">-</div></div>
+    <div class="metric"><div class="muted">更新时间</div><div id="labTime">-</div></div>
+  </div>
+  <p class="scoreMid">“达到研究门槛”只表示训练段和样本外段都为正、样本外交易次数及盈亏比达标；它不是自动开真实仓许可。公开 TradingView 策略还需在桌面版登录后加入图表，再与这里的 Hyperliquid 结果交叉验证。</p>
+  <div class="paperTableWrap" style="max-height:520px"><table id="strategyLabTbl"><thead><tr><th>门槛</th><th>币种</th><th>实际历史</th><th>策略</th><th>类型</th><th>当前信号</th><th>训练净收益</th><th>样本外净收益</th><th>样本外回撤</th><th>交易数</th><th>胜率</th><th>盈亏比</th><th>平均每笔</th><th>参数</th></tr></thead><tbody></tbody></table></div>
+  <p id="labNote" class="subtle"></p>
+</div>
 </dialog>
 <dialog id="globalDlg">
 <div class="helpHead"><h2>全局设置</h2><button onclick="globalDlg.close()">关闭</button></div>
@@ -4191,6 +4255,17 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>策略判断节流ms</code>：WS 行情本身持续接收；500ms 表示把这段时间内的新盘口合并判断一次，避免每条消息都重复查库。它不是 500ms 网络延迟。</p>
 <p><code>真实下单总开关</code>：最外层保险。关闭后绝不会发送新的真实订单。</p>
 <p><code>真实策略开关</code>：总开关开启后还要这个开关开启，才会按规则真实下单。关闭时只监控和模拟。</p>
+
+<h3>策略实验室怎么读</h3>
+<p><code>训练段</code>：较早的 60% K 线，用来观察这套固定参数在过去是否有基本逻辑。它不是挑完参数后重新美化的成绩。</p>
+<p><code>样本外</code>：较新的 40% K 线，排名只看这一段。可以理解成参数先定好，再参加一次没用于训练的考试。</p>
+<p><code>下一根开盘成交</code>：本根收盘后才能知道 RSI、MACD 或突破信号，所以程序最早只能用下一根开盘价成交，避免偷偷使用未来价格。</p>
+<p><code>达到研究门槛</code>：训练和样本外净收益都为正，样本外至少 6 笔、盈亏比至少 1.10、回撤未超过门槛。它只代表值得继续做 30/60/90 天、多周期和实时模拟，不是实盘授权。</p>
+<p><code>往返成本 bps</code>：估算一笔从开仓到平仓的总手续费和滑点。默认 12 bps。真实成本会随 maker/taker 费率、盘口、币种和订单大小变化。</p>
+<p><code>当前信号</code>：最后一根已获取 K 线得出的做多、做空或空仓目标。它不是实时盘口信号；15分钟策略只有在新15分钟K线确认后才应变化。</p>
+<p><code>实际历史</code>：必须看这一列，而不是只看你填写的天数。Hyperliquid 公开 candleSnapshot 约有 5000 根上限，所以 5分钟大约只有17天、15分钟大约52天；更长历史需要 TradingView 或授权历史数据源。</p>
+<p><code>TradingView 和这里的区别</code>：TradingView 适合发现和阅读策略、使用它的策略测试器；最终要在 Hyperliquid 下单时，仍应使用 Hyperliquid K线重跑，因为交易所价格、K线边界、手续费和成交条件可能不同。</p>
+<p>TradingView 公共库可以搜索和手工添加策略，但没有官方接口允许任意批量下载全部社区源码。开源脚本可在页面查看时按作者许可人工移植；受保护或仅邀请脚本不能拉取源码，也不应绕过保护。</p>
 
 <h3>l2Book 表格怎么读</h3>
 <p><code>买一 bid</code>：现在别人愿意买的最高价。你如果马上卖，通常接近这个价成交。</p>
@@ -5109,6 +5184,73 @@ async function loadLeadlag(){
   try{const r=await fetch('leadlag?limit=200');const data=await r.json();if(!data.ok)throw new Error(data.error||'读取失败');renderLeadlag(data);if(status)status.textContent='已刷新：'+new Date().toLocaleTimeString();}
   catch(e){if(status)status.textContent='读取失败：'+e.message;}
 }
+function strategySignalText(value){
+  const signal=Number(value||0);
+  return signal>0?'做多':(signal<0?'做空':'空仓');
+}
+function strategyFamilyText(value){
+  return ({
+    ema_cross:'EMA趋势',macd:'MACD动量',rsi_reversion:'RSI均值回归',
+    bollinger_reversion:'布林均值回归',donchian_breakout:'唐奇安突破',
+    supertrend:'Supertrend趋势',momentum:'动量趋势'
+  })[value]||value||'-';
+}
+function showStrategyLabDetail(row){
+  const train=row.train||{},test=row.test||{};
+  document.getElementById('detailTitle').textContent=`策略回测：${row.coin} / ${row.strategy}`;
+  document.getElementById('detailBody').innerHTML=`
+    <div class="detailGrid">
+      <div class="detailBox"><div class="muted">研究门槛</div><div class="${row.promotable?'scoreGood':'scoreBad'}">${row.promotable?'达到，仍需继续验证':'未达到'}</div></div>
+      <div class="detailBox"><div class="muted">当前收盘信号</div><div>${strategySignalText(row.current_signal)}</div></div>
+      <div class="detailBox"><div class="muted">币种 / 周期</div><div>${esc(row.coin)} / ${esc(row.interval)}</div></div>
+      <div class="detailBox"><div class="muted">实际历史覆盖</div><div>${fmt(row.actual_days,1)} 天 / ${row.samples||0} 根</div></div>
+      <div class="detailBox"><div class="muted">参数</div><div>${esc(JSON.stringify(row.params||{}))}</div></div>
+      <div class="detailBox"><div class="muted">训练净收益 / 回撤</div><div>${fmt(train.net_bps,1)} / ${fmt(train.max_drawdown_bps,1)} bps</div></div>
+      <div class="detailBox"><div class="muted">样本外净收益 / 回撤</div><div>${fmt(test.net_bps,1)} / ${fmt(test.max_drawdown_bps,1)} bps</div></div>
+      <div class="detailBox"><div class="muted">训练交易 / 胜率 / 盈亏比</div><div>${train.trades||0} / ${fmt(Number(train.win_rate||0)*100,1)}% / ${fmt(train.profit_factor,2)}</div></div>
+      <div class="detailBox"><div class="muted">样本外交易 / 胜率 / 盈亏比</div><div>${test.trades||0} / ${fmt(Number(test.win_rate||0)*100,1)}% / ${fmt(test.profit_factor,2)}</div></div>
+      <div class="detailBox"><div class="muted">样本外平均 / 最差单笔</div><div>${fmt(test.avg_trade_bps,1)} / ${fmt(test.worst_trade_bps,1)} bps</div></div>
+      <div class="detailBox"><div class="muted">样本外暴露时间</div><div>${fmt(Number(test.exposure||0)*100,1)}%</div></div>
+    </div>
+    <h3>怎么理解</h3>
+    <div class="detailText">信号在一根 K 线收盘后才确定，并按下一根 K 线开盘成交。收益已经扣除策略实验室设置的估算往返成本，但没有逐根模拟动态盘口深度、资金费和强平风险。“达到门槛”只允许进入更长周期回测和实时模拟，不代表可以直接真实下单。</div>`;
+  detailDlg.showModal();
+}
+function renderStrategyLab(data){
+  const rows=data.rows||[],body=document.querySelector('#strategyLabTbl tbody');body.innerHTML='';
+  if((data.coins||[]).length)document.getElementById('labCoins').value=data.coins.join(',');
+  if(data.interval)document.getElementById('labInterval').value=data.interval;
+  if(data.days)document.getElementById('labDays').value=data.days;
+  if(data.round_trip_cost_bps!==undefined)document.getElementById('labCost').value=data.round_trip_cost_bps;
+  document.getElementById('labEvaluations').textContent=data.evaluations??rows.length;
+  document.getElementById('labPromotable').textContent=data.promotable??rows.filter(row=>row.promotable).length;
+  document.getElementById('labSource').textContent=({hyperliquid_candles:'Hyperliquid K线',sqlite_latest:'数据库上次结果',memory_cache:'内存缓存',empty:'尚未运行'})[data.source]||data.source||'Hyperliquid K线';
+  document.getElementById('labTime').textContent=data.ts?fmtBeijingDateTime(data.ts):'-';
+  rows.forEach(row=>{
+    const test=row.test||{},train=row.train||{},tr=document.createElement('tr');
+    tr.innerHTML=`<td class="${row.promotable?'passChip':'blockChip'}">${row.promotable?'研究候选':'未通过'}</td><td>${esc(row.coin)}</td><td>${fmt(row.actual_days,1)}天 / ${row.samples||0}根</td><td>${esc(row.strategy)}</td><td>${esc(strategyFamilyText(row.family))}</td><td>${strategySignalText(row.current_signal)}</td><td class="${Number(train.net_bps)>=0?'scoreGood':'scoreBad'}">${fmt(train.net_bps,1)} bps</td><td class="${Number(test.net_bps)>=0?'scoreGood':'scoreBad'}">${fmt(test.net_bps,1)} bps</td><td class="${Number(test.max_drawdown_bps)>=-500?'scoreGood':'scoreBad'}">${fmt(test.max_drawdown_bps,1)} bps</td><td>${test.trades||0}</td><td>${fmt(Number(test.win_rate||0)*100,1)}%</td><td>${fmt(test.profit_factor,2)}</td><td>${fmt(test.avg_trade_bps,1)} bps</td><td style="text-align:left">${esc(JSON.stringify(row.params||{}))}</td>`;
+    tr.title='点击查看训练段、样本外和风险详情';tr.onclick=()=>showStrategyLabDetail(row);body.appendChild(tr);
+  });
+  if(!rows.length)body.innerHTML='<tr><td colspan="14" class="muted">还没有回测结果，点击“运行新回测”</td></tr>';
+  const failures=(data.failures||[]).map(item=>`${item.coin}: ${item.error}`).join('；');
+  document.getElementById('labNote').textContent=[data.note||'',failures?`未能读取：${failures}`:''].filter(Boolean).join(' ');
+}
+async function runStrategyLab(refresh){
+  const status=document.getElementById('labStatus');
+  const coins=(document.getElementById('labCoins').value||'').trim();
+  const interval=document.getElementById('labInterval').value;
+  const days=document.getElementById('labDays').value;
+  const cost=document.getElementById('labCost').value;
+  if(!coins){status.textContent='至少填写一个币种';return;}
+  status.textContent=refresh?'正在下载K线并回测，可能需要几十秒...':'正在读取上次结果...';
+  try{
+    const query=new URLSearchParams({coins,interval,days,cost_bps:cost,limit:'80'});if(refresh)query.set('refresh','1');
+    const response=await fetch('strategy_lab?'+query.toString());const data=await response.json();
+    if(!data.ok){renderStrategyLab(data);const failed=(data.failures||[]).map(item=>`${item.coin}: ${item.error}`).join('；');throw new Error(data.error||failed||'回测失败');}renderStrategyLab(data);
+    status.textContent=`完成：${data.evaluations||0} 组，${data.promotable||0} 组达到继续研究门槛；未授权真实下单。`;
+  }catch(e){status.textContent='策略实验室失败：'+e.message;}
+}
+function openStrategyLabDialog(){strategyLabDlg.showModal();runStrategyLab(false);}
 function openLeadlagDialog(){leadlagDlg.showModal();loadLeadlag();}
 async function saveLeadlagConfig(){
   const status=document.getElementById('llSaveStatus'),token=adminTokenValue();if(!token){status.textContent='请先在全局设置填写管理口令';return;}
@@ -5531,6 +5673,8 @@ class AltServerState:
         self.last_live_account_db_save = 0.0
         self.strategy_cycle_lock = threading.Lock()
         self.leadlag_lock = threading.Lock()
+        self.strategy_lab_lock = threading.Lock()
+        self.strategy_lab_cache = None
         self.realtime_strategy_status = {
             "running": False, "last_eval_ts": None, "last_event_ts": None,
             "last_error": None, "events": 0, "last_revision": 0,
@@ -5801,6 +5945,44 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                 "l2book": l2_snapshot,
                 "admin_enabled": bool(state.config.get("admin_token")),
             })
+            return
+        if parsed.path == "/strategy_lab":
+            coins = split_symbols((query.get("coins") or ["BTC,ETH,SOL"])[0])[:12]
+            interval = str((query.get("interval") or ["15m"])[0]).lower()
+            days = max(7, min(180, int((query.get("days") or ["30"])[0])))
+            cost_bps = max(0.0, min(500.0, float((query.get("cost_bps") or ["12"])[0])))
+            limit = max(1, min(200, int((query.get("limit") or ["80"])[0])))
+            refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
+            if not coins:
+                json_response(self, {"ok": False, "error": "至少填写一个币种"}, status=400)
+                return
+            if interval not in ("5m", "15m", "1h", "4h"):
+                json_response(self, {"ok": False, "error": "周期只允许 5m/15m/1h/4h"}, status=400)
+                return
+            cache_key = (tuple(coins), interval, days, round(cost_bps, 6), limit)
+            with state.strategy_lab_lock:
+                cached = state.strategy_lab_cache
+            if not refresh and cached and cached.get("key") == cache_key and time.time() - cached.get("ts", 0) < 300:
+                json_response(self, {**cached["payload"], "source": "memory_cache"})
+                return
+            if not refresh:
+                stored = load_latest_strategy_lab_run(db_path=state.db_path)
+                if stored:
+                    json_response(self, {**stored, "source": "sqlite_latest"})
+                    return
+                json_response(self, {"ok": True, "rows": [], "source": "empty", "note": "点击运行回测生成第一批结果"})
+                return
+            try:
+                payload = run_strategy_lab(
+                    tuple(coins), days=days, interval=interval,
+                    round_trip_cost_bps=cost_bps, limit=limit,
+                )
+                payload["run_id"] = save_strategy_lab_run(payload, db_path=state.db_path)
+                with state.strategy_lab_lock:
+                    state.strategy_lab_cache = {"key": cache_key, "ts": time.time(), "payload": payload}
+                json_response(self, {**payload, "source": "hyperliquid_candles"})
+            except (URLError, HTTPError, TimeoutError, RuntimeError, ValueError, KeyError, IndexError, TypeError, OSError) as exc:
+                json_response(self, {"ok": False, "error": str(exc)}, status=500)
             return
         if parsed.path == "/history":
             asset = (query.get("asset") or [""])[0].upper()
