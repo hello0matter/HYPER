@@ -42,6 +42,17 @@ class CryptoStrategyLabTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
         sleep.assert_called_once_with(1.5)
 
+    def test_lab_requeues_a_rate_limited_coin(self):
+        candles = candles_from_closes([100 + i * .1 for i in range(260)])
+        with patch.object(lab, "fetch_hl_ohlcv", side_effect=[RuntimeError("HTTP 429"), candles]) as fetch, patch.object(
+            lab.time, "sleep",
+        ):
+            result = lab.run_strategy_lab(("BTC",), days=30, interval="15m")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["failures"], [])
+        self.assertEqual(result["evaluations"], len(lab.strategy_specs()))
+        self.assertEqual(fetch.call_count, 2)
+
     def test_history_fetch_paginates_beyond_exchange_page_limit(self):
         def item(ts):
             return {"t": ts, "o": "1", "h": "2", "l": ".5", "c": "1.5", "v": "10"}

@@ -365,18 +365,28 @@ def evaluate_coin(coin, candles, *, interval="15m", round_trip_cost_bps=12.0):
 
 def run_strategy_lab(coins=("BTC", "ETH", "SOL"), *, days=30, interval="15m", round_trip_cost_bps=12.0, limit=50):
     rows, failures, coverage = [], [], []
-    for coin in coins:
-        try:
-            candles = fetch_hl_ohlcv(coin, days=days, interval=interval)
-            actual_days = ((candles[-1]["ts"] - candles[0]["ts"]) / 86_400_000) if len(candles) > 1 else 0.0
-            coverage.append({"coin": coin, "candles": len(candles), "actual_days": actual_days})
-            evaluated = evaluate_coin(coin, candles, interval=interval, round_trip_cost_bps=round_trip_cost_bps)
-            for row in evaluated:
-                row["actual_days"] = actual_days
-            rows.extend(evaluated)
-        except Exception as exc:  # Keep the other markets usable after one API failure.
-            failures.append({"coin": coin, "error": str(exc)})
-        time.sleep(0.35)
+    pending = list(coins)
+    for pass_index in range(2):
+        retry = []
+        for coin in pending:
+            try:
+                candles = fetch_hl_ohlcv(coin, days=days, interval=interval)
+                actual_days = ((candles[-1]["ts"] - candles[0]["ts"]) / 86_400_000) if len(candles) > 1 else 0.0
+                coverage.append({"coin": coin, "candles": len(candles), "actual_days": actual_days})
+                evaluated = evaluate_coin(coin, candles, interval=interval, round_trip_cost_bps=round_trip_cost_bps)
+                for row in evaluated:
+                    row["actual_days"] = actual_days
+                rows.extend(evaluated)
+            except Exception as exc:  # Keep the other markets usable after one API failure.
+                if pass_index == 0 and "429" in str(exc):
+                    retry.append(coin)
+                else:
+                    failures.append({"coin": coin, "error": str(exc)})
+            time.sleep(0.35)
+        pending = retry
+        if not pending:
+            break
+        time.sleep(5.0)
     rows.sort(key=lambda item: (bool(item["promotable"]), item["score"]), reverse=True)
     truncated = [item for item in coverage if item["actual_days"] + 1 < float(days)]
     coverage_note = ""
