@@ -67,9 +67,21 @@ class CryptoStrategyLabTests(unittest.TestCase):
         families = {item.family for item in lab.strategy_specs()}
         self.assertEqual(families, {
             "ema_cross", "macd", "rsi_reversion", "bollinger_reversion",
-            "donchian_breakout", "supertrend", "momentum",
+            "donchian_breakout", "supertrend", "momentum", "macd_sma_filter",
+            "bollinger_rsi", "stoch_rsi", "ichimoku_ema", "triple_ema",
+            "squeeze_breakout", "obv_trend", "supertrend_adx",
+            "bollinger_breakout", "turtle_atr",
         })
-        self.assertGreaterEqual(len(lab.strategy_specs()), 30)
+        self.assertGreaterEqual(len(lab.strategy_specs()), 60)
+
+    def test_every_catalog_strategy_produces_valid_targets(self):
+        closes = [100 + math.sin(i / 7) * 4 + i * .01 for i in range(420)]
+        candles = candles_from_closes(closes)
+        for spec in lab.strategy_specs():
+            with self.subTest(strategy=spec.name):
+                targets = lab.strategy_targets(candles, spec)
+                self.assertEqual(len(targets), len(candles))
+                self.assertLessEqual(set(targets), {-1, 0, 1})
 
     def test_costs_can_turn_small_edge_negative(self):
         closes = [100 * math.exp(i * 0.00005) for i in range(300)]

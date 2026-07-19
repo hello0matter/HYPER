@@ -3941,12 +3941,12 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
   </div>
   <div class="grid">
     <div class="metric"><div class="muted">策略参数组合</div><div id="labEvaluations">-</div></div>
-    <div class="metric"><div class="muted">达到研究门槛</div><div id="labPromotable">-</div></div>
+    <div class="metric"><div class="muted">单窗口通过（禁止实盘）</div><div id="labPromotable">-</div></div>
     <div class="metric"><div class="muted">数据源</div><div id="labSource">-</div></div>
     <div class="metric"><div class="muted">更新时间</div><div id="labTime">-</div></div>
   </div>
-  <p class="scoreMid">“达到研究门槛”只表示训练段和样本外段都为正、样本外交易次数及盈亏比达标；它不是自动开真实仓许可。公开 TradingView 策略还需在桌面版登录后加入图表，再与这里的 Hyperliquid 结果交叉验证。</p>
-  <div class="paperTableWrap" style="max-height:520px"><table id="strategyLabTbl"><thead><tr><th>门槛</th><th>币种</th><th>实际历史</th><th>策略</th><th>类型</th><th>当前信号</th><th>训练净收益</th><th>样本外净收益</th><th>样本外回撤</th><th>交易数</th><th>胜率</th><th>盈亏比</th><th>平均每笔</th><th>参数</th></tr></thead><tbody></tbody></table></div>
+  <p class="scoreMid">“单窗口通过”只表示当前币种、当前周期、当前历史窗口的训练段和样本外段都为正，交易次数及盈亏比达到最低门槛；仍然禁止自动真实下单。只有多个周期、多个历史窗口重复通过，并经过实时模拟，才可进入下一层验证。</p>
+  <div class="paperTableWrap" style="max-height:520px"><table id="strategyLabTbl"><thead><tr><th>状态</th><th>币种</th><th>实际历史</th><th>策略</th><th>类型</th><th>参考来源</th><th>当前信号</th><th>训练净收益</th><th>样本外净收益</th><th>样本外回撤</th><th>交易数</th><th>胜率</th><th>盈亏比</th><th>平均每笔</th><th>参数</th></tr></thead><tbody></tbody></table></div>
   <p id="labNote" class="subtle"></p>
 </div>
 </dialog>
@@ -4260,7 +4260,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>训练段</code>：较早的 60% K 线，用来观察这套固定参数在过去是否有基本逻辑。它不是挑完参数后重新美化的成绩。</p>
 <p><code>样本外</code>：较新的 40% K 线，排名只看这一段。可以理解成参数先定好，再参加一次没用于训练的考试。</p>
 <p><code>下一根开盘成交</code>：本根收盘后才能知道 RSI、MACD 或突破信号，所以程序最早只能用下一根开盘价成交，避免偷偷使用未来价格。</p>
-<p><code>达到研究门槛</code>：训练和样本外净收益都为正，样本外至少 6 笔、盈亏比至少 1.10、回撤未超过门槛。它只代表值得继续做 30/60/90 天、多周期和实时模拟，不是实盘授权。</p>
+<p><code>单窗口通过（禁止实盘）</code>：训练和样本外净收益都为正，样本外至少 6 笔、盈亏比至少 1.10、回撤未超过门槛。它只代表当前一个币、一个周期、一个历史窗口值得继续研究，不是策略成功，更不是实盘授权。</p>
 <p><code>往返成本 bps</code>：估算一笔从开仓到平仓的总手续费和滑点。默认 12 bps。真实成本会随 maker/taker 费率、盘口、币种和订单大小变化。</p>
 <p><code>当前信号</code>：最后一根已获取 K 线得出的做多、做空或空仓目标。它不是实时盘口信号；15分钟策略只有在新15分钟K线确认后才应变化。</p>
 <p><code>实际历史</code>：必须看这一列，而不是只看你填写的天数。Hyperliquid 公开 candleSnapshot 约有 5000 根上限，所以 5分钟大约只有17天、15分钟大约52天；更长历史需要 TradingView 或授权历史数据源。</p>
@@ -5192,7 +5192,10 @@ function strategyFamilyText(value){
   return ({
     ema_cross:'EMA趋势',macd:'MACD动量',rsi_reversion:'RSI均值回归',
     bollinger_reversion:'布林均值回归',donchian_breakout:'唐奇安突破',
-    supertrend:'Supertrend趋势',momentum:'动量趋势'
+    supertrend:'Supertrend趋势',momentum:'动量趋势',macd_sma_filter:'MACD趋势过滤',
+    bollinger_rsi:'布林+RSI确认',stoch_rsi:'StochRSI',ichimoku_ema:'一目均衡+EMA',
+    triple_ema:'三EMA排列',squeeze_breakout:'波动挤压突破',obv_trend:'OBV量价趋势',
+    supertrend_adx:'Supertrend+ADX',bollinger_breakout:'布林突破',turtle_atr:'海龟+ATR'
   })[value]||value||'-';
 }
 function showStrategyLabDetail(row){
@@ -5200,11 +5203,12 @@ function showStrategyLabDetail(row){
   document.getElementById('detailTitle').textContent=`策略回测：${row.coin} / ${row.strategy}`;
   document.getElementById('detailBody').innerHTML=`
     <div class="detailGrid">
-      <div class="detailBox"><div class="muted">研究门槛</div><div class="${row.promotable?'scoreGood':'scoreBad'}">${row.promotable?'达到，仍需继续验证':'未达到'}</div></div>
+      <div class="detailBox"><div class="muted">单窗口门槛</div><div class="${row.promotable?'scoreGood':'scoreBad'}">${row.promotable?'通过，但禁止实盘':'未通过'}</div></div>
       <div class="detailBox"><div class="muted">当前收盘信号</div><div>${strategySignalText(row.current_signal)}</div></div>
       <div class="detailBox"><div class="muted">币种 / 周期</div><div>${esc(row.coin)} / ${esc(row.interval)}</div></div>
       <div class="detailBox"><div class="muted">实际历史覆盖</div><div>${fmt(row.actual_days,1)} 天 / ${row.samples||0} 根</div></div>
       <div class="detailBox"><div class="muted">参数</div><div>${esc(JSON.stringify(row.params||{}))}</div></div>
+      <div class="detailBox"><div class="muted">参考来源</div><div>${esc(row.reference||'经典公开技术规则')}</div></div>
       <div class="detailBox"><div class="muted">训练净收益 / 回撤</div><div>${fmt(train.net_bps,1)} / ${fmt(train.max_drawdown_bps,1)} bps</div></div>
       <div class="detailBox"><div class="muted">样本外净收益 / 回撤</div><div>${fmt(test.net_bps,1)} / ${fmt(test.max_drawdown_bps,1)} bps</div></div>
       <div class="detailBox"><div class="muted">训练交易 / 胜率 / 盈亏比</div><div>${train.trades||0} / ${fmt(Number(train.win_rate||0)*100,1)}% / ${fmt(train.profit_factor,2)}</div></div>
@@ -5213,7 +5217,7 @@ function showStrategyLabDetail(row){
       <div class="detailBox"><div class="muted">样本外暴露时间</div><div>${fmt(Number(test.exposure||0)*100,1)}%</div></div>
     </div>
     <h3>怎么理解</h3>
-    <div class="detailText">信号在一根 K 线收盘后才确定，并按下一根 K 线开盘成交。收益已经扣除策略实验室设置的估算往返成本，但没有逐根模拟动态盘口深度、资金费和强平风险。“达到门槛”只允许进入更长周期回测和实时模拟，不代表可以直接真实下单。</div>`;
+    <div class="detailText">信号在一根 K 线收盘后才确定，并按下一根 K 线开盘成交。收益已经扣除策略实验室设置的估算往返成本，但没有逐根模拟动态盘口深度、资金费和强平风险。“单窗口通过”只允许进入更多周期回测和实时模拟，不代表可以直接真实下单。</div>`;
   detailDlg.showModal();
 }
 function renderStrategyLab(data){
@@ -5228,10 +5232,11 @@ function renderStrategyLab(data){
   document.getElementById('labTime').textContent=data.ts?fmtBeijingDateTime(data.ts):'-';
   rows.forEach(row=>{
     const test=row.test||{},train=row.train||{},tr=document.createElement('tr');
-    tr.innerHTML=`<td class="${row.promotable?'passChip':'blockChip'}">${row.promotable?'研究候选':'未通过'}</td><td>${esc(row.coin)}</td><td>${fmt(row.actual_days,1)}天 / ${row.samples||0}根</td><td>${esc(row.strategy)}</td><td>${esc(strategyFamilyText(row.family))}</td><td>${strategySignalText(row.current_signal)}</td><td class="${Number(train.net_bps)>=0?'scoreGood':'scoreBad'}">${fmt(train.net_bps,1)} bps</td><td class="${Number(test.net_bps)>=0?'scoreGood':'scoreBad'}">${fmt(test.net_bps,1)} bps</td><td class="${Number(test.max_drawdown_bps)>=-500?'scoreGood':'scoreBad'}">${fmt(test.max_drawdown_bps,1)} bps</td><td>${test.trades||0}</td><td>${fmt(Number(test.win_rate||0)*100,1)}%</td><td>${fmt(test.profit_factor,2)}</td><td>${fmt(test.avg_trade_bps,1)} bps</td><td style="text-align:left">${esc(JSON.stringify(row.params||{}))}</td>`;
+    const source=(row.reference||'经典公开规则').replace('TradingView社区思路参考（按公开规则独立复刻，不是原作者源码）：','TV参考：');
+    tr.innerHTML=`<td class="${row.promotable?'passChip':'blockChip'}">${row.promotable?'单窗通过・禁实盘':'未通过'}</td><td>${esc(row.coin)}</td><td>${fmt(row.actual_days,1)}天 / ${row.samples||0}根</td><td>${esc(row.strategy)}</td><td>${esc(strategyFamilyText(row.family))}</td><td style="text-align:left">${esc(source)}</td><td>${strategySignalText(row.current_signal)}</td><td class="${Number(train.net_bps)>=0?'scoreGood':'scoreBad'}">${fmt(train.net_bps,1)} bps</td><td class="${Number(test.net_bps)>=0?'scoreGood':'scoreBad'}">${fmt(test.net_bps,1)} bps</td><td class="${Number(test.max_drawdown_bps)>=-500?'scoreGood':'scoreBad'}">${fmt(test.max_drawdown_bps,1)} bps</td><td>${test.trades||0}</td><td>${fmt(Number(test.win_rate||0)*100,1)}%</td><td>${fmt(test.profit_factor,2)}</td><td>${fmt(test.avg_trade_bps,1)} bps</td><td style="text-align:left">${esc(JSON.stringify(row.params||{}))}</td>`;
     tr.title='点击查看训练段、样本外和风险详情';tr.onclick=()=>showStrategyLabDetail(row);body.appendChild(tr);
   });
-  if(!rows.length)body.innerHTML='<tr><td colspan="14" class="muted">还没有回测结果，点击“运行新回测”</td></tr>';
+  if(!rows.length)body.innerHTML='<tr><td colspan="15" class="muted">还没有回测结果，点击“运行新回测”</td></tr>';
   const failures=(data.failures||[]).map(item=>`${item.coin}: ${item.error}`).join('；');
   document.getElementById('labNote').textContent=[data.note||'',failures?`未能读取：${failures}`:''].filter(Boolean).join(' ');
 }
@@ -5244,7 +5249,7 @@ async function runStrategyLab(refresh){
   if(!coins){status.textContent='至少填写一个币种';return;}
   status.textContent=refresh?'正在下载K线并回测，可能需要几十秒...':'正在读取上次结果...';
   try{
-    const query=new URLSearchParams({coins,interval,days,cost_bps:cost,limit:'80'});if(refresh)query.set('refresh','1');
+    const query=new URLSearchParams({coins,interval,days,cost_bps:cost,limit:'1000'});if(refresh)query.set('refresh','1');
     const response=await fetch('strategy_lab?'+query.toString());const data=await response.json();
     if(!data.ok){renderStrategyLab(data);const failed=(data.failures||[]).map(item=>`${item.coin}: ${item.error}`).join('；');throw new Error(data.error||failed||'回测失败');}renderStrategyLab(data);
     status.textContent=`完成：${data.evaluations||0} 组，${data.promotable||0} 组达到继续研究门槛；未授权真实下单。`;
@@ -5951,7 +5956,7 @@ class AltRequestHandler(BaseHTTPRequestHandler):
             interval = str((query.get("interval") or ["15m"])[0]).lower()
             days = max(7, min(180, int((query.get("days") or ["30"])[0])))
             cost_bps = max(0.0, min(500.0, float((query.get("cost_bps") or ["12"])[0])))
-            limit = max(1, min(200, int((query.get("limit") or ["80"])[0])))
+            limit = max(1, min(1000, int((query.get("limit") or ["1000"])[0])))
             refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
             if not coins:
                 json_response(self, {"ok": False, "error": "至少填写一个币种"}, status=400)

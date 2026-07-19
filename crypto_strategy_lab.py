@@ -31,6 +31,7 @@ class StrategySpec:
     family: str
     name: str
     params: dict
+    reference: str = "经典公开技术规则（项目独立实现）"
 
 
 def _request_json(payload):
@@ -163,6 +164,70 @@ def _atr(candles, period=14):
     return _ema(tr, period)
 
 
+def _sma_optional(values, period):
+    out = [None] * len(values)
+    for i in range(period - 1, len(values)):
+        window = values[i - period + 1:i + 1]
+        if all(value is not None for value in window):
+            out[i] = sum(window) / period
+    return out
+
+
+def _stochastic_rsi(values, rsi_period=14, stoch_period=14, smooth=3):
+    rsi = _rsi(values, rsi_period)
+    raw = [None] * len(values)
+    for i in range(stoch_period - 1, len(values)):
+        window = rsi[i - stoch_period + 1:i + 1]
+        if any(value is None for value in window):
+            continue
+        low, high = min(window), max(window)
+        raw[i] = 50.0 if high == low else (rsi[i] - low) / (high - low) * 100
+    k = _sma_optional(raw, smooth)
+    return k, _sma_optional(k, smooth)
+
+
+def _obv(candles):
+    out, value = [], 0.0
+    for i, row in enumerate(candles):
+        if i:
+            if row["close"] > candles[i - 1]["close"]:
+                value += row["volume"]
+            elif row["close"] < candles[i - 1]["close"]:
+                value -= row["volume"]
+        out.append(value)
+    return out
+
+
+def _adx(candles, period=14):
+    plus_dm, minus_dm, true_range = [0.0], [0.0], [0.0]
+    for i in range(1, len(candles)):
+        up = candles[i]["high"] - candles[i - 1]["high"]
+        down = candles[i - 1]["low"] - candles[i]["low"]
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+        previous = candles[i - 1]["close"]
+        true_range.append(max(
+            candles[i]["high"] - candles[i]["low"],
+            abs(candles[i]["high"] - previous), abs(candles[i]["low"] - previous),
+        ))
+    atr, plus_avg, minus_avg = _ema(true_range, period), _ema(plus_dm, period), _ema(minus_dm, period)
+    dx = []
+    for tr, plus, minus in zip(atr, plus_avg, minus_avg):
+        if tr in (None, 0) or plus is None or minus is None:
+            dx.append(0.0)
+            continue
+        plus_di, minus_di = 100 * plus / tr, 100 * minus / tr
+        total = plus_di + minus_di
+        dx.append(0.0 if total == 0 else abs(plus_di - minus_di) / total * 100)
+    return _ema(dx, period)
+
+
+def _rolling_mid(high, low, period, index):
+    if index < period - 1:
+        return None
+    return (max(high[index - period + 1:index + 1]) + min(low[index - period + 1:index + 1])) / 2
+
+
 def _hold_targets(raw):
     target, out = 0, []
     for item in raw:
@@ -268,6 +333,139 @@ def strategy_targets(candles, spec):
             if trend[i] is None:
                 continue
             raw[i] = 1 if momentum > 0 and close[i] >= trend[i] else (-1 if momentum < 0 and close[i] <= trend[i] else 0)
+    elif family == "macd_sma_filter":
+        fast, slow, trend = _ema(close, p["fast"]), _ema(close, p["slow"]), _sma(close, p["trend"])
+        line = [0.0 if a is None or b is None else a - b for a, b in zip(fast, slow)]
+        signal = _ema(line, p["signal"])
+        raw = [
+            0 if sig is None or filt is None else (
+                1 if macd > sig and price > filt else (-1 if macd < sig and price < filt else 0)
+            )
+            for price, macd, sig, filt in zip(close, line, signal, trend)
+        ]
+    elif family == "bollinger_rsi":
+        mid, sd, rsi = _sma(close, p["period"]), _rolling_std(close, p["period"]), _rsi(close, p["rsi"])
+        position = 0
+        for i, price in enumerate(close):
+            if mid[i] is None or sd[i] is None or rsi[i] is None:
+                raw[i] = position
+                continue
+            upper, lower = mid[i] + p["dev"] * sd[i], mid[i] - p["dev"] * sd[i]
+            if position == 0 and price < lower and rsi[i] <= p["lower"]:
+                position = 1
+            elif position == 0 and price > upper and rsi[i] >= p["upper"]:
+                position = -1
+            elif position == 1 and price >= mid[i]:
+                position = 0
+            elif position == -1 and price <= mid[i]:
+                position = 0
+            raw[i] = position
+    elif family == "stoch_rsi":
+        k, d = _stochastic_rsi(close, p["rsi"], p["stoch"], p["smooth"])
+        position = 0
+        for i in range(1, len(close)):
+            if None in (k[i - 1], d[i - 1], k[i], d[i]):
+                raw[i] = position
+                continue
+            if position <= 0 and k[i - 1] <= d[i - 1] and k[i] > d[i] and k[i] <= p["lower"]:
+                position = 1
+            elif position >= 0 and k[i - 1] >= d[i - 1] and k[i] < d[i] and k[i] >= p["upper"]:
+                position = -1
+            elif position == 1 and k[i] >= 50:
+                position = 0
+            elif position == -1 and k[i] <= 50:
+                position = 0
+            raw[i] = position
+    elif family == "ichimoku_ema":
+        trend = _ema(close, p["ema"])
+        for i, price in enumerate(close):
+            conversion = _rolling_mid(high, low, p["conversion"], i)
+            base = _rolling_mid(high, low, p["base"], i)
+            if conversion is None or base is None or trend[i] is None:
+                continue
+            raw[i] = 1 if conversion > base and price > trend[i] else (
+                -1 if conversion < base and price < trend[i] else 0
+            )
+    elif family == "triple_ema":
+        fast, middle, slow = _ema(close, p["fast"]), _ema(close, p["middle"]), _ema(close, p["slow"])
+        raw = [
+            0 if None in (a, b, c) else (1 if a > b > c else (-1 if a < b < c else 0))
+            for a, b, c in zip(fast, middle, slow)
+        ]
+    elif family == "squeeze_breakout":
+        mid, sd, atr = _sma(close, p["period"]), _rolling_std(close, p["period"]), _atr(candles, p["period"])
+        position, previous_squeeze = 0, False
+        for i, price in enumerate(close):
+            if mid[i] is None or sd[i] is None or atr[i] is None:
+                raw[i] = position
+                continue
+            squeeze = (
+                mid[i] + p["bb"] * sd[i] < mid[i] + p["kc"] * atr[i]
+                and mid[i] - p["bb"] * sd[i] > mid[i] - p["kc"] * atr[i]
+            )
+            if previous_squeeze and not squeeze:
+                position = 1 if price > mid[i] else -1
+            elif position == 1 and price < mid[i]:
+                position = 0
+            elif position == -1 and price > mid[i]:
+                position = 0
+            raw[i] = position
+            previous_squeeze = squeeze
+    elif family == "obv_trend":
+        obv = _obv(candles)
+        obv_signal, price_trend = _ema(obv, p["obv_ema"]), _ema(close, p["price_ema"])
+        raw = [
+            0 if signal is None or trend is None else (
+                1 if volume_line > signal and price > trend else (
+                    -1 if volume_line < signal and price < trend else 0
+                )
+            )
+            for volume_line, signal, price, trend in zip(obv, obv_signal, close, price_trend)
+        ]
+    elif family == "supertrend_adx":
+        adx = _adx(candles, p["adx"])
+        base = strategy_targets(candles, StrategySpec(
+            "supertrend", "internal", {"period": p["period"], "mult": p["mult"]},
+        ))
+        raw = [direction if strength is not None and strength >= p["threshold"] else 0 for direction, strength in zip(base, adx)]
+    elif family == "bollinger_breakout":
+        mid, sd = _sma(close, p["period"]), _rolling_std(close, p["period"])
+        position = 0
+        for i, price in enumerate(close):
+            if mid[i] is None or sd[i] is None:
+                raw[i] = position
+                continue
+            upper, lower = mid[i] + p["dev"] * sd[i], mid[i] - p["dev"] * sd[i]
+            if position == 0 and price > upper:
+                position = 1
+            elif position == 0 and price < lower:
+                position = -1
+            elif position == 1 and price < mid[i]:
+                position = 0
+            elif position == -1 and price > mid[i]:
+                position = 0
+            raw[i] = position
+    elif family == "turtle_atr":
+        atr = _atr(candles, p["atr"])
+        position, peak, trough = 0, None, None
+        for i, price in enumerate(close):
+            if i < p["entry"] or atr[i] is None:
+                raw[i] = position
+                continue
+            upper, lower = max(high[i - p["entry"]:i]), min(low[i - p["entry"]:i])
+            if position == 0 and price > upper:
+                position, peak = 1, high[i]
+            elif position == 0 and price < lower:
+                position, trough = -1, low[i]
+            elif position == 1:
+                peak = max(peak, high[i])
+                if price < peak - p["mult"] * atr[i]:
+                    position, peak = 0, None
+            elif position == -1:
+                trough = min(trough, low[i])
+                if price > trough + p["mult"] * atr[i]:
+                    position, trough = 0, None
+            raw[i] = position
     else:
         raise ValueError(f"unknown strategy family: {family}")
     return _hold_targets(raw)
@@ -324,6 +522,7 @@ def backtest_targets(candles, targets, *, start=1, end=None, round_trip_cost_bps
 
 def strategy_specs():
     specs = []
+    community = "TradingView社区思路参考（按公开规则独立复刻，不是原作者源码）"
     for fast, slow in ((9, 21), (12, 36), (20, 50), (30, 90), (50, 200)):
         specs.append(StrategySpec("ema_cross", f"EMA {fast}/{slow}", {"fast": fast, "slow": slow}))
     for fast, slow, signal in ((8, 21, 5), (12, 26, 9), (19, 39, 9)):
@@ -338,6 +537,69 @@ def strategy_specs():
         specs.append(StrategySpec("supertrend", f"Supertrend {period} x{mult}", {"period": period, "mult": mult}))
     for lookback, ema in ((5, 20), (10, 30), (20, 50), (40, 100), (80, 200)):
         specs.append(StrategySpec("momentum", f"动量 {lookback} + EMA{ema}", {"lookback": lookback, "ema": ema}))
+    for fast, slow, signal, trend in ((8, 21, 5, 100), (12, 26, 9, 200), (19, 39, 9, 200)):
+        specs.append(StrategySpec(
+            "macd_sma_filter", f"MACD趋势过滤 {fast}/{slow}/{signal} + SMA{trend}",
+            {"fast": fast, "slow": slow, "signal": signal, "trend": trend},
+            f"{community}：MACD + SMA 200 Strategy (by ChartArt)",
+        ))
+    for period, dev, rsi, lower, upper in (
+        (20, 2.0, 14, 30, 70), (20, 2.0, 7, 25, 75),
+        (30, 2.0, 14, 30, 70), (20, 1.5, 14, 25, 75),
+    ):
+        specs.append(StrategySpec(
+            "bollinger_rsi", f"布林+RSI {period} x{dev} RSI{rsi}",
+            {"period": period, "dev": dev, "rsi": rsi, "lower": lower, "upper": upper},
+            f"{community}：Bollinger + RSI, Double Strategy (by ChartArt)",
+        ))
+    for rsi, stoch, smooth, lower, upper in ((14, 14, 3, 20, 80), (7, 14, 3, 20, 80), (21, 21, 3, 15, 85)):
+        specs.append(StrategySpec(
+            "stoch_rsi", f"StochRSI {rsi}/{stoch}/{smooth}",
+            {"rsi": rsi, "stoch": stoch, "smooth": smooth, "lower": lower, "upper": upper},
+            f"{community}：Stochastic RSI Strategy",
+        ))
+    for conversion, base, ema in ((9, 26, 200), (7, 22, 100), (12, 30, 200)):
+        specs.append(StrategySpec(
+            "ichimoku_ema", f"一目均衡交叉 {conversion}/{base} + EMA{ema}",
+            {"conversion": conversion, "base": base, "ema": ema},
+            f"{community}：Ichimoku TK Cross > EMA200 Crypto Strategy",
+        ))
+    for fast, middle, slow in ((5, 13, 34), (9, 21, 55), (20, 50, 100)):
+        specs.append(StrategySpec(
+            "triple_ema", f"三EMA排列 {fast}/{middle}/{slow}",
+            {"fast": fast, "middle": middle, "slow": slow},
+            f"{community}：CRYPTO 3EMA Strategy with TP/SL based on ATR（这里只复刻入场结构）",
+        ))
+    for period, bb, kc in ((20, 2.0, 1.5), (20, 2.0, 2.0), (30, 2.0, 1.5)):
+        specs.append(StrategySpec(
+            "squeeze_breakout", f"波动挤压突破 {period} BB{bb}/KC{kc}",
+            {"period": period, "bb": bb, "kc": kc},
+            f"{community}：Crypto Squeeze Strategy",
+        ))
+    for obv_ema, price_ema in ((10, 20), (20, 50), (30, 100)):
+        specs.append(StrategySpec(
+            "obv_trend", f"OBV趋势 {obv_ema} + EMA{price_ema}",
+            {"obv_ema": obv_ema, "price_ema": price_ema},
+            f"{community}：OBV Accumulation / Distribution Strategy Crypto",
+        ))
+    for period, mult, adx, threshold in ((10, 2.0, 14, 20), (10, 3.0, 14, 25), (14, 2.5, 14, 30)):
+        specs.append(StrategySpec(
+            "supertrend_adx", f"Supertrend+ADX {period} x{mult} ADX{threshold}",
+            {"period": period, "mult": mult, "adx": adx, "threshold": threshold},
+            f"{community}：ADX+DI+SUPERTREND Strategy",
+        ))
+    for period, dev in ((20, 1.5), (20, 2.0), (30, 2.0)):
+        specs.append(StrategySpec(
+            "bollinger_breakout", f"布林突破 {period} x{dev}",
+            {"period": period, "dev": dev},
+            f"{community}：Bollinger Bands Breakout Strategy",
+        ))
+    for entry, atr, mult in ((20, 14, 2.0), (40, 14, 2.5), (55, 20, 3.0)):
+        specs.append(StrategySpec(
+            "turtle_atr", f"海龟突破+ATR {entry}/{atr} x{mult}",
+            {"entry": entry, "atr": atr, "mult": mult},
+            f"{community}：Turtle trading strategy (Donchian/ATR)",
+        ))
     return specs
 
 
@@ -355,7 +617,7 @@ def evaluate_coin(coin, candles, *, interval="15m", round_trip_cost_bps=12.0):
         score = test["net_bps"] + max(test["max_drawdown_bps"], -2000) * 0.35 + min(test["trades"], 20) * 2
         results.append({
             "coin": coin, "interval": interval, "family": spec.family, "strategy": spec.name,
-            "params": spec.params, "samples": len(candles), "split_index": split,
+            "params": spec.params, "reference": spec.reference, "samples": len(candles), "split_index": split,
             "train": train, "test": test, "stable": stable, "promotable": promotable,
             "score": score, "current_signal": int(targets[-1]),
         })
