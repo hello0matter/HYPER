@@ -38,7 +38,7 @@ python hyperliquid_correlation_monitor.py --server
 - `GET /history?asset=SOL&limit=200`：某个币的历史记录。
 - `GET /paper?limit=200`：模拟盘持仓、历史平仓、权益曲线和当前模拟参数。
 - `GET /live?fresh=1`：真实账户、真实交易记录、l2Book 状态，以及本轮每个候选被哪条规则过滤的诊断结果。
-- `GET /strategy_lab?coins=BTC,ETH,SOL&interval=15m&days=30&cost_bps=12&refresh=1`：下载 Hyperliquid K线并运行常见虚拟货币策略的训练/样本外回测；不触发真实下单。
+- `GET /strategy_lab?coins=BTC,ETH,SOL,DOGE,XRP,ADA,AVAX,LINK,SUI,AAVE,UNI&interval=4h&days=730&cost_bps=13&max_drawdown_pct=25&refresh=1`：下载 Hyperliquid K线并运行常见虚拟货币策略的训练/样本外回测；不触发真实下单。省略参数时也使用这套第一轮研究默认值。
 - `GET /strategy_pine?family=...&params=...&cost_bps=12`：为策略实验室内置参数生成可复制的 Pine Script v6；只生成项目独立实现，不返回社区受保护源码。
 
 ### 虚拟货币策略实验室
@@ -49,13 +49,15 @@ Dashboard 顶部“策略实验室”目前覆盖 17 类、62 组固定参数。
 
 页面把这两段显示成人话“较早行情”和“较新行情”，并可填写假设投入 USDC，直接查看全历史、较新行情的收益百分比、约赚/约亏金额及最大回落金额。全历史只用于描述，不参与通过门槛，避免把未来数据泄漏到筛选过程。未通过的行会列出具体失败原因。点击任意策略可生成、查看、一键复制或下载对应 Pine v6 代码，再粘贴到 TradingView Pine 编辑器对照测试。
 
-“达到研究门槛”不代表可以直接真实下单。至少还要在 30/60/90 天、5m/15m/1h 等窗口重复验证，确认结果不是只在某个币最近一段行情有效，再进入实时模拟。当前 Hyperliquid 真实执行器是双腿相关性策略；策略实验室中的 TradingView 风格单腿方向策略保持独立，不会误接到已有真实交易开关。
+“达到研究门槛”不代表可以直接真实下单。页面默认采用 Vibe AI 研究计划的第一轮设置：11个高流动性币、4小时K线、730天、往返13bps成本、25%最大回撤门槛；“恢复推荐参数”可一键填回。之后仍要用4小时成本压力、1小时和日线等独立窗口复验，确认结果不是只在某个币最近一段行情有效，再进入实时模拟。当前 Hyperliquid 真实执行器是双腿相关性策略；策略实验室中的 TradingView 风格单腿方向策略保持独立，不会误接到已有真实交易开关。
 
 Hyperliquid 公开 `candleSnapshot` 目前约有 5000 根 K 线的历史上限，因此 5m 实际最多约 17 天、15m 约 52 天、1h 约 208 天、4h 约 833 天。页面按周期限制请求天数并突出显示每个币真正取得的 K 线数量和覆盖天数。需要输入 2000 天时应选择日线；实际长度仍受币种上线时间限制。需要更长的细周期回测时，应接入 TradingView 导出或有授权的历史数据源，再用 Hyperliquid 最近数据做执行市场复验。
 
 TradingView 可以用于发现官方内置和社区公开策略，但没有官方接口供本项目任意批量下载全部社区源码。免费登录后可以在“指标、指标和策略”中搜索并加入图表，随后打开“策略测试器”查看结果。开源 Pine 脚本只应在页面允许查看源码且符合作者许可证时人工移植；受保护和仅邀请脚本不能下载源码。本项目最终使用 Hyperliquid 自身 K线复验，避免 TradingView 与实际执行市场的价格、K线边界和成本不一致。
 
 本次社区脚本名称、TradingView 原始 Profit Factor、交易数和 Hyperliquid 多周期复验结论记录在 [`docs/tradingview_strategy_research.md`](docs/tradingview_strategy_research.md)。
+
+Vibe AI 首轮计划及 11 个币、5 个窗口、3,410 组实际复验的诚实结果记录在 [`docs/vibe_crypto_batch_results.md`](docs/vibe_crypto_batch_results.md)。当前没有策略同时通过全部窗口。
 
 ### 模拟盘 / 纸面交易
 

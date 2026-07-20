@@ -3931,18 +3931,18 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <dialog id="strategyLabDlg" class="wideDialog">
 <div class="helpHead"><h2>虚拟货币策略实验室</h2><button onclick="strategyLabDlg.close()">关闭</button></div>
 <div class="helpBody">
-  <p>统一使用 Hyperliquid K线测试常见策略。以30天为例：先用较早约18天检查规则，再用较新约12天参加一次“没看过答案的考试”。信号在本根收盘计算、下一根开盘成交，并扣除配置的往返成本。</p>
+  <p>统一使用 Hyperliquid K线测试常见策略。推荐先用4小时K线和约730天历史：前60%检查规则，后40%参加一次“没看过答案的考试”。信号在本根收盘计算、下一根开盘成交，并扣除配置的往返成本。</p>
   <div class="paperActions">
-    <label>币种<input id="labCoins" value="BTC,ETH,SOL" style="width:180px"></label>
-    <label>周期<select id="labInterval" onchange="updateLabDayLimit()"><option value="5m">5分钟</option><option value="15m" selected>15分钟</option><option value="1h">1小时</option><option value="4h">4小时</option><option value="1d">日线</option></select></label>
-    <label>请求历史天数<input id="labDays" type="number" min="7" max="52" value="30" style="width:85px"></label>
-    <label>往返成本bps<input id="labCost" type="number" min="0" max="500" value="12" step="0.5" style="width:75px"></label>
-    <label>最大回撤门槛%<input id="labMaxDrawdown" type="number" min="1" max="100" value="12" step="1" style="width:75px"></label>
+    <label>币种<input id="labCoins" value="BTC,ETH,SOL,DOGE,XRP,ADA,AVAX,LINK,SUI,AAVE,UNI" style="width:290px"></label>
+    <label>周期<select id="labInterval" onchange="updateLabDayLimit()"><option value="5m">5分钟</option><option value="15m">15分钟</option><option value="1h">1小时</option><option value="4h" selected>4小时</option><option value="1d">日线</option></select></label>
+    <label>请求历史天数<input id="labDays" type="number" min="7" max="833" value="730" style="width:85px"></label>
+    <label>往返成本bps<input id="labCost" type="number" min="0" max="500" value="13" step="0.5" style="width:75px"></label>
+    <label>最大回撤门槛%<input id="labMaxDrawdown" type="number" min="1" max="100" value="25" step="1" style="width:75px"></label>
     <label>假设投入USDC<input id="labCapital" type="number" min="1" max="10000000" value="100" step="10" style="width:90px" onchange="if(latestStrategyLabData)renderStrategyLab(latestStrategyLabData)"></label>
-    <button onclick="runStrategyLab(true)">运行新回测</button><button onclick="runStrategyLab(false)">读取上次</button>
+    <button onclick="applyVibeResearchDefaults()">恢复推荐参数</button><button onclick="runStrategyLab(true)">运行新回测</button><button onclick="runStrategyLab(false)">读取上次</button>
     <span id="labStatus" class="subtle">真实交易未授权；先看样本外结果。</span>
   </div>
-  <p id="labDayHint" class="subtle">15分钟公开K线约5000根，实际最多约52天；要输入2000天请选择“日线”。</p>
+  <p id="labDayHint" class="subtle">4小时公开K线约5000根，最多请求约833天；真正长度还受币种上线时间限制。</p>
   <div class="grid">
     <div class="metric"><div class="muted">策略参数组合</div><div id="labEvaluations">-</div></div>
     <div class="metric"><div class="muted">单窗口通过（禁止实盘）</div><div id="labPromotable">-</div></div>
@@ -5219,6 +5219,15 @@ function updateLabDayLimit(){
   const label=({"5m":"5分钟","15m":"15分钟","1h":"1小时","4h":"4小时","1d":"日线"})[interval]||interval;
   const hint=document.getElementById('labDayHint');if(hint)hint.textContent=`${label}按公开接口约5000根K线上限，最多请求约${max}天；真正长度还受币种上线时间限制。${interval==='1d'?'可以输入2000天。':'要研究2000天请选择“日线”。'}`;
 }
+function applyVibeResearchDefaults(){
+  document.getElementById('labCoins').value='BTC,ETH,SOL,DOGE,XRP,ADA,AVAX,LINK,SUI,AAVE,UNI';
+  document.getElementById('labInterval').value='4h';
+  document.getElementById('labDays').value=730;
+  document.getElementById('labCost').value=13;
+  document.getElementById('labMaxDrawdown').value=25;
+  updateLabDayLimit();
+  document.getElementById('labStatus').textContent='已恢复 Vibe AI 研究建议的第一轮参数；点击“运行新回测”开始。';
+}
 function signed(value,digits=2){const n=Number(value||0);return `${n>=0?'+':''}${fmt(n,digits)}`}
 function strategyMoneyText(bps,capital=labCapitalValue()){
   const percent=strategyPercent(bps),profit=capital*percent/100;
@@ -6032,8 +6041,8 @@ class AltRequestHandler(BaseHTTPRequestHandler):
             })
             return
         if parsed.path == "/strategy_lab":
-            coins = split_symbols((query.get("coins") or ["BTC,ETH,SOL"])[0])[:12]
-            interval = str((query.get("interval") or ["15m"])[0]).lower()
+            coins = split_symbols((query.get("coins") or ["BTC,ETH,SOL,DOGE,XRP,ADA,AVAX,LINK,SUI,AAVE,UNI"])[0])[:12]
+            interval = str((query.get("interval") or ["4h"])[0]).lower()
             if not coins:
                 json_response(self, {"ok": False, "error": "至少填写一个币种"}, status=400)
                 return
@@ -6042,9 +6051,9 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                 json_response(self, {"ok": False, "error": "周期只允许 5m/15m/1h/4h/1d"}, status=400)
                 return
             try:
-                days = max(7, min(day_limits[interval], int((query.get("days") or ["30"])[0])))
-                cost_bps = max(0.0, min(500.0, float((query.get("cost_bps") or ["12"])[0])))
-                max_drawdown_pct = max(1.0, min(100.0, float((query.get("max_drawdown_pct") or ["12"])[0])))
+                days = max(7, min(day_limits[interval], int((query.get("days") or ["730"])[0])))
+                cost_bps = max(0.0, min(500.0, float((query.get("cost_bps") or ["13"])[0])))
+                max_drawdown_pct = max(1.0, min(100.0, float((query.get("max_drawdown_pct") or ["25"])[0])))
                 limit = max(1, min(1000, int((query.get("limit") or ["1000"])[0])))
             except ValueError as exc:
                 json_response(self, {"ok": False, "error": f"回测参数无效：{exc}"}, status=400)
