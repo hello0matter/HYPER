@@ -92,6 +92,16 @@ class CryptoStrategyLabTests(unittest.TestCase):
         self.assertGreater(free["net_bps"], costly["net_bps"])
         self.assertLess(costly["net_bps"], 0)
 
+    def test_bankrupt_short_cannot_recover_on_later_price_drop(self):
+        candles = [
+            {"ts": i, "open": price, "high": price, "low": price, "close": price, "volume": 1}
+            for i, price in enumerate((100, 100, 220, 80))
+        ]
+        result = lab.backtest_targets(candles, [-1] * len(candles), round_trip_cost_bps=0)
+        self.assertTrue(result["bankrupt"])
+        self.assertEqual(result["net_return_pct"], -100)
+        self.assertEqual(result["max_drawdown_pct"], -100)
+
     def test_walk_forward_marks_clear_trend_candidate(self):
         closes = [100 * math.exp(i * 0.001) for i in range(420)]
         candles = candles_from_closes(closes)

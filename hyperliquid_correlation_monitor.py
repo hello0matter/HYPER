@@ -5222,6 +5222,14 @@ function strategyMoneyText(bps,capital=labCapitalValue()){
   const percent=strategyPercent(bps),profit=capital*percent/100;
   return `${signed(percent,2)}% / ${signed(profit,2)} U`;
 }
+function strategyStatsReturnText(stats,capital=labCapitalValue()){
+  const percent=stats?.net_return_pct===undefined?strategyPercent(stats?.net_bps):Number(stats.net_return_pct||0);
+  return `${signed(percent,2)}% / ${signed(capital*percent/100,2)} U`;
+}
+function strategyStatsDrawdownText(stats,capital=labCapitalValue()){
+  const percent=stats?.max_drawdown_pct===undefined?Number(stats?.max_drawdown_bps||0)/100:Number(stats.max_drawdown_pct||0);
+  return `${signed(percent,2)}% / ${signed(capital*percent/100,2)} U`;
+}
 function showStrategyLabDetail(row){
   selectedStrategyLabRow=row;selectedStrategyPine=null;
   const overall=row.overall||{},train=row.train||{},test=row.test||{},capital=labCapitalValue();
@@ -5230,7 +5238,7 @@ function showStrategyLabDetail(row){
   const gate=row.gate_summary||(row.promotable?'本窗口全部最低条件满足；仍禁止实盘':'旧记录没有失败原因，请运行新回测');
   document.getElementById('detailTitle').textContent=`策略回测：${row.coin} / ${row.strategy}`;
   document.getElementById('detailBody').innerHTML=`
-    <div class="detailText"><b>先看这句：</b>假设每次使用 ${fmt(capital,2)} U、不开杠杆，较新约 ${fmt(newerDays,1)} 天的历史结果是 <b class="${Number(test.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(test.net_bps,capital)}</b>，历史最大回落约 <b class="scoreBad">${strategyMoneyText(test.max_drawdown_bps,capital)}</b>。这是历史换算，不是保证以后能赚。</div>
+    <div class="detailText"><b>先看这句：</b>假设每次使用 ${fmt(capital,2)} U、不开杠杆，较新约 ${fmt(newerDays,1)} 天的历史结果是 <b class="${Number(test.net_return_pct??test.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyStatsReturnText(test,capital)}</b>，历史最大回落约 <b class="scoreBad">${strategyStatsDrawdownText(test,capital)}</b>。这是历史换算，不是保证以后能赚。</div>
     <div class="detailGrid">
       <div class="detailBox"><div class="muted">单窗口门槛</div><div class="${row.promotable?'scoreGood':'scoreBad'}">${row.promotable?'通过，但禁止实盘':'未通过'}</div></div>
       <div class="detailBox"><div class="muted">为什么通过 / 未通过</div><div>${esc(gate)}</div></div>
@@ -5239,16 +5247,17 @@ function showStrategyLabDetail(row){
       <div class="detailBox"><div class="muted">实际历史覆盖</div><div>${fmt(row.actual_days,1)} 天 / ${row.samples||0} 根</div></div>
       <div class="detailBox"><div class="muted">参数</div><div>${esc(JSON.stringify(row.params||{}))}</div></div>
       <div class="detailBox"><div class="muted">参考来源</div><div>${esc(row.reference||'经典公开技术规则')}</div></div>
-      <div class="detailBox"><div class="muted">全历史约${fmt(row.actual_days,1)}天：收益 / 最大回落</div><div class="${Number(overall.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(overall.net_bps,capital)} / ${strategyMoneyText(overall.max_drawdown_bps,capital)}</div></div>
-      <div class="detailBox"><div class="muted">较早约${fmt(earlierDays,1)}天：收益 / 最大回落</div><div>${strategyMoneyText(train.net_bps,capital)} / ${strategyMoneyText(train.max_drawdown_bps,capital)}</div></div>
-      <div class="detailBox"><div class="muted">较新约${fmt(newerDays,1)}天：收益 / 最大回落</div><div>${strategyMoneyText(test.net_bps,capital)} / ${strategyMoneyText(test.max_drawdown_bps,capital)}</div></div>
+      <div class="detailBox"><div class="muted">全历史约${fmt(row.actual_days,1)}天：收益 / 最大回落</div><div class="${Number(overall.net_return_pct??overall.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyStatsReturnText(overall,capital)} / ${strategyStatsDrawdownText(overall,capital)}</div></div>
+      <div class="detailBox"><div class="muted">全历史是否触发资金归零</div><div class="${overall.bankrupt?'scoreBad':'scoreGood'}">${overall.bankrupt?'是：归零后不允许后续行情“复活”':'否'}</div></div>
+      <div class="detailBox"><div class="muted">较早约${fmt(earlierDays,1)}天：收益 / 最大回落</div><div>${strategyStatsReturnText(train,capital)} / ${strategyStatsDrawdownText(train,capital)}</div></div>
+      <div class="detailBox"><div class="muted">较新约${fmt(newerDays,1)}天：收益 / 最大回落</div><div>${strategyStatsReturnText(test,capital)} / ${strategyStatsDrawdownText(test,capital)}</div></div>
       <div class="detailBox"><div class="muted">较早行情：交易 / 胜率 / 盈亏比</div><div>${train.trades||0} / ${fmt(Number(train.win_rate||0)*100,1)}% / ${fmt(train.profit_factor,2)}</div></div>
       <div class="detailBox"><div class="muted">较新行情：交易 / 胜率 / 盈亏比</div><div>${test.trades||0} / ${fmt(Number(test.win_rate||0)*100,1)}% / ${fmt(test.profit_factor,2)}</div></div>
       <div class="detailBox"><div class="muted">较新平均 / 最差单笔</div><div>${strategyMoneyText(test.avg_trade_bps,capital)} / ${strategyMoneyText(test.worst_trade_bps,capital)}</div></div>
       <div class="detailBox"><div class="muted">较新行情持仓时间占比</div><div>${fmt(Number(test.exposure||0)*100,1)}%</div></div>
     </div>
     <h3>“较早”和“较新”是什么意思</h3>
-    <div class="detailText">这 ${fmt(row.actual_days,1)} 天被按时间切成两段。较早约 ${fmt(earlierDays,1)} 天用来确认规则不是完全胡乱的；参数固定后，再拿较新约 ${fmt(newerDays,1)} 天参加考试。两段都赚钱才可能显示“单窗口通过”。这样仍不能证明未来赚钱，只是比用同一段数据挑参数再夸成绩更诚实。</div>
+    <div class="detailText">这 ${fmt(row.actual_days,1)} 天被按时间切成两段。较早约 ${fmt(earlierDays,1)} 天用来确认规则不是完全胡乱的；参数固定后，再拿较新约 ${fmt(newerDays,1)} 天参加考试。两段都赚钱才可能显示“单窗口通过”。回测按100%本金、无杠杆的固定仓位计算；如果权益归零，后面的价格反弹不能把账户“复活”。这样仍不能证明未来赚钱，只是比用同一段数据挑参数再夸成绩更诚实。</div>
     <h3>Pine Script v6</h3>
     <div class="paperActions"><button onclick="previewStrategyPine()">生成并查看 Pine</button><button onclick="copyStrategyPine()">一键复制 Pine</button><button onclick="downloadStrategyPine()">下载 .pine</button><span id="pineStatus" class="subtle">独立复刻公开规则，不是社区作者受保护源码。</span></div>
     <pre id="pinePreview" class="detailText" style="display:none;white-space:pre;max-height:360px;overflow:auto"></pre>`;
@@ -5299,7 +5308,7 @@ function renderStrategyLab(data){
     const overall=row.overall||{},test=row.test||{},train=row.train||{},tr=document.createElement('tr');
     const source=(row.reference||'经典公开规则').replace('TradingView社区思路参考（按公开规则独立复刻，不是原作者源码）：','TV参考：');
     const reason=row.gate_summary||(row.promotable?'最低条件满足；仍禁实盘':'旧记录请重新回测查看原因');
-    tr.innerHTML=`<td class="${row.promotable?'passChip':'blockChip'}">${row.promotable?'单窗通过・禁实盘':'未通过'}</td><td class="reasonCell">${esc(reason)}</td><td>${esc(row.coin)}</td><td>${esc(row.strategy)}</td><td>${strategySignalText(row.current_signal)}</td><td class="${Number(overall.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(overall.net_bps,capital)}</td><td class="${Number(test.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(test.net_bps,capital)}</td><td class="scoreBad">${strategyMoneyText(test.max_drawdown_bps,capital)}</td><td class="${Number(train.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(train.net_bps,capital)}</td><td>${test.trades||0}</td><td>${fmt(Number(test.win_rate||0)*100,1)}%</td><td>${fmt(test.profit_factor,2)}</td><td>${fmt(row.actual_days,1)}天 / ${row.samples||0}根</td><td>${esc(strategyFamilyText(row.family))}</td><td style="text-align:left">${esc(source)}</td><td style="text-align:left">${esc(JSON.stringify(row.params||{}))}</td>`;
+    tr.innerHTML=`<td class="${row.promotable?'passChip':'blockChip'}">${row.promotable?'单窗通过・禁实盘':'未通过'}</td><td class="reasonCell">${esc(reason)}</td><td>${esc(row.coin)}</td><td>${esc(row.strategy)}</td><td>${strategySignalText(row.current_signal)}</td><td class="${Number(overall.net_return_pct??overall.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyStatsReturnText(overall,capital)}</td><td class="${Number(test.net_return_pct??test.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyStatsReturnText(test,capital)}</td><td class="scoreBad">${strategyStatsDrawdownText(test,capital)}</td><td class="${Number(train.net_return_pct??train.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyStatsReturnText(train,capital)}</td><td>${test.trades||0}</td><td>${fmt(Number(test.win_rate||0)*100,1)}%</td><td>${fmt(test.profit_factor,2)}</td><td>${fmt(row.actual_days,1)}天 / ${row.samples||0}根</td><td>${esc(strategyFamilyText(row.family))}</td><td style="text-align:left">${esc(source)}</td><td style="text-align:left">${esc(JSON.stringify(row.params||{}))}</td>`;
     tr.title='点击查看本金换算、较早/较新行情解释和Pine代码';tr.onclick=()=>showStrategyLabDetail(row);body.appendChild(tr);
   });
   if(!rows.length)body.innerHTML='<tr><td colspan="16" class="muted">还没有回测结果，点击“运行新回测”</td></tr>';

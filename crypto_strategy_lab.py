@@ -475,36 +475,65 @@ def backtest_targets(candles, targets, *, start=1, end=None, round_trip_cost_bps
     end = min(len(candles) - 1, int(end if end is not None else len(candles) - 1))
     start = max(1, int(start))
     one_way = float(round_trip_cost_bps) / 2
-    position, entry_price, entry_cost = 0, None, 0.0
-    equity_bps, peak_bps, max_drawdown_bps = 0.0, 0.0, 0.0
+    one_way_rate = one_way / 10_000
+    position, quantity, entry_price, entry_cost = 0, 0.0, None, 0.0
+    equity, peak_equity, max_drawdown_bps = 1.0, 1.0, 0.0
     returns, trades = [], []
-    exposure = 0
+    exposure, bankrupt = 0, False
+
+    def update_drawdown():
+        nonlocal peak_equity, max_drawdown_bps
+        peak_equity = max(peak_equity, equity)
+        drawdown_bps = (equity / peak_equity - 1) * 10_000 if peak_equity > 0 else -10_000
+        max_drawdown_bps = min(max_drawdown_bps, drawdown_bps)
+
     for i in range(start, end + 1):
         desired = int(targets[i - 1])
         price = float(candles[i]["open"])
         if desired != position:
             if position:
-                gross = position * math.log(price / entry_price) * 10_000
+                gross = position * (price / entry_price - 1) * 10_000
                 trades.append(gross - entry_cost - one_way)
-            transition_cost = one_way * abs(desired - position)
-            equity_bps -= transition_cost
+                equity -= abs(quantity) * price * one_way_rate
+            quantity = 0.0
             if desired:
+                order_equity = max(0.0, equity)
+                quantity = desired * order_equity / price
+                equity -= order_equity * one_way_rate
                 entry_price, entry_cost = price, one_way
             else:
                 entry_price, entry_cost = None, 0.0
             position = desired
+            update_drawdown()
+            if equity <= 0:
+                equity, max_drawdown_bps, bankrupt = 0.0, -10_000.0, True
+                break
         if i < end:
-            step = position * math.log(float(candles[i + 1]["open"]) / price) * 10_000
-            equity_bps += step
-            returns.append(step)
+            before = equity
+            next_price = float(candles[i + 1]["open"])
+            equity += quantity * (next_price - price)
+            if equity <= 0:
+                gross = position * (next_price / entry_price - 1) * 10_000 if entry_price else -10_000
+                trades.append(gross - entry_cost - one_way)
+                equity, max_drawdown_bps, bankrupt = 0.0, -10_000.0, True
+                position, quantity = 0, 0.0
+                break
+            returns.append((equity / before - 1) * 10_000 if before > 0 else -10_000)
             exposure += int(position != 0)
-            peak_bps = max(peak_bps, equity_bps)
-            max_drawdown_bps = min(max_drawdown_bps, equity_bps - peak_bps)
-    if position and entry_price:
+            update_drawdown()
+    if not bankrupt and position and entry_price:
         final_price = float(candles[end]["close"])
-        gross = position * math.log(final_price / entry_price) * 10_000
+        end_open = float(candles[end]["open"])
+        equity += quantity * (final_price - end_open)
+        gross = position * (final_price / entry_price - 1) * 10_000
         trades.append(gross - entry_cost - one_way)
-        equity_bps -= one_way
+        equity -= abs(quantity) * final_price * one_way_rate
+        if equity <= 0:
+            equity, max_drawdown_bps, bankrupt = 0.0, -10_000.0, True
+        else:
+            update_drawdown()
+    net_return_pct = (equity - 1) * 100
+    net_bps = math.log(equity) * 10_000 if equity > 0 else -1_000_000.0
     wins = [item for item in trades if item > 0]
     losses = [item for item in trades if item < 0]
     mean = statistics.fmean(returns) if returns else 0.0
@@ -512,11 +541,13 @@ def backtest_targets(candles, targets, *, start=1, end=None, round_trip_cost_bps
     sharpe = mean / stdev * math.sqrt(len(returns)) if stdev > 0 else 0.0
     profit_factor = sum(wins) / abs(sum(losses)) if losses else (999.0 if wins else 0.0)
     return {
-        "net_bps": equity_bps, "max_drawdown_bps": max_drawdown_bps,
+        "net_bps": net_bps, "net_return_pct": net_return_pct,
+        "max_drawdown_bps": max_drawdown_bps, "max_drawdown_pct": max_drawdown_bps / 100,
         "trades": len(trades), "wins": len(wins), "win_rate": len(wins) / len(trades) if trades else 0.0,
         "profit_factor": profit_factor, "avg_trade_bps": statistics.fmean(trades) if trades else 0.0,
         "worst_trade_bps": min(trades) if trades else 0.0, "sharpe_like": sharpe,
         "exposure": exposure / max(1, end - start), "last_target": int(targets[end - 1]),
+        "bankrupt": bankrupt,
     }
 
 
@@ -619,18 +650,18 @@ def evaluate_coin(coin, candles, *, interval="15m", round_trip_cost_bps=12.0):
         )
         train = backtest_targets(candles, targets, start=1, end=split, round_trip_cost_bps=round_trip_cost_bps)
         test = backtest_targets(candles, targets, start=split + 1, end=len(candles) - 1, round_trip_cost_bps=round_trip_cost_bps)
-        stable = train["net_bps"] > 0 and test["net_bps"] > 0
+        stable = train["net_return_pct"] > 0 and test["net_return_pct"] > 0
         gate_failures = []
-        if train["net_bps"] <= 0:
+        if train["net_return_pct"] <= 0:
             gate_failures.append("较早行情亏损")
-        if test["net_bps"] <= 0:
+        if test["net_return_pct"] <= 0:
             gate_failures.append("较新行情亏损")
         if test["trades"] < 6:
             gate_failures.append(f"较新行情只有{test['trades']}笔，少于6笔")
         if test["profit_factor"] < 1.10:
             gate_failures.append(f"盈亏比{test['profit_factor']:.2f}，低于1.10")
-        if test["max_drawdown_bps"] < -1200:
-            gate_failures.append(f"最大回落{test['max_drawdown_bps'] / 100:.2f}%，超过12%")
+        if test["max_drawdown_pct"] < -12:
+            gate_failures.append(f"最大回落{test['max_drawdown_pct']:.2f}%，超过12%")
         promotable = not gate_failures
         score = test["net_bps"] + max(test["max_drawdown_bps"], -2000) * 0.35 + min(test["trades"], 20) * 2
         results.append({

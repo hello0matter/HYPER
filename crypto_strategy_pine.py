@@ -204,7 +204,8 @@ def generate_pine_strategy(spec, *, round_trip_cost_bps=12.0, initial_capital=10
 strategy("{title}", overlay=true, initial_capital={float(initial_capital):.2f}, currency=currency.USD,
      default_qty_type=strategy.percent_of_equity, default_qty_value=100, pyramiding=0,
      commission_type=strategy.commission.percent, commission_value={one_way_percent:.6f},
-     process_orders_on_close=false)
+     process_orders_on_close=false, calc_on_order_fills=false, calc_on_every_tick=false,
+     use_bar_magnifier=false, margin_long=100, margin_short=100)
 
 {body}
 
