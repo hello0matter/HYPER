@@ -100,6 +100,8 @@ class CryptoStrategyLabTests(unittest.TestCase):
         self.assertGreater(ema["train"]["net_bps"], 0)
         self.assertGreater(ema["test"]["net_bps"], 0)
         self.assertEqual(ema["current_signal"], 1)
+        self.assertEqual(ema["promotable"], not ema["gate_failures"])
+        self.assertTrue(ema["gate_summary"])
 
     def test_latest_signal_uses_latest_closed_bar(self):
         closes = [100 + i * .2 for i in range(260)]

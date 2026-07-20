@@ -39,12 +39,15 @@ python hyperliquid_correlation_monitor.py --server
 - `GET /paper?limit=200`：模拟盘持仓、历史平仓、权益曲线和当前模拟参数。
 - `GET /live?fresh=1`：真实账户、真实交易记录、l2Book 状态，以及本轮每个候选被哪条规则过滤的诊断结果。
 - `GET /strategy_lab?coins=BTC,ETH,SOL&interval=15m&days=30&cost_bps=12&refresh=1`：下载 Hyperliquid K线并运行常见虚拟货币策略的训练/样本外回测；不触发真实下单。
+- `GET /strategy_pine?family=...&params=...&cost_bps=12`：为策略实验室内置参数生成可复制的 Pine Script v6；只生成项目独立实现，不返回社区受保护源码。
 
 ### 虚拟货币策略实验室
 
 Dashboard 顶部“策略实验室”目前覆盖 17 类、62 组固定参数。除 EMA、MACD、RSI、布林回归、唐奇安、Supertrend 和动量等经典规则外，还加入了 TradingView 社区中规则较清晰的代表性思路：MACD+SMA200、布林+RSI、StochRSI、一目均衡+EMA、三EMA、Squeeze、OBV、Supertrend+ADX、布林突破和海龟+ATR。社区策略只按公开技术规则独立复刻，不复制受保护源码；页面逐行显示参考来源。
 
 实验室使用前 60% K线作为训练段、后 40% 作为样本外段；信号在本根收盘计算，按下一根开盘成交，并扣除配置的估算往返成本。绿色状态已明确写成“单窗口通过・禁止实盘”：它只代表当前一个币种、周期和历史窗口达到最低研究门槛，不代表策略成功。
+
+页面把这两段显示成人话“较早行情”和“较新行情”，并可填写假设投入 USDC，直接查看历史收益百分比、约赚/约亏金额及最大回落金额。未通过的行会列出具体失败原因。点击任意策略可生成、查看、一键复制或下载对应 Pine v6 代码，再粘贴到 TradingView Pine 编辑器对照测试。
 
 “达到研究门槛”不代表可以直接真实下单。至少还要在 30/60/90 天、5m/15m/1h 等窗口重复验证，确认结果不是只在某个币最近一段行情有效，再进入实时模拟。当前 Hyperliquid 真实执行器是双腿相关性策略；策略实验室中的 TradingView 风格单腿方向策略保持独立，不会误接到已有真实交易开关。
 

@@ -30,7 +30,8 @@ from zoneinfo import ZoneInfo
 
 import websocket
 
-from crypto_strategy_lab import run_strategy_lab
+from crypto_strategy_lab import run_strategy_lab, strategy_specs
+from crypto_strategy_pine import generate_pine_strategy, pine_filename
 
 try:
     import tkinter as tk
@@ -3930,12 +3931,13 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <dialog id="strategyLabDlg" class="wideDialog">
 <div class="helpHead"><h2>虚拟货币策略实验室</h2><button onclick="strategyLabDlg.close()">关闭</button></div>
 <div class="helpBody">
-  <p>统一使用 Hyperliquid K线测试常见趋势、动量、突破和均值回归策略。信号在本根收盘计算、下一根开盘成交，避免偷看未来；排名只看后40%的样本外区间，并扣除配置的往返成本。</p>
+  <p>统一使用 Hyperliquid K线测试常见策略。以30天为例：先用较早约18天检查规则，再用较新约12天参加一次“没看过答案的考试”。信号在本根收盘计算、下一根开盘成交，并扣除配置的往返成本。</p>
   <div class="paperActions">
     <label>币种<input id="labCoins" value="BTC,ETH,SOL" style="width:180px"></label>
     <label>周期<select id="labInterval"><option value="5m">5分钟</option><option value="15m" selected>15分钟</option><option value="1h">1小时</option><option value="4h">4小时</option></select></label>
     <label>历史天数<input id="labDays" type="number" min="7" max="180" value="30" style="width:75px"></label>
     <label>往返成本bps<input id="labCost" type="number" min="0" max="500" value="12" step="0.5" style="width:75px"></label>
+    <label>假设投入USDC<input id="labCapital" type="number" min="1" max="10000000" value="100" step="10" style="width:90px" onchange="if(latestStrategyLabData)renderStrategyLab(latestStrategyLabData)"></label>
     <button onclick="runStrategyLab(true)">运行新回测</button><button onclick="runStrategyLab(false)">读取上次</button>
     <span id="labStatus" class="subtle">真实交易未授权；先看样本外结果。</span>
   </div>
@@ -3945,8 +3947,8 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">数据源</div><div id="labSource">-</div></div>
     <div class="metric"><div class="muted">更新时间</div><div id="labTime">-</div></div>
   </div>
-  <p class="scoreMid">“单窗口通过”只表示当前币种、当前周期、当前历史窗口的训练段和样本外段都为正，交易次数及盈亏比达到最低门槛；仍然禁止自动真实下单。只有多个周期、多个历史窗口重复通过，并经过实时模拟，才可进入下一层验证。</p>
-  <div class="paperTableWrap" style="max-height:520px"><table id="strategyLabTbl"><thead><tr><th>状态</th><th>币种</th><th>实际历史</th><th>策略</th><th>类型</th><th>参考来源</th><th>当前信号</th><th>训练净收益</th><th>样本外净收益</th><th>样本外回撤</th><th>交易数</th><th>胜率</th><th>盈亏比</th><th>平均每笔</th><th>参数</th></tr></thead><tbody></tbody></table></div>
+  <p class="scoreMid">“单窗口通过”=较早行情赚钱、较新行情也赚钱、较新至少6笔、盈亏比≥1.10、最大回落不超过12%。它仍然禁止自动真实下单。金额只是把历史收益率乘以你填写的假设本金，不是未来承诺。</p>
+  <div class="paperTableWrap" style="max-height:520px"><table id="strategyLabTbl"><thead><tr><th>状态</th><th>为什么</th><th>币种</th><th>策略</th><th>当前信号</th><th>较新行情收益 / 约赚</th><th>较新最大回落 / 约亏</th><th>较早行情收益</th><th>交易数</th><th>胜率</th><th>盈亏比</th><th>实际历史</th><th>类型</th><th>参考来源</th><th>参数</th></tr></thead><tbody></tbody></table></div>
   <p id="labNote" class="subtle"></p>
 </div>
 </dialog>
@@ -4257,12 +4259,15 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>真实策略开关</code>：总开关开启后还要这个开关开启，才会按规则真实下单。关闭时只监控和模拟。</p>
 
 <h3>策略实验室怎么读</h3>
-<p><code>训练段</code>：较早的 60% K 线，用来观察这套固定参数在过去是否有基本逻辑。它不是挑完参数后重新美化的成绩。</p>
-<p><code>样本外</code>：较新的 40% K 线，排名只看这一段。可以理解成参数先定好，再参加一次没用于训练的考试。</p>
+<p><code>较早行情（原“训练段”）</code>：例如30天里的前约18天，先看这套规则是不是完全胡乱的。</p>
+<p><code>较新行情（原“样本外”）</code>：例如30天里的后约12天。参数不再改变，拿它参加一次没提前看答案的考试。页面主要看这一段。</p>
 <p><code>下一根开盘成交</code>：本根收盘后才能知道 RSI、MACD 或突破信号，所以程序最早只能用下一根开盘价成交，避免偷偷使用未来价格。</p>
 <p><code>单窗口通过（禁止实盘）</code>：训练和样本外净收益都为正，样本外至少 6 笔、盈亏比至少 1.10、回撤未超过门槛。它只代表当前一个币、一个周期、一个历史窗口值得继续研究，不是策略成功，更不是实盘授权。</p>
 <p><code>往返成本 bps</code>：估算一笔从开仓到平仓的总手续费和滑点。默认 12 bps。真实成本会随 maker/taker 费率、盘口、币种和订单大小变化。</p>
 <p><code>当前信号</code>：最后一根已获取 K 线得出的做多、做空或空仓目标。它不是实时盘口信号；15分钟策略只有在新15分钟K线确认后才应变化。</p>
+<p><code>假设投入USDC</code>：只把历史收益百分比换算成人话金额。例如较新收益6%，输入100U就显示历史约赚6U，输入1000U显示约赚60U；不代表未来一定得到这些钱。</p>
+<p><code>为什么未通过</code>：会直接列出较早行情亏损、较新行情亏损、交易不足6笔、盈亏比低于1.10或最大回落超过12%中的具体原因。</p>
+<p><code>复制 Pine</code>：点击策略行进入详情，可以生成、复制或下载对应的 Pine Script v6。它是本项目按公开规则独立实现的代码，不是复制社区作者的受保护源码。</p>
 <p><code>实际历史</code>：必须看这一列，而不是只看你填写的天数。Hyperliquid 公开 candleSnapshot 约有 5000 根上限，所以 5分钟大约只有17天、15分钟大约52天；更长历史需要 TradingView 或授权历史数据源。</p>
 <p><code>TradingView 和这里的区别</code>：TradingView 适合发现和阅读策略、使用它的策略测试器；最终要在 Hyperliquid 下单时，仍应使用 Hyperliquid K线重跑，因为交易所价格、K线边界、手续费和成交条件可能不同。</p>
 <p>TradingView 公共库可以搜索和手工添加策略，但没有官方接口允许任意批量下载全部社区源码。开源脚本可在页面查看时按作者许可人工移植；受保护或仅邀请脚本不能拉取源码，也不应绕过保护。</p>
@@ -4337,6 +4342,9 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <script>
 let latestRows=[];
 let selectedRow=null;
+let latestStrategyLabData=null;
+let selectedStrategyLabRow=null;
+let selectedStrategyPine=null;
 let sortKey='score', sortDir=-1;
 const charts={};
 let liveL2Coins=[];
@@ -5198,30 +5206,74 @@ function strategyFamilyText(value){
     supertrend_adx:'Supertrend+ADX',bollinger_breakout:'布林突破',turtle_atr:'海龟+ATR'
   })[value]||value||'-';
 }
+function strategyPercent(bps){return Math.expm1(Number(bps||0)/10000)*100}
+function labCapitalValue(){return Math.max(1,Number(document.getElementById('labCapital')?.value||100))}
+function signed(value,digits=2){const n=Number(value||0);return `${n>=0?'+':''}${fmt(n,digits)}`}
+function strategyMoneyText(bps,capital=labCapitalValue()){
+  const percent=strategyPercent(bps),profit=capital*percent/100;
+  return `${signed(percent,2)}% / ${signed(profit,2)} U`;
+}
 function showStrategyLabDetail(row){
-  const train=row.train||{},test=row.test||{};
+  selectedStrategyLabRow=row;selectedStrategyPine=null;
+  const train=row.train||{},test=row.test||{},capital=labCapitalValue();
+  const earlierDays=Number(row.earlier_days??Number(row.actual_days||0)*.60);
+  const newerDays=Number(row.newer_days??Number(row.actual_days||0)*.40);
+  const gate=row.gate_summary||(row.promotable?'本窗口全部最低条件满足；仍禁止实盘':'旧记录没有失败原因，请运行新回测');
   document.getElementById('detailTitle').textContent=`策略回测：${row.coin} / ${row.strategy}`;
   document.getElementById('detailBody').innerHTML=`
+    <div class="detailText"><b>先看这句：</b>假设每次使用 ${fmt(capital,2)} U、不开杠杆，较新约 ${fmt(newerDays,1)} 天的历史结果是 <b class="${Number(test.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(test.net_bps,capital)}</b>，历史最大回落约 <b class="scoreBad">${strategyMoneyText(test.max_drawdown_bps,capital)}</b>。这是历史换算，不是保证以后能赚。</div>
     <div class="detailGrid">
       <div class="detailBox"><div class="muted">单窗口门槛</div><div class="${row.promotable?'scoreGood':'scoreBad'}">${row.promotable?'通过，但禁止实盘':'未通过'}</div></div>
+      <div class="detailBox"><div class="muted">为什么通过 / 未通过</div><div>${esc(gate)}</div></div>
       <div class="detailBox"><div class="muted">当前收盘信号</div><div>${strategySignalText(row.current_signal)}</div></div>
       <div class="detailBox"><div class="muted">币种 / 周期</div><div>${esc(row.coin)} / ${esc(row.interval)}</div></div>
       <div class="detailBox"><div class="muted">实际历史覆盖</div><div>${fmt(row.actual_days,1)} 天 / ${row.samples||0} 根</div></div>
       <div class="detailBox"><div class="muted">参数</div><div>${esc(JSON.stringify(row.params||{}))}</div></div>
       <div class="detailBox"><div class="muted">参考来源</div><div>${esc(row.reference||'经典公开技术规则')}</div></div>
-      <div class="detailBox"><div class="muted">训练净收益 / 回撤</div><div>${fmt(train.net_bps,1)} / ${fmt(train.max_drawdown_bps,1)} bps</div></div>
-      <div class="detailBox"><div class="muted">样本外净收益 / 回撤</div><div>${fmt(test.net_bps,1)} / ${fmt(test.max_drawdown_bps,1)} bps</div></div>
-      <div class="detailBox"><div class="muted">训练交易 / 胜率 / 盈亏比</div><div>${train.trades||0} / ${fmt(Number(train.win_rate||0)*100,1)}% / ${fmt(train.profit_factor,2)}</div></div>
-      <div class="detailBox"><div class="muted">样本外交易 / 胜率 / 盈亏比</div><div>${test.trades||0} / ${fmt(Number(test.win_rate||0)*100,1)}% / ${fmt(test.profit_factor,2)}</div></div>
-      <div class="detailBox"><div class="muted">样本外平均 / 最差单笔</div><div>${fmt(test.avg_trade_bps,1)} / ${fmt(test.worst_trade_bps,1)} bps</div></div>
-      <div class="detailBox"><div class="muted">样本外暴露时间</div><div>${fmt(Number(test.exposure||0)*100,1)}%</div></div>
+      <div class="detailBox"><div class="muted">较早约${fmt(earlierDays,1)}天：收益 / 最大回落</div><div>${strategyMoneyText(train.net_bps,capital)} / ${strategyMoneyText(train.max_drawdown_bps,capital)}</div></div>
+      <div class="detailBox"><div class="muted">较新约${fmt(newerDays,1)}天：收益 / 最大回落</div><div>${strategyMoneyText(test.net_bps,capital)} / ${strategyMoneyText(test.max_drawdown_bps,capital)}</div></div>
+      <div class="detailBox"><div class="muted">较早行情：交易 / 胜率 / 盈亏比</div><div>${train.trades||0} / ${fmt(Number(train.win_rate||0)*100,1)}% / ${fmt(train.profit_factor,2)}</div></div>
+      <div class="detailBox"><div class="muted">较新行情：交易 / 胜率 / 盈亏比</div><div>${test.trades||0} / ${fmt(Number(test.win_rate||0)*100,1)}% / ${fmt(test.profit_factor,2)}</div></div>
+      <div class="detailBox"><div class="muted">较新平均 / 最差单笔</div><div>${strategyMoneyText(test.avg_trade_bps,capital)} / ${strategyMoneyText(test.worst_trade_bps,capital)}</div></div>
+      <div class="detailBox"><div class="muted">较新行情持仓时间占比</div><div>${fmt(Number(test.exposure||0)*100,1)}%</div></div>
     </div>
-    <h3>怎么理解</h3>
-    <div class="detailText">信号在一根 K 线收盘后才确定，并按下一根 K 线开盘成交。收益已经扣除策略实验室设置的估算往返成本，但没有逐根模拟动态盘口深度、资金费和强平风险。“单窗口通过”只允许进入更多周期回测和实时模拟，不代表可以直接真实下单。</div>`;
+    <h3>“较早”和“较新”是什么意思</h3>
+    <div class="detailText">这 ${fmt(row.actual_days,1)} 天被按时间切成两段。较早约 ${fmt(earlierDays,1)} 天用来确认规则不是完全胡乱的；参数固定后，再拿较新约 ${fmt(newerDays,1)} 天参加考试。两段都赚钱才可能显示“单窗口通过”。这样仍不能证明未来赚钱，只是比用同一段数据挑参数再夸成绩更诚实。</div>
+    <h3>Pine Script v6</h3>
+    <div class="paperActions"><button onclick="previewStrategyPine()">生成并查看 Pine</button><button onclick="copyStrategyPine()">一键复制 Pine</button><button onclick="downloadStrategyPine()">下载 .pine</button><span id="pineStatus" class="subtle">独立复刻公开规则，不是社区作者受保护源码。</span></div>
+    <pre id="pinePreview" class="detailText" style="display:none;white-space:pre;max-height:360px;overflow:auto"></pre>`;
   detailDlg.showModal();
 }
+async function loadSelectedStrategyPine(){
+  if(!selectedStrategyLabRow)throw new Error('请先选择一个策略');
+  const key=JSON.stringify([selectedStrategyLabRow.family,selectedStrategyLabRow.params,document.getElementById('labCost')?.value]);
+  if(selectedStrategyPine?.key===key)return selectedStrategyPine;
+  const status=document.getElementById('pineStatus');if(status)status.textContent='正在生成 Pine v6...';
+  const query=new URLSearchParams({family:selectedStrategyLabRow.family,params:JSON.stringify(selectedStrategyLabRow.params||{}),cost_bps:document.getElementById('labCost')?.value||12});
+  const response=await fetch('strategy_pine?'+query.toString());const data=await response.json();
+  if(!data.ok)throw new Error(data.error||'Pine生成失败');selectedStrategyPine={...data,key};return selectedStrategyPine;
+}
+async function previewStrategyPine(){
+  const status=document.getElementById('pineStatus');
+  try{const data=await loadSelectedStrategyPine();const pre=document.getElementById('pinePreview');pre.textContent=data.code;pre.style.display='block';status.textContent='已生成；可复制后粘贴进 TradingView Pine编辑器。';}
+  catch(e){if(status)status.textContent='生成失败：'+e.message;}
+}
+async function copyTextFallback(value){
+  try{await navigator.clipboard.writeText(value);return true;}catch(e){const area=document.createElement('textarea');area.value=value;area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);area.select();const ok=document.execCommand('copy');area.remove();return ok;}
+}
+async function copyStrategyPine(){
+  const status=document.getElementById('pineStatus');
+  try{const data=await loadSelectedStrategyPine();await copyTextFallback(data.code);status.textContent='Pine代码已复制：打开TradingView → Pine编辑器 → 新建 → 粘贴 → 添加到图表。';}
+  catch(e){if(status)status.textContent='复制失败：'+e.message;}
+}
+async function downloadStrategyPine(){
+  const status=document.getElementById('pineStatus');
+  try{const data=await loadSelectedStrategyPine();const url=URL.createObjectURL(new Blob([data.code],{type:'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=url;a.download=data.filename||'HYPER_strategy.pine';a.click();URL.revokeObjectURL(url);status.textContent='Pine文件已下载。';}
+  catch(e){if(status)status.textContent='下载失败：'+e.message;}
+}
 function renderStrategyLab(data){
-  const rows=data.rows||[],body=document.querySelector('#strategyLabTbl tbody');body.innerHTML='';
+  latestStrategyLabData=data;
+  const rows=data.rows||[],body=document.querySelector('#strategyLabTbl tbody'),capital=labCapitalValue();body.innerHTML='';
   if((data.coins||[]).length)document.getElementById('labCoins').value=data.coins.join(',');
   if(data.interval)document.getElementById('labInterval').value=data.interval;
   if(data.days)document.getElementById('labDays').value=data.days;
@@ -5233,8 +5285,9 @@ function renderStrategyLab(data){
   rows.forEach(row=>{
     const test=row.test||{},train=row.train||{},tr=document.createElement('tr');
     const source=(row.reference||'经典公开规则').replace('TradingView社区思路参考（按公开规则独立复刻，不是原作者源码）：','TV参考：');
-    tr.innerHTML=`<td class="${row.promotable?'passChip':'blockChip'}">${row.promotable?'单窗通过・禁实盘':'未通过'}</td><td>${esc(row.coin)}</td><td>${fmt(row.actual_days,1)}天 / ${row.samples||0}根</td><td>${esc(row.strategy)}</td><td>${esc(strategyFamilyText(row.family))}</td><td style="text-align:left">${esc(source)}</td><td>${strategySignalText(row.current_signal)}</td><td class="${Number(train.net_bps)>=0?'scoreGood':'scoreBad'}">${fmt(train.net_bps,1)} bps</td><td class="${Number(test.net_bps)>=0?'scoreGood':'scoreBad'}">${fmt(test.net_bps,1)} bps</td><td class="${Number(test.max_drawdown_bps)>=-500?'scoreGood':'scoreBad'}">${fmt(test.max_drawdown_bps,1)} bps</td><td>${test.trades||0}</td><td>${fmt(Number(test.win_rate||0)*100,1)}%</td><td>${fmt(test.profit_factor,2)}</td><td>${fmt(test.avg_trade_bps,1)} bps</td><td style="text-align:left">${esc(JSON.stringify(row.params||{}))}</td>`;
-    tr.title='点击查看训练段、样本外和风险详情';tr.onclick=()=>showStrategyLabDetail(row);body.appendChild(tr);
+    const reason=row.gate_summary||(row.promotable?'最低条件满足；仍禁实盘':'旧记录请重新回测查看原因');
+    tr.innerHTML=`<td class="${row.promotable?'passChip':'blockChip'}">${row.promotable?'单窗通过・禁实盘':'未通过'}</td><td class="reasonCell">${esc(reason)}</td><td>${esc(row.coin)}</td><td>${esc(row.strategy)}</td><td>${strategySignalText(row.current_signal)}</td><td class="${Number(test.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(test.net_bps,capital)}</td><td class="scoreBad">${strategyMoneyText(test.max_drawdown_bps,capital)}</td><td class="${Number(train.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(train.net_bps,capital)}</td><td>${test.trades||0}</td><td>${fmt(Number(test.win_rate||0)*100,1)}%</td><td>${fmt(test.profit_factor,2)}</td><td>${fmt(row.actual_days,1)}天 / ${row.samples||0}根</td><td>${esc(strategyFamilyText(row.family))}</td><td style="text-align:left">${esc(source)}</td><td style="text-align:left">${esc(JSON.stringify(row.params||{}))}</td>`;
+    tr.title='点击查看本金换算、较早/较新行情解释和Pine代码';tr.onclick=()=>showStrategyLabDetail(row);body.appendChild(tr);
   });
   if(!rows.length)body.innerHTML='<tr><td colspan="15" class="muted">还没有回测结果，点击“运行新回测”</td></tr>';
   const failures=(data.failures||[]).map(item=>`${item.coin}: ${item.error}`).join('；');
@@ -5252,7 +5305,7 @@ async function runStrategyLab(refresh){
     const query=new URLSearchParams({coins,interval,days,cost_bps:cost,limit:'1000'});if(refresh)query.set('refresh','1');
     const response=await fetch('strategy_lab?'+query.toString());const data=await response.json();
     if(!data.ok){renderStrategyLab(data);const failed=(data.failures||[]).map(item=>`${item.coin}: ${item.error}`).join('；');throw new Error(data.error||failed||'回测失败');}renderStrategyLab(data);
-    status.textContent=`完成：${data.evaluations||0} 组，${data.promotable||0} 组达到继续研究门槛；未授权真实下单。`;
+    status.textContent=`完成：${data.evaluations||0} 组，${data.promotable||0} 组单窗口通过；全部禁止自动真实下单。`;
   }catch(e){status.textContent='策略实验室失败：'+e.message;}
 }
 function openStrategyLabDialog(){strategyLabDlg.showModal();runStrategyLab(false);}
@@ -5987,6 +6040,29 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                     state.strategy_lab_cache = {"key": cache_key, "ts": time.time(), "payload": payload}
                 json_response(self, {**payload, "source": "hyperliquid_candles"})
             except (URLError, HTTPError, TimeoutError, RuntimeError, ValueError, KeyError, IndexError, TypeError, OSError) as exc:
+                json_response(self, {"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/strategy_pine":
+            family = str((query.get("family") or [""])[0]).strip()
+            try:
+                params_values = query.get("params") or ["{}"]
+                params_text = params_values[0]
+                params = json.loads(params_text)
+                cost_bps = max(0.0, min(500.0, float((query.get("cost_bps") or ["12"])[0])))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                json_response(self, {"ok": False, "error": f"Pine参数无效：{exc}"}, status=400)
+                return
+            spec = next((item for item in strategy_specs() if item.family == family and item.params == params), None)
+            if not spec:
+                json_response(self, {"ok": False, "error": "未找到对应的内置策略参数"}, status=404)
+                return
+            try:
+                code = generate_pine_strategy(spec, round_trip_cost_bps=cost_bps)
+                json_response(self, {
+                    "ok": True, "strategy": spec.name, "family": spec.family,
+                    "reference": spec.reference, "filename": pine_filename(spec), "code": code,
+                })
+            except (TypeError, ValueError, KeyError) as exc:
                 json_response(self, {"ok": False, "error": str(exc)}, status=500)
             return
         if parsed.path == "/history":

@@ -613,12 +613,25 @@ def evaluate_coin(coin, candles, *, interval="15m", round_trip_cost_bps=12.0):
         train = backtest_targets(candles, targets, start=1, end=split, round_trip_cost_bps=round_trip_cost_bps)
         test = backtest_targets(candles, targets, start=split + 1, end=len(candles) - 1, round_trip_cost_bps=round_trip_cost_bps)
         stable = train["net_bps"] > 0 and test["net_bps"] > 0
-        promotable = bool(stable and test["trades"] >= 6 and test["profit_factor"] >= 1.10 and test["max_drawdown_bps"] >= -1200)
+        gate_failures = []
+        if train["net_bps"] <= 0:
+            gate_failures.append("较早行情亏损")
+        if test["net_bps"] <= 0:
+            gate_failures.append("较新行情亏损")
+        if test["trades"] < 6:
+            gate_failures.append(f"较新行情只有{test['trades']}笔，少于6笔")
+        if test["profit_factor"] < 1.10:
+            gate_failures.append(f"盈亏比{test['profit_factor']:.2f}，低于1.10")
+        if test["max_drawdown_bps"] < -1200:
+            gate_failures.append(f"最大回落{test['max_drawdown_bps'] / 100:.2f}%，超过12%")
+        promotable = not gate_failures
         score = test["net_bps"] + max(test["max_drawdown_bps"], -2000) * 0.35 + min(test["trades"], 20) * 2
         results.append({
             "coin": coin, "interval": interval, "family": spec.family, "strategy": spec.name,
             "params": spec.params, "reference": spec.reference, "samples": len(candles), "split_index": split,
             "train": train, "test": test, "stable": stable, "promotable": promotable,
+            "gate_failures": gate_failures,
+            "gate_summary": "本窗口全部最低条件满足；仍禁止实盘" if promotable else "；".join(gate_failures),
             "score": score, "current_signal": int(targets[-1]),
         })
     results.sort(key=lambda item: item["score"], reverse=True)
@@ -638,6 +651,8 @@ def run_strategy_lab(coins=("BTC", "ETH", "SOL"), *, days=30, interval="15m", ro
                 evaluated = evaluate_coin(coin, candles, interval=interval, round_trip_cost_bps=round_trip_cost_bps)
                 for row in evaluated:
                     row["actual_days"] = actual_days
+                    row["earlier_days"] = actual_days * row["split_index"] / max(1, row["samples"] - 1)
+                    row["newer_days"] = max(0.0, actual_days - row["earlier_days"])
                 rows.extend(evaluated)
             except Exception as exc:  # Keep the other markets usable after one API failure.
                 if pass_index == 0 and "429" in str(exc):
