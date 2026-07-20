@@ -32,6 +32,7 @@ import websocket
 
 from crypto_strategy_lab import run_strategy_lab, strategy_specs
 from crypto_strategy_pine import generate_pine_strategy, pine_filename
+from multi_asset_portfolio_lab import DEFAULT_SYMBOLS, run_multi_asset_portfolio_lab
 
 try:
     import tkinter as tk
@@ -751,6 +752,17 @@ def init_alt_db(path=ALT_DB_FILE):
             )
         """)
         db.execute("CREATE INDEX IF NOT EXISTS idx_strategy_lab_runs_ts ON strategy_lab_runs(ts)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_lab_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                symbols TEXT NOT NULL,
+                years REAL NOT NULL,
+                round_trip_cost_bps REAL NOT NULL,
+                payload_json TEXT NOT NULL
+            )
+        """)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_lab_runs_ts ON portfolio_lab_runs(ts)")
 
 
 def save_alt_scan(payload, config, *, db_path=ALT_DB_FILE):
@@ -797,6 +809,33 @@ def load_latest_strategy_lab_run(*, db_path=ALT_DB_FILE):
     init_alt_db(db_path)
     with sqlite3.connect(db_path) as db:
         row = db.execute("SELECT payload_json FROM strategy_lab_runs ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def save_portfolio_lab_run(payload, *, db_path=ALT_DB_FILE):
+    init_alt_db(db_path)
+    with sqlite3.connect(db_path) as db:
+        cursor = db.execute("""
+            INSERT INTO portfolio_lab_runs (
+                ts, symbols, years, round_trip_cost_bps, payload_json
+            ) VALUES (?, ?, ?, ?, ?)
+        """, (
+            float(payload.get("ts") or time.time()), ",".join(payload.get("symbols") or []),
+            float(payload.get("years") or 0), float(payload.get("round_trip_cost_bps") or 0),
+            json.dumps(payload, ensure_ascii=False),
+        ))
+        return cursor.lastrowid
+
+
+def load_latest_portfolio_lab_run(*, db_path=ALT_DB_FILE):
+    init_alt_db(db_path)
+    with sqlite3.connect(db_path) as db:
+        row = db.execute("SELECT payload_json FROM portfolio_lab_runs ORDER BY id DESC LIMIT 1").fetchone()
     if not row:
         return None
     try:
@@ -3884,7 +3923,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 </style>
 </head>
 <body>
-<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openStrategyLabDialog()">策略实验室</button><button onclick="window.open('/vibe/','_blank','noopener')">Vibe AI研究</button><button onclick="openLeadlagDialog()">联动传播 V2</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
+<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openStrategyLabDialog()">加密策略实验室</button><button onclick="openPortfolioLabDialog()">多市场组合</button><button onclick="window.open('/vibe/','_blank','noopener')">Vibe AI研究</button><button onclick="openLeadlagDialog()">联动传播 V2</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
 <main>
 <section class="topPanel">
 <h2>模拟盘 / 纸面交易</h2>
@@ -3953,6 +3992,37 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
   <p class="scoreMid">“单窗口通过”=较早行情赚钱、较新行情也赚钱、较新至少6笔、盈亏比≥1.10、较新最大回撤不超过你填写的门槛。门槛放宽只会减少筛选，不会降低实际回撤；它仍然禁止自动真实下单。</p>
   <div class="paperTableWrap" style="max-height:520px"><table id="strategyLabTbl"><thead><tr><th>状态</th><th>为什么</th><th>币种</th><th>策略</th><th>当前信号</th><th>全历史收益 / 约赚</th><th>较新行情收益 / 约赚</th><th>较新最大回落 / 约亏</th><th>较早行情收益</th><th>交易数</th><th>胜率</th><th>盈亏比</th><th>实际历史</th><th>类型</th><th>参考来源</th><th>参数</th></tr></thead><tbody></tbody></table></div>
   <p id="labNote" class="subtle"></p>
+</div>
+</dialog>
+<dialog id="portfolioLabDlg" class="wideDialog">
+<div class="helpHead"><h2>多市场“一品一策”等权组合</h2><button onclick="portfolioLabDlg.close()">关闭</button></div>
+<div class="helpBody">
+  <p>每个产品只在前段历史里从固定策略库挑选自己的策略，冻结以后再用最后约30%历史考试。通过选择门槛的产品按相等仓位合成一个组合；不会连接券商、交易所或自动下单。</p>
+  <div class="paperActions">
+    <label>产品代码<input id="pfSymbols" value="SPY,QQQ,IWM,EEM,FXI,EWJ,EWG,EWU,TLT,IEF,GLD,SLV,USO,DBA,VNQ,BTC-USD,ETH-USD,EURUSD=X,JPY=X,CL=F" style="width:520px"></label>
+    <label>历史年数<input id="pfYears" type="number" min="2" max="20" value="8" step="1" style="width:70px"></label>
+    <label>总本金<input id="pfCapital" type="number" min="100" value="20000" step="1000" style="width:100px"></label>
+    <label>往返成本bps<input id="pfCost" type="number" min="0" max="500" value="20" step="1" style="width:75px"></label>
+    <label>选择段比例<input id="pfSelection" type="number" min="0.55" max="0.85" value="0.70" step="0.05" style="width:70px"></label>
+    <label>验证段最少交易<input id="pfMinTrades" type="number" min="0" max="100" value="3" step="1" style="width:65px"></label>
+    <label>选择段最大回撤%<input id="pfMaxDrawdown" type="number" min="1" max="100" value="30" step="1" style="width:70px"></label>
+    <label><input id="pfAllowShort" type="checkbox">允许做空</label>
+    <label><input id="pfRequirePass" type="checkbox" checked>不合格产品留现金</label>
+    <button onclick="runPortfolioLab(true)">运行组合研究</button><button onclick="runPortfolioLab(false)">读取上次</button>
+    <span id="pfStatus" class="subtle">默认20个产品、等权、只做多。</span>
+  </div>
+  <div class="grid">
+    <div class="metric"><div class="muted">纳入 / 已分析</div><div id="pfIncluded">-</div></div>
+    <div class="metric"><div class="muted">样本外组合收益</div><div id="pfReturn">-</div></div>
+    <div class="metric"><div class="muted">最终金额</div><div id="pfFinal">-</div></div>
+    <div class="metric"><div class="muted">年化收益</div><div id="pfAnnual">-</div></div>
+    <div class="metric"><div class="muted">最大回撤</div><div id="pfDrawdown">-</div></div>
+    <div class="metric"><div class="muted">Sharpe</div><div id="pfSharpe">-</div></div>
+    <div class="metric"><div class="muted">数据源</div><div id="pfSource">-</div></div>
+  </div>
+  <canvas id="pfChart" class="mini" width="1000" height="230"></canvas>
+  <div class="paperTableWrap" style="max-height:520px"><table id="portfolioLabTbl"><thead><tr><th>是否纳入</th><th>产品</th><th>等权仓位</th><th>自己的策略</th><th>最终样本外收益</th><th>最终回撤</th><th>最终交易数</th><th>选择段</th><th>验证段</th><th>选择原因</th><th>参数</th></tr></thead><tbody></tbody></table></div>
+  <p id="pfNote" class="subtle"></p>
 </div>
 </dialog>
 <dialog id="globalDlg">
@@ -5344,6 +5414,44 @@ async function runStrategyLab(refresh){
     status.textContent=`完成：${data.evaluations||0} 组，${data.promotable||0} 组单窗口通过；全部禁止自动真实下单。`;
   }catch(e){status.textContent='策略实验室失败：'+e.message;}
 }
+function portfolioValueText(value){return Number.isFinite(Number(value))?fmt(Number(value),2):'-'}
+function renderPortfolioLab(data){
+  const p=data.portfolio||{}, rows=data.rows||[];
+  document.getElementById('pfIncluded').textContent=`${data.included_products??0} / ${data.selected_products??rows.length}`;
+  document.getElementById('pfReturn').textContent=`${signed(p.net_return_pct,2)}%`;
+  document.getElementById('pfFinal').textContent=`${portfolioValueText(p.final_value)} U`;
+  document.getElementById('pfAnnual').textContent=`${signed(p.annualized_return_pct,2)}%`;
+  document.getElementById('pfDrawdown').textContent=`${signed(p.max_drawdown_pct,2)}%`;
+  document.getElementById('pfSharpe').textContent=fmt(p.sharpe,2);
+  document.getElementById('pfSource').textContent=data.source||'-';
+  if(data.symbols)document.getElementById('pfSymbols').value=data.symbols.join(',');
+  if(data.years)document.getElementById('pfYears').value=data.years;
+  if(data.capital)document.getElementById('pfCapital').value=data.capital;
+  if(data.round_trip_cost_bps!==undefined)document.getElementById('pfCost').value=data.round_trip_cost_bps;
+  if(data.selection_ratio!==undefined)document.getElementById('pfSelection').value=data.selection_ratio;
+  if(data.min_validation_trades!==undefined)document.getElementById('pfMinTrades').value=data.min_validation_trades;
+  if(data.max_selection_drawdown_pct!==undefined)document.getElementById('pfMaxDrawdown').value=data.max_selection_drawdown_pct;
+  document.getElementById('pfAllowShort').checked=data.allow_short===true;
+  document.getElementById('pfRequirePass').checked=data.require_selection_pass!==false;
+  const body=document.querySelector('#portfolioLabTbl tbody');body.innerHTML='';
+  rows.forEach(row=>{
+    const tr=document.createElement('tr'),test=row.test||{},early=row.early||{},validation=row.validation||{};
+    tr.innerHTML=`<td class="${row.included?'passChip':'blockChip'}">${row.included?'纳入':'留现金'}</td><td>${esc(row.symbol)}</td><td>${fmt(row.weight_pct,2)}%</td><td style="text-align:left">${esc(row.strategy)}</td><td class="${Number(test.net_return_pct)>=0?'scoreGood':'scoreBad'}">${signed(test.net_return_pct,2)}%</td><td class="scoreBad">${signed(test.max_drawdown_pct,2)}%</td><td>${test.trades||0}</td><td>${signed(early.net_return_pct,2)}%</td><td>${signed(validation.net_return_pct,2)}%</td><td style="text-align:left">${esc((row.selection_failures||[]).join('；')||'选择段通过')}</td><td style="text-align:left">${esc(JSON.stringify(row.params||{}))}</td>`;
+    tr.onclick=()=>{document.getElementById('detailTitle').textContent=`组合产品：${row.symbol}`;document.getElementById('detailBody').innerHTML=`<div class="detailText"><b>${esc(row.strategy)}</b><br>前段选择结果：${esc((row.selection_failures||[]).join('；')||'通过')}<br>最终样本外：${signed(test.net_return_pct,2)}%，最大回撤 ${signed(test.max_drawdown_pct,2)}%，交易 ${test.trades||0} 笔。<br><br>这不是把全历史冠军直接拿来交易；策略在最终样本外之前已经冻结。</div>`;detailDlg.showModal()};
+    body.appendChild(tr);
+  });
+  if(!rows.length)body.innerHTML='<tr><td colspan="11" class="muted">还没有组合研究结果</td></tr>';
+  const curve=(p.equity_curve||[]).map(item=>({...item,ts:Number(item.ts)/1000}));
+  makeChart('pfChart',curve,[{label:'组合净值U',color:'#2563eb',value:r=>r.equity,digits:2}],{marks:[Number(data.capital||0)],footer:`样本外组合曲线：${curve.length}天`,reset:true});
+  document.getElementById('pfNote').textContent=[data.note||'',(data.failures||[]).map(x=>`${x.symbol}: ${x.error}`).join('；')].filter(Boolean).join(' ');
+}
+async function runPortfolioLab(refresh){
+  const status=document.getElementById('pfStatus');
+  const q=new URLSearchParams({symbols:document.getElementById('pfSymbols').value,years:document.getElementById('pfYears').value,capital:document.getElementById('pfCapital').value,cost_bps:document.getElementById('pfCost').value,selection_ratio:document.getElementById('pfSelection').value,min_trades:document.getElementById('pfMinTrades').value,max_drawdown_pct:document.getElementById('pfMaxDrawdown').value,allow_short:document.getElementById('pfAllowShort').checked?'1':'0',require_pass:document.getElementById('pfRequirePass').checked?'1':'0'});
+  if(refresh)q.set('refresh','1'); status.textContent=refresh?'正在下载多个市场日线并逐产品选择策略，首次可能需要几分钟...':'正在读取上次组合结果...';
+  try{const r=await fetch('portfolio_lab?'+q.toString());const data=await r.json();if(!data.ok)throw new Error(data.error||'组合研究失败');renderPortfolioLab(data);status.textContent=`完成：${data.included_products||0} 个产品纳入等权组合；仅研究，不下单。`;}catch(e){status.textContent='组合研究失败：'+e.message;}
+}
+function openPortfolioLabDialog(){portfolioLabDlg.showModal();runPortfolioLab(false)}
 function openStrategyLabDialog(){strategyLabDlg.showModal();updateLabDayLimit();runStrategyLab(false);}
 function openLeadlagDialog(){leadlagDlg.showModal();loadLeadlag();}
 async function saveLeadlagConfig(){
@@ -5769,6 +5877,8 @@ class AltServerState:
         self.leadlag_lock = threading.Lock()
         self.strategy_lab_lock = threading.Lock()
         self.strategy_lab_cache = None
+        self.portfolio_lab_lock = threading.Lock()
+        self.portfolio_lab_cache = None
         self.realtime_strategy_status = {
             "running": False, "last_eval_ts": None, "last_event_ts": None,
             "last_error": None, "events": 0, "last_revision": 0,
@@ -6039,6 +6149,60 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                 "l2book": l2_snapshot,
                 "admin_enabled": bool(state.config.get("admin_token")),
             })
+            return
+        if parsed.path == "/portfolio_lab":
+            symbols = split_symbols((query.get("symbols") or [",".join(DEFAULT_SYMBOLS)])[0])[:30]
+            if not symbols:
+                json_response(self, {"ok": False, "error": "至少填写一个产品代码"}, status=400)
+                return
+            try:
+                years = max(2.0, min(20.0, float((query.get("years") or ["8"])[0])))
+                capital = max(100.0, min(100_000_000.0, float((query.get("capital") or ["20000"])[0])))
+                cost_bps = max(0.0, min(500.0, float((query.get("cost_bps") or ["20"])[0])))
+                selection_ratio = max(0.55, min(0.85, float((query.get("selection_ratio") or ["0.70"])[0])))
+                min_trades = max(0, min(100, int((query.get("min_trades") or ["3"])[0])))
+                max_drawdown_pct = max(1.0, min(100.0, float((query.get("max_drawdown_pct") or ["30"])[0])))
+            except ValueError as exc:
+                json_response(self, {"ok": False, "error": f"组合参数无效：{exc}"}, status=400)
+                return
+            truthy = ("1", "true", "yes", "on")
+            allow_short = (query.get("allow_short") or [""])[0].lower() in truthy
+            require_pass = (query.get("require_pass") or ["1"])[0].lower() in truthy
+            refresh = (query.get("refresh") or [""])[0].lower() in truthy
+            cache_key = (
+                tuple(symbols), round(years, 4), round(capital, 2), round(cost_bps, 4),
+                round(selection_ratio, 4), min_trades, round(max_drawdown_pct, 4),
+                allow_short, require_pass,
+            )
+            with state.portfolio_lab_lock:
+                cached = state.portfolio_lab_cache
+            if not refresh and cached and cached.get("key") == cache_key:
+                json_response(self, {**cached["payload"], "cache_source": "memory_cache"})
+                return
+            if not refresh:
+                stored = load_latest_portfolio_lab_run(db_path=state.db_path)
+                if stored:
+                    json_response(self, {**stored, "cache_source": "sqlite_latest"})
+                    return
+                json_response(self, {
+                    "ok": True, "rows": [], "portfolio": {}, "cache_source": "empty",
+                    "note": "点击运行组合研究，系统才会下载多市场日线并选策略。",
+                })
+                return
+            try:
+                payload = run_multi_asset_portfolio_lab(
+                    tuple(symbols), years=years, capital=capital,
+                    round_trip_cost_bps=cost_bps, selection_ratio=selection_ratio,
+                    min_validation_trades=min_trades,
+                    max_selection_drawdown_pct=max_drawdown_pct,
+                    allow_short=allow_short, require_selection_pass=require_pass,
+                )
+                payload["run_id"] = save_portfolio_lab_run(payload, db_path=state.db_path)
+                with state.portfolio_lab_lock:
+                    state.portfolio_lab_cache = {"key": cache_key, "payload": payload}
+                json_response(self, {**payload, "cache_source": "fresh"})
+            except (URLError, HTTPError, TimeoutError, RuntimeError, ValueError, KeyError, IndexError, TypeError, OSError) as exc:
+                json_response(self, {"ok": False, "error": str(exc)}, status=500)
             return
         if parsed.path == "/strategy_lab":
             coins = split_symbols((query.get("coins") or ["BTC,ETH,SOL,DOGE,XRP,ADA,AVAX,LINK,SUI,AAVE,UNI"])[0])[:12]

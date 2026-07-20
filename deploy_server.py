@@ -9,7 +9,12 @@ HOST = "50.114.113.121"
 USER = "root"
 LOCAL_ROOT = Path(__file__).resolve().parent
 REMOTE_ROOT = "/opt/hyperliquid-monitor"
-DEPLOY_FILES = ("hyperliquid_correlation_monitor.py", "crypto_strategy_lab.py", "crypto_strategy_pine.py")
+DEPLOY_FILES = (
+    "hyperliquid_correlation_monitor.py",
+    "crypto_strategy_lab.py",
+    "crypto_strategy_pine.py",
+    "multi_asset_portfolio_lab.py",
+)
 SERVICE = "hyperliquid-alt-monitor.service"
 
 
