@@ -662,6 +662,8 @@ def evaluate_coin(coin, candles, *, interval="15m", round_trip_cost_bps=12.0, ma
             gate_failures.append(f"盈亏比{test['profit_factor']:.2f}，低于1.10")
         if test["max_drawdown_pct"] < -abs(float(max_drawdown_pct)):
             gate_failures.append(f"最大回落{test['max_drawdown_pct']:.2f}%，超过{abs(float(max_drawdown_pct)):.2f}%")
+        if overall["max_drawdown_pct"] < -80:
+            gate_failures.append("全历史曾接近归零（最大回撤超过80%）")
         promotable = not gate_failures
         score = test["net_bps"] + max(test["max_drawdown_bps"], -2000) * 0.35 + min(test["trades"], 20) * 2
         results.append({
