@@ -3884,7 +3884,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 </style>
 </head>
 <body>
-<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openStrategyLabDialog()">策略实验室</button><button onclick="openLeadlagDialog()">联动传播 V2</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
+<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openStrategyLabDialog()">策略实验室</button><button onclick="window.open('/vibe/','_blank','noopener')">Vibe AI研究</button><button onclick="openLeadlagDialog()">联动传播 V2</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
 <main>
 <section class="topPanel">
 <h2>模拟盘 / 纸面交易</h2>
@@ -4269,11 +4269,12 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>往返成本 bps</code>：估算一笔从开仓到平仓的总手续费和滑点。默认 12 bps。真实成本会随 maker/taker 费率、盘口、币种和订单大小变化。</p>
 <p><code>当前信号</code>：最后一根已获取 K 线得出的做多、做空或空仓目标。它不是实时盘口信号；15分钟策略只有在新15分钟K线确认后才应变化。</p>
 <p><code>假设投入USDC</code>：只把历史收益百分比换算成人话金额。例如较新收益6%，输入100U就显示历史约赚6U，输入1000U显示约赚60U；不代表未来一定得到这些钱。</p>
-<p><code>为什么未通过</code>：会直接列出较早行情亏损、较新行情亏损、交易不足6笔、盈亏比低于1.10或最大回落超过12%中的具体原因。</p>
+<p><code>为什么未通过</code>：会直接列出较早行情亏损、较新行情亏损、交易不足6笔、盈亏比低于1.10、最大回落超过你填写的门槛，或全历史曾接近归零等具体原因。</p>
 <p><code>复制 Pine</code>：点击策略行进入详情，可以生成、复制或下载对应的 Pine Script v6。它是本项目按公开规则独立实现的代码，不是复制社区作者的受保护源码。</p>
 <p><code>实际历史</code>：必须看这一列，而不是只看请求天数。Hyperliquid 公开 candleSnapshot 约有5000根上限：5分钟约17天、15分钟约52天、1小时约208天、4小时约833天。要输入2000天请选择日线，但实际长度仍受币种上线时间限制。</p>
 <p><code>TradingView 和这里的区别</code>：TradingView 适合发现和阅读策略、使用它的策略测试器；最终要在 Hyperliquid 下单时，仍应使用 Hyperliquid K线重跑，因为交易所价格、K线边界、手续费和成交条件可能不同。</p>
 <p>TradingView 公共库可以搜索和手工添加策略，但没有官方接口允许任意批量下载全部社区源码。开源脚本可在页面查看时按作者许可人工移植；受保护或仅邀请脚本不能拉取源码，也不应绕过保护。</p>
+<p><code>Vibe AI研究</code>：单独部署的开源 Vibe-Trading 研究工作区，包含策略生成、462个公开因子、批量回测、研究团队和 Pine 导出。它默认不连接任何真实账户；先在里面发现候选，再回到本页面用 Hyperliquid 数据、成本和实盘规则复验。</p>
 
 <h3>l2Book 表格怎么读</h3>
 <p><code>买一 bid</code>：现在别人愿意买的最高价。你如果马上卖，通常接近这个价成交。</p>
