@@ -3934,18 +3934,20 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
   <p>统一使用 Hyperliquid K线测试常见策略。以30天为例：先用较早约18天检查规则，再用较新约12天参加一次“没看过答案的考试”。信号在本根收盘计算、下一根开盘成交，并扣除配置的往返成本。</p>
   <div class="paperActions">
     <label>币种<input id="labCoins" value="BTC,ETH,SOL" style="width:180px"></label>
-    <label>周期<select id="labInterval"><option value="5m">5分钟</option><option value="15m" selected>15分钟</option><option value="1h">1小时</option><option value="4h">4小时</option></select></label>
-    <label>历史天数<input id="labDays" type="number" min="7" max="180" value="30" style="width:75px"></label>
+    <label>周期<select id="labInterval" onchange="updateLabDayLimit()"><option value="5m">5分钟</option><option value="15m" selected>15分钟</option><option value="1h">1小时</option><option value="4h">4小时</option><option value="1d">日线</option></select></label>
+    <label>请求历史天数<input id="labDays" type="number" min="7" max="52" value="30" style="width:85px"></label>
     <label>往返成本bps<input id="labCost" type="number" min="0" max="500" value="12" step="0.5" style="width:75px"></label>
     <label>假设投入USDC<input id="labCapital" type="number" min="1" max="10000000" value="100" step="10" style="width:90px" onchange="if(latestStrategyLabData)renderStrategyLab(latestStrategyLabData)"></label>
     <button onclick="runStrategyLab(true)">运行新回测</button><button onclick="runStrategyLab(false)">读取上次</button>
     <span id="labStatus" class="subtle">真实交易未授权；先看样本外结果。</span>
   </div>
+  <p id="labDayHint" class="subtle">15分钟公开K线约5000根，实际最多约52天；要输入2000天请选择“日线”。</p>
   <div class="grid">
     <div class="metric"><div class="muted">策略参数组合</div><div id="labEvaluations">-</div></div>
     <div class="metric"><div class="muted">单窗口通过（禁止实盘）</div><div id="labPromotable">-</div></div>
     <div class="metric"><div class="muted">数据源</div><div id="labSource">-</div></div>
     <div class="metric"><div class="muted">更新时间</div><div id="labTime">-</div></div>
+    <div class="metric"><div class="muted">真正拿到的历史</div><div id="labCoverage">-</div></div>
   </div>
   <p class="scoreMid">“单窗口通过”=较早行情赚钱、较新行情也赚钱、较新至少6笔、盈亏比≥1.10、最大回落不超过12%。它仍然禁止自动真实下单。金额只是把历史收益率乘以你填写的假设本金，不是未来承诺。</p>
   <div class="paperTableWrap" style="max-height:520px"><table id="strategyLabTbl"><thead><tr><th>状态</th><th>为什么</th><th>币种</th><th>策略</th><th>当前信号</th><th>较新行情收益 / 约赚</th><th>较新最大回落 / 约亏</th><th>较早行情收益</th><th>交易数</th><th>胜率</th><th>盈亏比</th><th>实际历史</th><th>类型</th><th>参考来源</th><th>参数</th></tr></thead><tbody></tbody></table></div>
@@ -4268,7 +4270,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>假设投入USDC</code>：只把历史收益百分比换算成人话金额。例如较新收益6%，输入100U就显示历史约赚6U，输入1000U显示约赚60U；不代表未来一定得到这些钱。</p>
 <p><code>为什么未通过</code>：会直接列出较早行情亏损、较新行情亏损、交易不足6笔、盈亏比低于1.10或最大回落超过12%中的具体原因。</p>
 <p><code>复制 Pine</code>：点击策略行进入详情，可以生成、复制或下载对应的 Pine Script v6。它是本项目按公开规则独立实现的代码，不是复制社区作者的受保护源码。</p>
-<p><code>实际历史</code>：必须看这一列，而不是只看你填写的天数。Hyperliquid 公开 candleSnapshot 约有 5000 根上限，所以 5分钟大约只有17天、15分钟大约52天；更长历史需要 TradingView 或授权历史数据源。</p>
+<p><code>实际历史</code>：必须看这一列，而不是只看请求天数。Hyperliquid 公开 candleSnapshot 约有5000根上限：5分钟约17天、15分钟约52天、1小时约208天、4小时约833天。要输入2000天请选择日线，但实际长度仍受币种上线时间限制。</p>
 <p><code>TradingView 和这里的区别</code>：TradingView 适合发现和阅读策略、使用它的策略测试器；最终要在 Hyperliquid 下单时，仍应使用 Hyperliquid K线重跑，因为交易所价格、K线边界、手续费和成交条件可能不同。</p>
 <p>TradingView 公共库可以搜索和手工添加策略，但没有官方接口允许任意批量下载全部社区源码。开源脚本可在页面查看时按作者许可人工移植；受保护或仅邀请脚本不能拉取源码，也不应绕过保护。</p>
 
@@ -5208,6 +5210,13 @@ function strategyFamilyText(value){
 }
 function strategyPercent(bps){return Math.expm1(Number(bps||0)/10000)*100}
 function labCapitalValue(){return Math.max(1,Number(document.getElementById('labCapital')?.value||100))}
+const labDayLimits={"5m":17,"15m":52,"1h":208,"4h":833,"1d":2000};
+function updateLabDayLimit(){
+  const interval=document.getElementById('labInterval')?.value||'15m',input=document.getElementById('labDays'),max=labDayLimits[interval]||180;
+  if(input){input.max=max;if(Number(input.value)>max)input.value=max;}
+  const label=({"5m":"5分钟","15m":"15分钟","1h":"1小时","4h":"4小时","1d":"日线"})[interval]||interval;
+  const hint=document.getElementById('labDayHint');if(hint)hint.textContent=`${label}按公开接口约5000根K线上限，最多请求约${max}天；真正长度还受币种上线时间限制。${interval==='1d'?'可以输入2000天。':'要研究2000天请选择“日线”。'}`;
+}
 function signed(value,digits=2){const n=Number(value||0);return `${n>=0?'+':''}${fmt(n,digits)}`}
 function strategyMoneyText(bps,capital=labCapitalValue()){
   const percent=strategyPercent(bps),profit=capital*percent/100;
@@ -5277,11 +5286,14 @@ function renderStrategyLab(data){
   if((data.coins||[]).length)document.getElementById('labCoins').value=data.coins.join(',');
   if(data.interval)document.getElementById('labInterval').value=data.interval;
   if(data.days)document.getElementById('labDays').value=data.days;
+  updateLabDayLimit();
   if(data.round_trip_cost_bps!==undefined)document.getElementById('labCost').value=data.round_trip_cost_bps;
   document.getElementById('labEvaluations').textContent=data.evaluations??rows.length;
   document.getElementById('labPromotable').textContent=data.promotable??rows.filter(row=>row.promotable).length;
   document.getElementById('labSource').textContent=({hyperliquid_candles:'Hyperliquid K线',sqlite_latest:'数据库上次结果',memory_cache:'内存缓存',empty:'尚未运行'})[data.source]||data.source||'Hyperliquid K线';
   document.getElementById('labTime').textContent=data.ts?fmtBeijingDateTime(data.ts):'-';
+  const coverage=(data.coverage||[]).map(item=>`${item.coin} ${fmt(item.actual_days,1)}天/${item.candles}根`);
+  const coverageEl=document.getElementById('labCoverage');coverageEl.textContent=coverage.length?coverage.join('；'):'-';coverageEl.className=(data.coverage||[]).some(item=>Number(item.actual_days)+1<Number(data.days||0))?'scoreBad':'';
   rows.forEach(row=>{
     const test=row.test||{},train=row.train||{},tr=document.createElement('tr');
     const source=(row.reference||'经典公开规则').replace('TradingView社区思路参考（按公开规则独立复刻，不是原作者源码）：','TV参考：');
@@ -5294,6 +5306,7 @@ function renderStrategyLab(data){
   document.getElementById('labNote').textContent=[data.note||'',failures?`未能读取：${failures}`:''].filter(Boolean).join(' ');
 }
 async function runStrategyLab(refresh){
+  updateLabDayLimit();
   const status=document.getElementById('labStatus');
   const coins=(document.getElementById('labCoins').value||'').trim();
   const interval=document.getElementById('labInterval').value;
@@ -5308,7 +5321,7 @@ async function runStrategyLab(refresh){
     status.textContent=`完成：${data.evaluations||0} 组，${data.promotable||0} 组单窗口通过；全部禁止自动真实下单。`;
   }catch(e){status.textContent='策略实验室失败：'+e.message;}
 }
-function openStrategyLabDialog(){strategyLabDlg.showModal();runStrategyLab(false);}
+function openStrategyLabDialog(){strategyLabDlg.showModal();updateLabDayLimit();runStrategyLab(false);}
 function openLeadlagDialog(){leadlagDlg.showModal();loadLeadlag();}
 async function saveLeadlagConfig(){
   const status=document.getElementById('llSaveStatus'),token=adminTokenValue();if(!token){status.textContent='请先在全局设置填写管理口令';return;}
@@ -6007,16 +6020,21 @@ class AltRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/strategy_lab":
             coins = split_symbols((query.get("coins") or ["BTC,ETH,SOL"])[0])[:12]
             interval = str((query.get("interval") or ["15m"])[0]).lower()
-            days = max(7, min(180, int((query.get("days") or ["30"])[0])))
-            cost_bps = max(0.0, min(500.0, float((query.get("cost_bps") or ["12"])[0])))
-            limit = max(1, min(1000, int((query.get("limit") or ["1000"])[0])))
-            refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
             if not coins:
                 json_response(self, {"ok": False, "error": "至少填写一个币种"}, status=400)
                 return
-            if interval not in ("5m", "15m", "1h", "4h"):
-                json_response(self, {"ok": False, "error": "周期只允许 5m/15m/1h/4h"}, status=400)
+            day_limits = {"5m": 17, "15m": 52, "1h": 208, "4h": 833, "1d": 2000}
+            if interval not in day_limits:
+                json_response(self, {"ok": False, "error": "周期只允许 5m/15m/1h/4h/1d"}, status=400)
                 return
+            try:
+                days = max(7, min(day_limits[interval], int((query.get("days") or ["30"])[0])))
+                cost_bps = max(0.0, min(500.0, float((query.get("cost_bps") or ["12"])[0])))
+                limit = max(1, min(1000, int((query.get("limit") or ["1000"])[0])))
+            except ValueError as exc:
+                json_response(self, {"ok": False, "error": f"回测参数无效：{exc}"}, status=400)
+                return
+            refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
             cache_key = (tuple(coins), interval, days, round(cost_bps, 6), limit)
             with state.strategy_lab_lock:
                 cached = state.strategy_lab_cache
