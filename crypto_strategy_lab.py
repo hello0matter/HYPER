@@ -610,6 +610,13 @@ def evaluate_coin(coin, candles, *, interval="15m", round_trip_cost_bps=12.0):
     results = []
     for spec in strategy_specs():
         targets = strategy_targets(candles, spec)
+        # Descriptive only: the complete-period result must not influence the
+        # out-of-sample promotion gate, otherwise the later segment leaks into
+        # strategy selection.
+        overall = backtest_targets(
+            candles, targets, start=1, end=len(candles) - 1,
+            round_trip_cost_bps=round_trip_cost_bps,
+        )
         train = backtest_targets(candles, targets, start=1, end=split, round_trip_cost_bps=round_trip_cost_bps)
         test = backtest_targets(candles, targets, start=split + 1, end=len(candles) - 1, round_trip_cost_bps=round_trip_cost_bps)
         stable = train["net_bps"] > 0 and test["net_bps"] > 0
@@ -629,7 +636,7 @@ def evaluate_coin(coin, candles, *, interval="15m", round_trip_cost_bps=12.0):
         results.append({
             "coin": coin, "interval": interval, "family": spec.family, "strategy": spec.name,
             "params": spec.params, "reference": spec.reference, "samples": len(candles), "split_index": split,
-            "train": train, "test": test, "stable": stable, "promotable": promotable,
+            "overall": overall, "train": train, "test": test, "stable": stable, "promotable": promotable,
             "gate_failures": gate_failures,
             "gate_summary": "本窗口全部最低条件满足；仍禁止实盘" if promotable else "；".join(gate_failures),
             "score": score, "current_signal": int(targets[-1]),

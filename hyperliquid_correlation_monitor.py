@@ -3950,7 +3950,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">真正拿到的历史</div><div id="labCoverage">-</div></div>
   </div>
   <p class="scoreMid">“单窗口通过”=较早行情赚钱、较新行情也赚钱、较新至少6笔、盈亏比≥1.10、最大回落不超过12%。它仍然禁止自动真实下单。金额只是把历史收益率乘以你填写的假设本金，不是未来承诺。</p>
-  <div class="paperTableWrap" style="max-height:520px"><table id="strategyLabTbl"><thead><tr><th>状态</th><th>为什么</th><th>币种</th><th>策略</th><th>当前信号</th><th>较新行情收益 / 约赚</th><th>较新最大回落 / 约亏</th><th>较早行情收益</th><th>交易数</th><th>胜率</th><th>盈亏比</th><th>实际历史</th><th>类型</th><th>参考来源</th><th>参数</th></tr></thead><tbody></tbody></table></div>
+  <div class="paperTableWrap" style="max-height:520px"><table id="strategyLabTbl"><thead><tr><th>状态</th><th>为什么</th><th>币种</th><th>策略</th><th>当前信号</th><th>全历史收益 / 约赚</th><th>较新行情收益 / 约赚</th><th>较新最大回落 / 约亏</th><th>较早行情收益</th><th>交易数</th><th>胜率</th><th>盈亏比</th><th>实际历史</th><th>类型</th><th>参考来源</th><th>参数</th></tr></thead><tbody></tbody></table></div>
   <p id="labNote" class="subtle"></p>
 </div>
 </dialog>
@@ -5224,7 +5224,7 @@ function strategyMoneyText(bps,capital=labCapitalValue()){
 }
 function showStrategyLabDetail(row){
   selectedStrategyLabRow=row;selectedStrategyPine=null;
-  const train=row.train||{},test=row.test||{},capital=labCapitalValue();
+  const overall=row.overall||{},train=row.train||{},test=row.test||{},capital=labCapitalValue();
   const earlierDays=Number(row.earlier_days??Number(row.actual_days||0)*.60);
   const newerDays=Number(row.newer_days??Number(row.actual_days||0)*.40);
   const gate=row.gate_summary||(row.promotable?'本窗口全部最低条件满足；仍禁止实盘':'旧记录没有失败原因，请运行新回测');
@@ -5239,6 +5239,7 @@ function showStrategyLabDetail(row){
       <div class="detailBox"><div class="muted">实际历史覆盖</div><div>${fmt(row.actual_days,1)} 天 / ${row.samples||0} 根</div></div>
       <div class="detailBox"><div class="muted">参数</div><div>${esc(JSON.stringify(row.params||{}))}</div></div>
       <div class="detailBox"><div class="muted">参考来源</div><div>${esc(row.reference||'经典公开技术规则')}</div></div>
+      <div class="detailBox"><div class="muted">全历史约${fmt(row.actual_days,1)}天：收益 / 最大回落</div><div class="${Number(overall.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(overall.net_bps,capital)} / ${strategyMoneyText(overall.max_drawdown_bps,capital)}</div></div>
       <div class="detailBox"><div class="muted">较早约${fmt(earlierDays,1)}天：收益 / 最大回落</div><div>${strategyMoneyText(train.net_bps,capital)} / ${strategyMoneyText(train.max_drawdown_bps,capital)}</div></div>
       <div class="detailBox"><div class="muted">较新约${fmt(newerDays,1)}天：收益 / 最大回落</div><div>${strategyMoneyText(test.net_bps,capital)} / ${strategyMoneyText(test.max_drawdown_bps,capital)}</div></div>
       <div class="detailBox"><div class="muted">较早行情：交易 / 胜率 / 盈亏比</div><div>${train.trades||0} / ${fmt(Number(train.win_rate||0)*100,1)}% / ${fmt(train.profit_factor,2)}</div></div>
@@ -5295,13 +5296,13 @@ function renderStrategyLab(data){
   const coverage=(data.coverage||[]).map(item=>`${item.coin} ${fmt(item.actual_days,1)}天/${item.candles}根`);
   const coverageEl=document.getElementById('labCoverage');coverageEl.textContent=coverage.length?coverage.join('；'):'-';coverageEl.className=(data.coverage||[]).some(item=>Number(item.actual_days)+1<Number(data.days||0))?'scoreBad':'';
   rows.forEach(row=>{
-    const test=row.test||{},train=row.train||{},tr=document.createElement('tr');
+    const overall=row.overall||{},test=row.test||{},train=row.train||{},tr=document.createElement('tr');
     const source=(row.reference||'经典公开规则').replace('TradingView社区思路参考（按公开规则独立复刻，不是原作者源码）：','TV参考：');
     const reason=row.gate_summary||(row.promotable?'最低条件满足；仍禁实盘':'旧记录请重新回测查看原因');
-    tr.innerHTML=`<td class="${row.promotable?'passChip':'blockChip'}">${row.promotable?'单窗通过・禁实盘':'未通过'}</td><td class="reasonCell">${esc(reason)}</td><td>${esc(row.coin)}</td><td>${esc(row.strategy)}</td><td>${strategySignalText(row.current_signal)}</td><td class="${Number(test.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(test.net_bps,capital)}</td><td class="scoreBad">${strategyMoneyText(test.max_drawdown_bps,capital)}</td><td class="${Number(train.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(train.net_bps,capital)}</td><td>${test.trades||0}</td><td>${fmt(Number(test.win_rate||0)*100,1)}%</td><td>${fmt(test.profit_factor,2)}</td><td>${fmt(row.actual_days,1)}天 / ${row.samples||0}根</td><td>${esc(strategyFamilyText(row.family))}</td><td style="text-align:left">${esc(source)}</td><td style="text-align:left">${esc(JSON.stringify(row.params||{}))}</td>`;
+    tr.innerHTML=`<td class="${row.promotable?'passChip':'blockChip'}">${row.promotable?'单窗通过・禁实盘':'未通过'}</td><td class="reasonCell">${esc(reason)}</td><td>${esc(row.coin)}</td><td>${esc(row.strategy)}</td><td>${strategySignalText(row.current_signal)}</td><td class="${Number(overall.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(overall.net_bps,capital)}</td><td class="${Number(test.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(test.net_bps,capital)}</td><td class="scoreBad">${strategyMoneyText(test.max_drawdown_bps,capital)}</td><td class="${Number(train.net_bps)>=0?'scoreGood':'scoreBad'}">${strategyMoneyText(train.net_bps,capital)}</td><td>${test.trades||0}</td><td>${fmt(Number(test.win_rate||0)*100,1)}%</td><td>${fmt(test.profit_factor,2)}</td><td>${fmt(row.actual_days,1)}天 / ${row.samples||0}根</td><td>${esc(strategyFamilyText(row.family))}</td><td style="text-align:left">${esc(source)}</td><td style="text-align:left">${esc(JSON.stringify(row.params||{}))}</td>`;
     tr.title='点击查看本金换算、较早/较新行情解释和Pine代码';tr.onclick=()=>showStrategyLabDetail(row);body.appendChild(tr);
   });
-  if(!rows.length)body.innerHTML='<tr><td colspan="15" class="muted">还没有回测结果，点击“运行新回测”</td></tr>';
+  if(!rows.length)body.innerHTML='<tr><td colspan="16" class="muted">还没有回测结果，点击“运行新回测”</td></tr>';
   const failures=(data.failures||[]).map(item=>`${item.coin}: ${item.error}`).join('；');
   document.getElementById('labNote').textContent=[data.note||'',failures?`未能读取：${failures}`:''].filter(Boolean).join(' ');
 }
