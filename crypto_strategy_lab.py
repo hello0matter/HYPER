@@ -634,7 +634,7 @@ def strategy_specs():
     return specs
 
 
-def evaluate_coin(coin, candles, *, interval="15m", round_trip_cost_bps=12.0):
+def evaluate_coin(coin, candles, *, interval="15m", round_trip_cost_bps=12.0, max_drawdown_pct=12.0):
     if len(candles) < 240:
         raise ValueError(f"{coin} K线不足：{len(candles)}")
     split = max(180, int(len(candles) * 0.60))
@@ -660,8 +660,8 @@ def evaluate_coin(coin, candles, *, interval="15m", round_trip_cost_bps=12.0):
             gate_failures.append(f"较新行情只有{test['trades']}笔，少于6笔")
         if test["profit_factor"] < 1.10:
             gate_failures.append(f"盈亏比{test['profit_factor']:.2f}，低于1.10")
-        if test["max_drawdown_pct"] < -12:
-            gate_failures.append(f"最大回落{test['max_drawdown_pct']:.2f}%，超过12%")
+        if test["max_drawdown_pct"] < -abs(float(max_drawdown_pct)):
+            gate_failures.append(f"最大回落{test['max_drawdown_pct']:.2f}%，超过{abs(float(max_drawdown_pct)):.2f}%")
         promotable = not gate_failures
         score = test["net_bps"] + max(test["max_drawdown_bps"], -2000) * 0.35 + min(test["trades"], 20) * 2
         results.append({
@@ -671,12 +671,13 @@ def evaluate_coin(coin, candles, *, interval="15m", round_trip_cost_bps=12.0):
             "gate_failures": gate_failures,
             "gate_summary": "本窗口全部最低条件满足；仍禁止实盘" if promotable else "；".join(gate_failures),
             "score": score, "current_signal": int(targets[-1]),
+            "max_drawdown_limit_pct": abs(float(max_drawdown_pct)),
         })
     results.sort(key=lambda item: item["score"], reverse=True)
     return results
 
 
-def run_strategy_lab(coins=("BTC", "ETH", "SOL"), *, days=30, interval="15m", round_trip_cost_bps=12.0, limit=50):
+def run_strategy_lab(coins=("BTC", "ETH", "SOL"), *, days=30, interval="15m", round_trip_cost_bps=12.0, max_drawdown_pct=12.0, limit=50):
     rows, failures, coverage = [], [], []
     pending = list(coins)
     for pass_index in range(2):
@@ -686,7 +687,10 @@ def run_strategy_lab(coins=("BTC", "ETH", "SOL"), *, days=30, interval="15m", ro
                 candles = fetch_hl_ohlcv(coin, days=days, interval=interval)
                 actual_days = ((candles[-1]["ts"] - candles[0]["ts"]) / 86_400_000) if len(candles) > 1 else 0.0
                 coverage.append({"coin": coin, "candles": len(candles), "actual_days": actual_days})
-                evaluated = evaluate_coin(coin, candles, interval=interval, round_trip_cost_bps=round_trip_cost_bps)
+                evaluated = evaluate_coin(
+                    coin, candles, interval=interval, round_trip_cost_bps=round_trip_cost_bps,
+                    max_drawdown_pct=max_drawdown_pct,
+                )
                 for row in evaluated:
                     row["actual_days"] = actual_days
                     row["earlier_days"] = actual_days * row["split_index"] / max(1, row["samples"] - 1)
@@ -710,7 +714,8 @@ def run_strategy_lab(coins=("BTC", "ETH", "SOL"), *, days=30, interval="15m", ro
         coverage_note = f" 请求{days}天，但 Hyperliquid 公开接口约有5000根K线上限；实际覆盖：{detail}。"
     return {
         "ok": bool(rows), "ts": time.time(), "coins": list(coins), "days": days, "interval": interval,
-        "round_trip_cost_bps": round_trip_cost_bps, "strategy_count": len(strategy_specs()),
+        "round_trip_cost_bps": round_trip_cost_bps, "max_drawdown_pct": abs(float(max_drawdown_pct)),
+        "strategy_count": len(strategy_specs()),
         "evaluations": len(rows), "promotable": sum(bool(row["promotable"]) for row in rows),
         "rows": rows[:max(1, int(limit))], "failures": failures, "coverage": coverage,
         "note": "排名只使用样本外结果并已扣配置的往返成本；promotable 仍不是自动实盘授权。" + coverage_note,
@@ -723,11 +728,13 @@ def main():
     parser.add_argument("--interval", default="15m")
     parser.add_argument("--days", type=int, default=30)
     parser.add_argument("--cost", type=float, default=12.0, help="估算往返成本 bps")
+    parser.add_argument("--max-drawdown", type=float, default=12.0)
     parser.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
     result = run_strategy_lab(
         tuple(item.strip().upper() for item in args.coins.split(",") if item.strip()),
-        days=args.days, interval=args.interval, round_trip_cost_bps=args.cost, limit=args.limit,
+        days=args.days, interval=args.interval, round_trip_cost_bps=args.cost,
+        max_drawdown_pct=args.max_drawdown, limit=args.limit,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

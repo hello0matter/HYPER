@@ -3937,6 +3937,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <label>周期<select id="labInterval" onchange="updateLabDayLimit()"><option value="5m">5分钟</option><option value="15m" selected>15分钟</option><option value="1h">1小时</option><option value="4h">4小时</option><option value="1d">日线</option></select></label>
     <label>请求历史天数<input id="labDays" type="number" min="7" max="52" value="30" style="width:85px"></label>
     <label>往返成本bps<input id="labCost" type="number" min="0" max="500" value="12" step="0.5" style="width:75px"></label>
+    <label>最大回撤门槛%<input id="labMaxDrawdown" type="number" min="1" max="100" value="12" step="1" style="width:75px"></label>
     <label>假设投入USDC<input id="labCapital" type="number" min="1" max="10000000" value="100" step="10" style="width:90px" onchange="if(latestStrategyLabData)renderStrategyLab(latestStrategyLabData)"></label>
     <button onclick="runStrategyLab(true)">运行新回测</button><button onclick="runStrategyLab(false)">读取上次</button>
     <span id="labStatus" class="subtle">真实交易未授权；先看样本外结果。</span>
@@ -3949,7 +3950,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">更新时间</div><div id="labTime">-</div></div>
     <div class="metric"><div class="muted">真正拿到的历史</div><div id="labCoverage">-</div></div>
   </div>
-  <p class="scoreMid">“单窗口通过”=较早行情赚钱、较新行情也赚钱、较新至少6笔、盈亏比≥1.10、最大回落不超过12%。它仍然禁止自动真实下单。金额只是把历史收益率乘以你填写的假设本金，不是未来承诺。</p>
+  <p class="scoreMid">“单窗口通过”=较早行情赚钱、较新行情也赚钱、较新至少6笔、盈亏比≥1.10、较新最大回撤不超过你填写的门槛。门槛放宽只会减少筛选，不会降低实际回撤；它仍然禁止自动真实下单。</p>
   <div class="paperTableWrap" style="max-height:520px"><table id="strategyLabTbl"><thead><tr><th>状态</th><th>为什么</th><th>币种</th><th>策略</th><th>当前信号</th><th>全历史收益 / 约赚</th><th>较新行情收益 / 约赚</th><th>较新最大回落 / 约亏</th><th>较早行情收益</th><th>交易数</th><th>胜率</th><th>盈亏比</th><th>实际历史</th><th>类型</th><th>参考来源</th><th>参数</th></tr></thead><tbody></tbody></table></div>
   <p id="labNote" class="subtle"></p>
 </div>
@@ -5298,6 +5299,7 @@ function renderStrategyLab(data){
   if(data.days)document.getElementById('labDays').value=data.days;
   updateLabDayLimit();
   if(data.round_trip_cost_bps!==undefined)document.getElementById('labCost').value=data.round_trip_cost_bps;
+  if(data.max_drawdown_pct!==undefined)document.getElementById('labMaxDrawdown').value=data.max_drawdown_pct;
   document.getElementById('labEvaluations').textContent=data.evaluations??rows.length;
   document.getElementById('labPromotable').textContent=data.promotable??rows.filter(row=>row.promotable).length;
   document.getElementById('labSource').textContent=({hyperliquid_candles:'Hyperliquid K线',sqlite_latest:'数据库上次结果',memory_cache:'内存缓存',empty:'尚未运行'})[data.source]||data.source||'Hyperliquid K线';
@@ -5322,10 +5324,11 @@ async function runStrategyLab(refresh){
   const interval=document.getElementById('labInterval').value;
   const days=document.getElementById('labDays').value;
   const cost=document.getElementById('labCost').value;
+  const maxDrawdown=document.getElementById('labMaxDrawdown').value;
   if(!coins){status.textContent='至少填写一个币种';return;}
   status.textContent=refresh?'正在下载K线并回测，可能需要几十秒...':'正在读取上次结果...';
   try{
-    const query=new URLSearchParams({coins,interval,days,cost_bps:cost,limit:'1000'});if(refresh)query.set('refresh','1');
+    const query=new URLSearchParams({coins,interval,days,cost_bps:cost,max_drawdown_pct:maxDrawdown,limit:'1000'});if(refresh)query.set('refresh','1');
     const response=await fetch('strategy_lab?'+query.toString());const data=await response.json();
     if(!data.ok){renderStrategyLab(data);const failed=(data.failures||[]).map(item=>`${item.coin}: ${item.error}`).join('；');throw new Error(data.error||failed||'回测失败');}renderStrategyLab(data);
     status.textContent=`完成：${data.evaluations||0} 组，${data.promotable||0} 组单窗口通过；全部禁止自动真实下单。`;
@@ -6040,12 +6043,13 @@ class AltRequestHandler(BaseHTTPRequestHandler):
             try:
                 days = max(7, min(day_limits[interval], int((query.get("days") or ["30"])[0])))
                 cost_bps = max(0.0, min(500.0, float((query.get("cost_bps") or ["12"])[0])))
+                max_drawdown_pct = max(1.0, min(100.0, float((query.get("max_drawdown_pct") or ["12"])[0])))
                 limit = max(1, min(1000, int((query.get("limit") or ["1000"])[0])))
             except ValueError as exc:
                 json_response(self, {"ok": False, "error": f"回测参数无效：{exc}"}, status=400)
                 return
             refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
-            cache_key = (tuple(coins), interval, days, round(cost_bps, 6), limit)
+            cache_key = (tuple(coins), interval, days, round(cost_bps, 6), round(max_drawdown_pct, 6), limit)
             with state.strategy_lab_lock:
                 cached = state.strategy_lab_cache
             if not refresh and cached and cached.get("key") == cache_key and time.time() - cached.get("ts", 0) < 300:
@@ -6061,7 +6065,7 @@ class AltRequestHandler(BaseHTTPRequestHandler):
             try:
                 payload = run_strategy_lab(
                     tuple(coins), days=days, interval=interval,
-                    round_trip_cost_bps=cost_bps, limit=limit,
+                    round_trip_cost_bps=cost_bps, max_drawdown_pct=max_drawdown_pct, limit=limit,
                 )
                 payload["run_id"] = save_strategy_lab_run(payload, db_path=state.db_path)
                 with state.strategy_lab_lock:
