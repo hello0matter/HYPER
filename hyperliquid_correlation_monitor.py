@@ -4040,6 +4040,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">相对基准超额</div><div id="pfExcess">-</div></div>
     <div class="metric"><div class="muted">数据源</div><div id="pfSource">-</div></div>
   </div>
+  <div class="paperActions"><b>收益曲线显示</b><button id="pfChartStrategyBtn" onclick="setPortfolioChartMode('strategy')">策略单独放大</button><button id="pfChartCompareBtn" onclick="setPortfolioChartMode('compare')">与基准同轴对比</button><span id="pfChartCaption" class="subtle">默认放大蓝色策略线；同轴对比时可能因基准涨幅较大而显得扁平。</span></div>
   <canvas id="pfChart" class="mini" width="1000" height="230"></canvas>
   <div class="paperTableWrap" style="max-height:520px"><table id="portfolioLabTbl"><thead><tr><th>状态</th><th>产品</th><th>最新风险仓位</th><th>当前滚动选择</th><th>有效窗口</th><th>最终样本外收益</th><th>最终回撤</th><th>最终交易数</th><th>最近选择段</th><th>最近验证段</th><th>原因</th><th>TV复核</th></tr></thead><tbody></tbody></table></div>
   <p id="pfNote" class="subtle"></p>
@@ -4451,6 +4452,7 @@ let selectedStrategyLabRow=null;
 let selectedStrategyPine=null;
 let latestPortfolioLabData=null;
 let selectedPortfolioLabRow=null;
+let portfolioChartMode='strategy';
 let sortKey='score', sortDir=-1;
 const charts={};
 let liveL2Coins=[];
@@ -5447,6 +5449,22 @@ async function runStrategyLab(refresh){
   }catch(e){status.textContent='策略实验室失败：'+e.message;}
 }
 function portfolioValueText(value){return Number.isFinite(Number(value))?fmt(Number(value),2):'-'}
+function setPortfolioChartMode(mode){
+  portfolioChartMode=mode==='compare'?'compare':'strategy';renderPortfolioChart();
+}
+function renderPortfolioChart(){
+  const data=latestPortfolioLabData;if(!data)return;
+  const p=data.portfolio||{},benchmark=data.benchmark||{},capital=Number(data.capital||0);
+  const benchmarkMap=new Map((benchmark.equity_curve||[]).map(item=>[Number(item.ts),Number(item.equity)]));
+  const curve=(p.equity_curve||[]).map(item=>({...item,benchmark:benchmarkMap.get(Number(item.ts)),strategyPct:capital?((Number(item.equity)/capital)-1)*100:0,benchmarkPct:capital&&benchmarkMap.has(Number(item.ts))?((benchmarkMap.get(Number(item.ts))/capital)-1)*100:Number.NaN,ts:Number(item.ts)/1000}));
+  const standalone=portfolioChartMode==='strategy';
+  document.getElementById('pfChartStrategyBtn').disabled=standalone;document.getElementById('pfChartCompareBtn').disabled=!standalone;
+  document.getElementById('pfChartCaption').textContent=standalone?'蓝线已使用自己的纵轴范围放大；现在能看到策略每天的真实起伏。':'策略和基准使用同一收益百分比纵轴；蓝线较平是因为策略涨幅远小于橙线，不是没有数据。';
+  const series=standalone
+    ?[{label:'策略累计收益%',color:'#2563eb',value:r=>r.strategyPct,digits:3}]
+    :[{label:'策略累计收益%',color:'#2563eb',value:r=>r.strategyPct,digits:2},{label:'买入持有收益%',color:'#f97316',value:r=>r.benchmarkPct,digits:2}];
+  makeChart('pfChart',curve,series,{marks:[0],footer:standalone?`策略线单独放大：${curve.length}个自然日`:`策略与基准同轴对比：${curve.length}个自然日`,reset:true});
+}
 function updatePortfolioEngineHelp(){
   const adaptive=document.getElementById('pfEngine').value==='adaptive';
   document.getElementById('pfRequirePass').disabled=adaptive;
@@ -5531,9 +5549,7 @@ function renderPortfolioLab(data){
     body.appendChild(tr);
   });
   if(!rows.length)body.innerHTML='<tr><td colspan="12" class="muted">还没有组合研究结果</td></tr>';
-  const benchmarkMap=new Map((benchmark.equity_curve||[]).map(item=>[Number(item.ts),Number(item.equity)]));
-  const curve=(p.equity_curve||[]).map(item=>({...item,benchmark:benchmarkMap.get(Number(item.ts)),ts:Number(item.ts)/1000}));
-  makeChart('pfChart',curve,[{label:'策略组合U',color:'#2563eb',value:r=>r.equity,digits:2},{label:'买入持有U',color:'#f97316',value:r=>r.benchmark,digits:2}],{marks:[Number(data.capital||0)],footer:`样本外组合曲线：${curve.length}个自然日`,reset:true});
+  renderPortfolioChart();
   document.getElementById('pfNote').textContent=[data.note||'',(data.failures||[]).map(x=>`${x.symbol}: ${x.error}`).join('；')].filter(Boolean).join(' ');
 }
 async function runPortfolioLab(refresh){
