@@ -3995,26 +3995,40 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 </div>
 </dialog>
 <dialog id="portfolioLabDlg" class="wideDialog">
-<div class="helpHead"><h2>多市场“一品一策”等权组合</h2><button onclick="portfolioLabDlg.close()">关闭</button></div>
+<div class="helpHead"><h2>多市场滚动组合 V2</h2><button onclick="portfolioLabDlg.close()">关闭</button></div>
 <div class="helpBody">
-  <p>每个产品只在前段历史里从固定策略库挑选自己的策略，冻结以后再用最后约30%历史考试。通过选择门槛的产品按相等仓位合成一个组合；不会连接券商、交易所或自动下单。</p>
+  <p>最终约30%历史是考试区。V2 每约3个月只用此前约2年数据重新选择最多3个不太相似的策略；如果它们在验证期没有盈利并跑赢该产品直接买入持有，就让该产品留现金。组合只做研究，不连接券商、交易所或自动下单。</p>
   <div class="paperActions">
     <label>产品代码<input id="pfSymbols" value="SPY,QQQ,IWM,EEM,FXI,EWJ,EWG,EWU,TLT,IEF,GLD,SLV,USO,DBA,VNQ,BTC-USD,ETH-USD,EURUSD=X,JPY=X,CL=F" style="width:520px"></label>
     <label>历史年数<input id="pfYears" type="number" min="2" max="20" value="8" step="1" style="width:70px"></label>
     <label>总本金<input id="pfCapital" type="number" min="100" value="20000" step="1000" style="width:100px"></label>
     <label>往返成本bps<input id="pfCost" type="number" min="0" max="500" value="20" step="1" style="width:75px"></label>
-    <label>选择段比例<input id="pfSelection" type="number" min="0.55" max="0.85" value="0.70" step="0.05" style="width:70px"></label>
-    <label>验证段最少交易<input id="pfMinTrades" type="number" min="0" max="100" value="3" step="1" style="width:65px"></label>
-    <label>选择段最大回撤%<input id="pfMaxDrawdown" type="number" min="1" max="100" value="30" step="1" style="width:70px"></label>
-    <label>组合档位<select id="pfPreset" onchange="applyPortfolioPreset(this.value)"><option value="balanced">均衡 1x/20品</option><option value="growth">进取 1.5x/12品</option><option value="aggressive">激进 2x/8品</option><option value="custom">自定义</option></select></label>
-    <label>最多纳入产品<input id="pfMaxProducts" type="number" min="1" max="30" value="20" step="1" style="width:60px"></label>
-    <label>总风险倍数<input id="pfExposure" type="number" min="0.25" max="3" value="1" step="0.25" style="width:65px"></label>
-    <label>年融资成本%<input id="pfFinancing" type="number" min="0" max="30" value="8" step="0.5" style="width:65px"></label>
-    <label><input id="pfAllowShort" type="checkbox">允许做空</label>
-    <label><input id="pfRequirePass" type="checkbox" checked>不合格产品留现金</label>
     <button onclick="runPortfolioLab(true)">运行组合研究</button><button onclick="runPortfolioLab(false)">读取上次</button>
-    <span id="pfStatus" class="subtle">默认20个产品、等权、只做多。</span>
+    <span id="pfStatus" class="subtle">默认使用V2、风险平价、只做多。</span>
   </div>
+  <div class="paperForm">
+    <label>研究引擎<select id="pfEngine" onchange="updatePortfolioEngineHelp()"><option value="adaptive" selected>V2滚动组合（推荐）</option><option value="fixed">旧版固定单策略</option></select></label>
+    <label>考试区占比<input id="pfSelection" type="number" min="0.55" max="0.85" value="0.70" step="0.05"></label>
+    <label>每次回看日K根数<input id="pfTrainingBars" type="number" min="252" max="2520" value="504" step="21"></label>
+    <label>每隔日K根数重选<input id="pfRebalanceBars" type="number" min="21" max="252" value="63" step="21"></label>
+    <label>每产品最多策略<input id="pfEnsembleSize" type="number" min="1" max="5" value="3" step="1"></label>
+    <label>策略信号最高相关<input id="pfSignalCorr" type="number" min="0" max="1" value="0.75" step="0.05"></label>
+    <label>验证段最少交易<input id="pfMinTrades" type="number" min="0" max="100" value="3" step="1"></label>
+    <label>选择期最大回撤%<input id="pfMaxDrawdown" type="number" min="1" max="100" value="30" step="1"></label>
+    <label><input id="pfRequireBenchmark" type="checkbox" checked>必须跑赢该产品买入持有</label>
+    <label><input id="pfRequirePass" type="checkbox" checked>旧版：不合格产品留现金</label>
+  </div>
+  <div class="paperForm">
+    <label>组合档位<select id="pfPreset" onchange="applyPortfolioPreset(this.value)"><option value="balanced">均衡 1x/20品</option><option value="growth">进取 1.5x/12品</option><option value="aggressive">激进 2x/8品</option><option value="custom">自定义</option></select></label>
+    <label>最多纳入产品<input id="pfMaxProducts" type="number" min="1" max="30" value="20" step="1"></label>
+    <label>总风险倍数<input id="pfExposure" type="number" min="0.25" max="3" value="1" step="0.25"></label>
+    <label>年融资成本%<input id="pfFinancing" type="number" min="0" max="30" value="8" step="0.5"></label>
+    <label>仓位分配<select id="pfWeightMode"><option value="risk_parity" selected>风险平价（低波动多分）</option><option value="equal">每产品等金额</option></select></label>
+    <label>波动统计日K根数<input id="pfVolatilityWindow" type="number" min="20" max="252" value="60" step="5"></label>
+    <label>单产品仓位上限%<input id="pfMaxWeight" type="number" min="5" max="100" value="20" step="1"></label>
+    <label><input id="pfAllowShort" type="checkbox">允许做空</label>
+  </div>
+  <p id="pfEngineHelp" class="subtle">504根约为2个股票交易年，63根约为3个月。“最高相关0.75”用于避免同时选三个几乎一样的策略；风险平价只使用当天以前的波动，不偷看未来。</p>
   <div class="grid">
     <div class="metric"><div class="muted">纳入 / 已分析</div><div id="pfIncluded">-</div></div>
     <div class="metric"><div class="muted">样本外组合收益</div><div id="pfReturn">-</div></div>
@@ -4027,7 +4041,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
     <div class="metric"><div class="muted">数据源</div><div id="pfSource">-</div></div>
   </div>
   <canvas id="pfChart" class="mini" width="1000" height="230"></canvas>
-  <div class="paperTableWrap" style="max-height:520px"><table id="portfolioLabTbl"><thead><tr><th>是否纳入</th><th>产品</th><th>等权仓位</th><th>自己的策略</th><th>最终样本外收益</th><th>最终回撤</th><th>最终交易数</th><th>选择段</th><th>验证段</th><th>选择原因</th><th>参数</th><th>TV复核</th></tr></thead><tbody></tbody></table></div>
+  <div class="paperTableWrap" style="max-height:520px"><table id="portfolioLabTbl"><thead><tr><th>状态</th><th>产品</th><th>最新风险仓位</th><th>当前滚动选择</th><th>有效窗口</th><th>最终样本外收益</th><th>最终回撤</th><th>最终交易数</th><th>最近选择段</th><th>最近验证段</th><th>原因</th><th>TV复核</th></tr></thead><tbody></tbody></table></div>
   <p id="pfNote" class="subtle"></p>
 </div>
 </dialog>
@@ -4352,6 +4366,16 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p>TradingView 公共库可以搜索和手工添加策略，但没有官方接口允许任意批量下载全部社区源码。开源脚本可在页面查看时按作者许可人工移植；受保护或仅邀请脚本不能拉取源码，也不应绕过保护。</p>
 <p><code>Vibe AI研究</code>：单独部署的开源 Vibe-Trading 研究工作区，包含策略生成、462个公开因子、批量回测、研究团队和 Pine 导出。它默认不连接任何真实账户；先在里面发现候选，再回到本页面用 Hyperliquid 数据、成本和实盘规则复验。</p>
 
+<h3>多市场滚动组合 V2 怎么读</h3>
+<p><code>考试区占比0.70</code>：前约70%只用于建立初始历史，最后约30%才画进最终组合成绩。V2在考试区内继续滚动，但每个时间点只能看当时以前的数据。</p>
+<p><code>每次回看504根</code>：每次重新选择时，只研究此前约504根日K，约等于两个股票交易年。不是拿全部历史挑一个永远不变的冠军。</p>
+<p><code>每隔63根重选</code>：大约每三个月重新考试一次。太短容易追逐噪声，太长可能跟不上市场状态变化。</p>
+<p><code>每产品最多3个策略</code>：不是只押一个历史第一名，而是让最多三个信号不太相似的合格规则投票；随后还要通过EMA50/EMA200趋势过滤。</p>
+<p><code>必须跑赢买入持有</code>：候选不仅要自己盈利，还必须在当时的验证段超过直接持有该产品；否则该滚动窗口留现金。留现金不是程序坏了，而是拒绝勉强交易。</p>
+<p><code>风险平价</code>：波动较小的产品分配更多风险仓位，波动较大的产品分配更少；只使用当天以前的波动。单产品上限防止某个低波动产品占据几乎全部本金。</p>
+<p><code>有效窗口 3/5</code>：五次滚动考试里有三次找到合格组合，另外两次持有现金。数字越高不等于收益一定越高，仍要一起看样本外收益、回撤和买入持有基准。</p>
+<p><code>TV查看组件</code>：V2不是一条固定Pine。弹窗只能逐个复制当前技术组件；完整逻辑还包含滚动重选、投票、趋势过滤和跨产品风险分配，不能把单个组件的TradingView结果冒充整个V2。</p>
+
 <h3>l2Book 表格怎么读</h3>
 <p><code>买一 bid</code>：现在别人愿意买的最高价。你如果马上卖，通常接近这个价成交。</p>
 <p><code>卖一 ask</code>：现在别人愿意卖的最低价。你如果马上买，通常接近这个价成交。</p>
@@ -4425,6 +4449,8 @@ let selectedRow=null;
 let latestStrategyLabData=null;
 let selectedStrategyLabRow=null;
 let selectedStrategyPine=null;
+let latestPortfolioLabData=null;
+let selectedPortfolioLabRow=null;
 let sortKey='score', sortDir=-1;
 const charts={};
 let liveL2Coins=[];
@@ -5421,17 +5447,45 @@ async function runStrategyLab(refresh){
   }catch(e){status.textContent='策略实验室失败：'+e.message;}
 }
 function portfolioValueText(value){return Number.isFinite(Number(value))?fmt(Number(value),2):'-'}
+function updatePortfolioEngineHelp(){
+  const adaptive=document.getElementById('pfEngine').value==='adaptive';
+  document.getElementById('pfRequirePass').disabled=adaptive;
+  document.getElementById('pfEngineHelp').textContent=adaptive
+    ?'504根约为2个股票交易年，63根约为3个月。“最高相关0.75”用于避免同时选三个几乎一样的策略；风险平价只使用当天以前的波动，不偷看未来。'
+    :'旧版只在考试区之前选定一个策略，此后不再更新。保留它是为了和以前结果对照，不建议作为默认研究引擎。';
+}
 function applyPortfolioPreset(value){
-  const presets={balanced:{max:20,exposure:1,dd:30,short:false},growth:{max:12,exposure:1.5,dd:40,short:false},aggressive:{max:8,exposure:2,dd:50,short:true}};
+  const presets={balanced:{max:20,exposure:1,dd:30,short:false,cap:20},growth:{max:12,exposure:1.5,dd:40,short:false,cap:25},aggressive:{max:8,exposure:2,dd:50,short:true,cap:35}};
   const p=presets[value];if(!p)return;
-  document.getElementById('pfMaxProducts').value=p.max;document.getElementById('pfExposure').value=p.exposure;document.getElementById('pfMaxDrawdown').value=p.dd;document.getElementById('pfAllowShort').checked=p.short;document.getElementById('pfRequirePass').checked=true;
+  document.getElementById('pfMaxProducts').value=p.max;document.getElementById('pfExposure').value=p.exposure;document.getElementById('pfMaxDrawdown').value=p.dd;document.getElementById('pfAllowShort').checked=p.short;document.getElementById('pfMaxWeight').value=p.cap;document.getElementById('pfRequirePass').checked=true;
   document.getElementById('pfStatus').textContent=`已选择${value==='aggressive'?'激进':value==='growth'?'进取':'均衡'}研究档位；风险倍数会同时放大盈利和亏损，并扣融资成本。`;
 }
+async function copyPortfolioSpecPine(spec,symbol){
+  const status=document.getElementById('pfStatus');status.textContent=`正在生成 ${symbol} / ${spec.name||spec.strategy} 的 Pine...`;
+  const q=new URLSearchParams({family:spec.family,params:JSON.stringify(spec.params||{}),cost_bps:document.getElementById('pfCost').value||20});
+  const r=await fetch('strategy_pine?'+q.toString());const data=await r.json();if(!data.ok)throw new Error(data.error||'生成失败');
+  await copyTextFallback(data.code);status.textContent=`已复制 ${symbol} / ${spec.name||spec.strategy}。这是组合中的一个组件；切到对应产品图表再粘贴。`;
+}
 async function copyPortfolioPine(event,row){
-  event.stopPropagation();const status=document.getElementById('pfStatus');status.textContent=`正在生成 ${row.symbol} 的 Pine...`;
-  try{const q=new URLSearchParams({family:row.family,params:JSON.stringify(row.params||{}),cost_bps:document.getElementById('pfCost').value||20});const r=await fetch('strategy_pine?'+q.toString());const data=await r.json();if(!data.ok)throw new Error(data.error||'生成失败');await copyTextFallback(data.code);status.textContent=`已复制 ${row.symbol} / ${row.strategy} 的 Pine。TradingView 每次只能在一个图表产品上复核，先切到对应产品再粘贴。`;}catch(e){status.textContent='Pine生成失败：'+e.message;}
+  event.stopPropagation();
+  if(row.family==='adaptive_ensemble'){showPortfolioLabDetail(row);document.getElementById('pfStatus').textContent='V2不是一条固定Pine：请在弹窗里逐个复制当前组件。';return;}
+  try{await copyPortfolioSpecPine({...row,name:row.strategy},row.symbol)}catch(e){document.getElementById('pfStatus').textContent='Pine生成失败：'+e.message;}
+}
+async function copySelectedPortfolioComponent(index,event){
+  if(event)event.stopPropagation();const component=(selectedPortfolioLabRow?.latest_components||[])[index];if(!component)return;
+  try{await copyPortfolioSpecPine(component,selectedPortfolioLabRow.symbol)}catch(e){document.getElementById('pfStatus').textContent='Pine生成失败：'+e.message;}
+}
+function portfolioWindowDate(value){return value?new Date(Number(value)).toLocaleDateString('zh-CN',{timeZone:'Asia/Shanghai'}):'-'}
+function showPortfolioLabDetail(row){
+  selectedPortfolioLabRow=row;const test=row.test||{},components=row.latest_components||[],history=(row.selection_history||[]).slice(-8).reverse();
+  const componentHtml=components.length?components.map((item,index)=>`<div class="detailBox"><b>${esc(item.name)}</b><br><span class="muted">验证期超越买入持有 ${signed(item.validation_excess_pct,2)}%</span><br><button onclick="copySelectedPortfolioComponent(${index},event)">复制这个组件 Pine</button></div>`).join(''):'<div class="detailBox">当前滚动窗口没有策略过门槛，因此这个产品当前持有现金。</div>';
+  const historyHtml=history.length?`<table><thead><tr><th>考试窗口</th><th>当时选择</th><th>动作</th></tr></thead><tbody>${history.map(item=>`<tr><td>${portfolioWindowDate(item.start_ts)} 至 ${portfolioWindowDate(item.end_ts)}</td><td>${esc((item.selected||[]).join(' + ')||'无')}</td><td>${item.cash?'留现金':'按组合信号运行'}</td></tr>`).join('')}</tbody></table>`:'旧版记录没有滚动窗口。';
+  document.getElementById('detailTitle').textContent=`组合产品：${row.symbol}`;
+  document.getElementById('detailBody').innerHTML=`<div class="detailText"><b>${esc(row.strategy)}</b><br>最终样本外收益 ${signed(test.net_return_pct,2)}%，最大回撤 ${signed(test.max_drawdown_pct,2)}%，完成交易 ${test.trades||0} 笔；当前组合风险仓位 ${fmt(row.weight_pct,2)}%。<br>有效选择窗口 ${row.active_windows??'-'} / ${row.total_windows??'-'}。仓位是产品的风险预算；策略没有信号时仍会是现金。</div><h3>当前滚动窗口的策略组件</h3><div class="detailGrid">${componentHtml}</div><p class="subtle">TradingView 每张图只能复核一个产品。组件 Pine 只复核该条技术规则，不等于完整 V2；完整 V2 还包含多数投票、EMA50/200行情过滤、每约63根日K重选和跨产品风险分配。</p><h3>最近滚动记录</h3><div class="paperTableWrap">${historyHtml}</div>`;
+  detailDlg.showModal();
 }
 function renderPortfolioLab(data){
+  latestPortfolioLabData=data;
   const p=data.portfolio||{}, benchmark=data.benchmark||{}, rows=data.rows||[];
   document.getElementById('pfIncluded').textContent=`${data.included_products??0} / ${data.selected_products??rows.length}`;
   document.getElementById('pfReturn').textContent=`${signed(p.net_return_pct,2)}%`;
@@ -5452,16 +5506,28 @@ function renderPortfolioLab(data){
   if(data.max_products!==undefined)document.getElementById('pfMaxProducts').value=data.max_products;
   if(data.exposure_multiplier!==undefined)document.getElementById('pfExposure').value=data.exposure_multiplier;
   if(data.annual_financing_pct!==undefined)document.getElementById('pfFinancing').value=data.annual_financing_pct;
+  if(data.engine)document.getElementById('pfEngine').value=data.engine;else if(rows.length)document.getElementById('pfEngine').value='fixed';
+  if(data.training_bars!==undefined)document.getElementById('pfTrainingBars').value=data.training_bars;
+  if(data.rebalance_bars!==undefined)document.getElementById('pfRebalanceBars').value=data.rebalance_bars;
+  if(data.ensemble_size!==undefined)document.getElementById('pfEnsembleSize').value=data.ensemble_size;
+  if(data.max_signal_correlation!==undefined)document.getElementById('pfSignalCorr').value=data.max_signal_correlation;
+  if(data.weight_mode)document.getElementById('pfWeightMode').value=data.weight_mode;
+  if(data.volatility_window!==undefined)document.getElementById('pfVolatilityWindow').value=data.volatility_window;
+  if(data.max_weight_pct!==undefined)document.getElementById('pfMaxWeight').value=data.max_weight_pct;
+  document.getElementById('pfRequireBenchmark').checked=data.require_benchmark_excess!==false;
   const exposure=Number(data.exposure_multiplier||1),maxProducts=Number(data.max_products||20),allowShort=data.allow_short===true;
   document.getElementById('pfPreset').value=exposure===2&&maxProducts===8&&allowShort?'aggressive':exposure===1.5&&maxProducts===12&&!allowShort?'growth':exposure===1&&maxProducts===20&&!allowShort?'balanced':'custom';
   document.getElementById('pfAllowShort').checked=data.allow_short===true;
   document.getElementById('pfRequirePass').checked=data.require_selection_pass!==false;
+  updatePortfolioEngineHelp();
   const body=document.querySelector('#portfolioLabTbl tbody');body.innerHTML='';
   rows.forEach(row=>{
     const tr=document.createElement('tr'),test=row.test||{},early=row.early||{},validation=row.validation||{};
-    tr.innerHTML=`<td class="${row.included?'passChip':'blockChip'}">${row.included?'纳入':'留现金'}</td><td>${esc(row.symbol)}</td><td>${fmt(row.weight_pct,2)}%</td><td style="text-align:left">${esc(row.strategy)}</td><td class="${Number(test.net_return_pct)>=0?'scoreGood':'scoreBad'}">${signed(test.net_return_pct,2)}%</td><td class="scoreBad">${signed(test.max_drawdown_pct,2)}%</td><td>${test.trades||0}</td><td>${signed(early.net_return_pct,2)}%</td><td>${signed(validation.net_return_pct,2)}%</td><td style="text-align:left">${esc((row.selection_failures||[]).join('；')||'选择段通过')}</td><td style="text-align:left">${esc(JSON.stringify(row.params||{}))}</td><td><button class="pfPineBtn">复制Pine</button></td>`;
+    const adaptive=row.family==='adaptive_ensemble',cash=adaptive&&row.latest_cash,status=!row.included?'未纳入':cash?'本期现金':'运行中';
+    const reason=(row.selection_failures||[]).join('；')||(cash?'本期没有策略同时盈利并跑赢买入持有':adaptive?'滚动窗口门槛通过':'选择段通过');
+    tr.innerHTML=`<td class="${row.included&&!cash?'passChip':'blockChip'}">${status}</td><td>${esc(row.symbol)}</td><td>${fmt(row.weight_pct,2)}%</td><td style="text-align:left">${esc(row.strategy)}</td><td>${adaptive?`${row.active_windows||0} / ${row.total_windows||0}`:'固定'}</td><td class="${Number(test.net_return_pct)>=0?'scoreGood':'scoreBad'}">${signed(test.net_return_pct,2)}%</td><td class="scoreBad">${signed(test.max_drawdown_pct,2)}%</td><td>${test.trades||0}</td><td>${signed(early.net_return_pct,2)}%</td><td>${signed(validation.net_return_pct,2)}%</td><td style="text-align:left">${esc(reason)}</td><td><button class="pfPineBtn">${adaptive?'查看组件':'复制Pine'}</button></td>`;
     tr.querySelector('.pfPineBtn').onclick=event=>copyPortfolioPine(event,row);
-    tr.onclick=()=>{document.getElementById('detailTitle').textContent=`组合产品：${row.symbol}`;document.getElementById('detailBody').innerHTML=`<div class="detailText"><b>${esc(row.strategy)}</b><br>前段选择结果：${esc((row.selection_failures||[]).join('；')||'通过')}<br>最终样本外：${signed(test.net_return_pct,2)}%，最大回撤 ${signed(test.max_drawdown_pct,2)}%，交易 ${test.trades||0} 笔。<br><br>这不是把全历史冠军直接拿来交易；策略在最终样本外之前已经冻结。</div>`;detailDlg.showModal()};
+    tr.onclick=()=>showPortfolioLabDetail(row);
     body.appendChild(tr);
   });
   if(!rows.length)body.innerHTML='<tr><td colspan="12" class="muted">还没有组合研究结果</td></tr>';
@@ -5472,11 +5538,11 @@ function renderPortfolioLab(data){
 }
 async function runPortfolioLab(refresh){
   const status=document.getElementById('pfStatus');
-  const q=new URLSearchParams({symbols:document.getElementById('pfSymbols').value,years:document.getElementById('pfYears').value,capital:document.getElementById('pfCapital').value,cost_bps:document.getElementById('pfCost').value,selection_ratio:document.getElementById('pfSelection').value,min_trades:document.getElementById('pfMinTrades').value,max_drawdown_pct:document.getElementById('pfMaxDrawdown').value,max_products:document.getElementById('pfMaxProducts').value,exposure:document.getElementById('pfExposure').value,financing_pct:document.getElementById('pfFinancing').value,allow_short:document.getElementById('pfAllowShort').checked?'1':'0',require_pass:document.getElementById('pfRequirePass').checked?'1':'0'});
-  if(refresh)q.set('refresh','1'); status.textContent=refresh?'正在下载多个市场日线并逐产品选择策略，首次可能需要几分钟...':'正在读取上次组合结果...';
-  try{const r=await fetch('portfolio_lab?'+q.toString());const data=await r.json();if(!data.ok)throw new Error(data.error||'组合研究失败');renderPortfolioLab(data);status.textContent=`完成：${data.included_products||0} 个产品纳入等权组合；仅研究，不下单。`;}catch(e){status.textContent='组合研究失败：'+e.message;}
+  const q=new URLSearchParams({symbols:document.getElementById('pfSymbols').value,years:document.getElementById('pfYears').value,capital:document.getElementById('pfCapital').value,cost_bps:document.getElementById('pfCost').value,engine:document.getElementById('pfEngine').value,selection_ratio:document.getElementById('pfSelection').value,training_bars:document.getElementById('pfTrainingBars').value,rebalance_bars:document.getElementById('pfRebalanceBars').value,ensemble_size:document.getElementById('pfEnsembleSize').value,max_signal_correlation:document.getElementById('pfSignalCorr').value,min_trades:document.getElementById('pfMinTrades').value,max_drawdown_pct:document.getElementById('pfMaxDrawdown').value,max_products:document.getElementById('pfMaxProducts').value,exposure:document.getElementById('pfExposure').value,financing_pct:document.getElementById('pfFinancing').value,weight_mode:document.getElementById('pfWeightMode').value,volatility_window:document.getElementById('pfVolatilityWindow').value,max_weight_pct:document.getElementById('pfMaxWeight').value,allow_short:document.getElementById('pfAllowShort').checked?'1':'0',require_pass:document.getElementById('pfRequirePass').checked?'1':'0',require_benchmark_excess:document.getElementById('pfRequireBenchmark').checked?'1':'0'});
+  if(refresh)q.set('refresh','1'); status.textContent=refresh?'正在下载多市场日线并进行滚动选择，20个产品通常需要几分钟...':'正在读取上次组合结果...';
+  try{const r=await fetch('portfolio_lab?'+q.toString());const data=await r.json();if(!data.ok)throw new Error(data.error||'组合研究失败');renderPortfolioLab(data);status.textContent=`完成：${data.included_products||0} 个产品进入组合框架，${data.weight_mode==='risk_parity'?'按风险平价':'按等金额'}分配；仅研究，不下单。`;}catch(e){status.textContent='组合研究失败：'+e.message;}
 }
-function openPortfolioLabDialog(){portfolioLabDlg.showModal();runPortfolioLab(false)}
+function openPortfolioLabDialog(){portfolioLabDlg.showModal();updatePortfolioEngineHelp();runPortfolioLab(false)}
 function openStrategyLabDialog(){strategyLabDlg.showModal();updateLabDayLimit();runStrategyLab(false);}
 function openLeadlagDialog(){leadlagDlg.showModal();loadLeadlag();}
 async function saveLeadlagConfig(){
@@ -6190,18 +6256,32 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                 max_products = max(1, min(30, int((query.get("max_products") or ["20"])[0])))
                 exposure_multiplier = max(0.25, min(3.0, float((query.get("exposure") or ["1"])[0])))
                 annual_financing_pct = max(0.0, min(30.0, float((query.get("financing_pct") or ["8"])[0])))
+                training_bars = max(252, min(2520, int((query.get("training_bars") or ["504"])[0])))
+                rebalance_bars = max(21, min(252, int((query.get("rebalance_bars") or ["63"])[0])))
+                ensemble_size = max(1, min(5, int((query.get("ensemble_size") or ["3"])[0])))
+                max_signal_correlation = max(0.0, min(1.0, float((query.get("max_signal_correlation") or ["0.75"])[0])))
+                volatility_window = max(20, min(252, int((query.get("volatility_window") or ["60"])[0])))
+                max_weight_pct = max(5.0, min(100.0, float((query.get("max_weight_pct") or ["20"])[0])))
             except ValueError as exc:
                 json_response(self, {"ok": False, "error": f"组合参数无效：{exc}"}, status=400)
+                return
+            engine = str((query.get("engine") or ["adaptive"])[0]).lower()
+            weight_mode = str((query.get("weight_mode") or ["risk_parity"])[0]).lower()
+            if engine not in ("adaptive", "fixed") or weight_mode not in ("risk_parity", "equal"):
+                json_response(self, {"ok": False, "error": "研究引擎或仓位分配方式无效"}, status=400)
                 return
             truthy = ("1", "true", "yes", "on")
             allow_short = (query.get("allow_short") or [""])[0].lower() in truthy
             require_pass = (query.get("require_pass") or ["1"])[0].lower() in truthy
+            require_benchmark_excess = (query.get("require_benchmark_excess") or ["1"])[0].lower() in truthy
             refresh = (query.get("refresh") or [""])[0].lower() in truthy
             cache_key = (
                 tuple(symbols), round(years, 4), round(capital, 2), round(cost_bps, 4),
                 round(selection_ratio, 4), min_trades, round(max_drawdown_pct, 4),
                 max_products, round(exposure_multiplier, 4), round(annual_financing_pct, 4),
-                allow_short, require_pass,
+                allow_short, require_pass, engine, training_bars, rebalance_bars,
+                ensemble_size, round(max_signal_correlation, 4), require_benchmark_excess,
+                weight_mode, volatility_window, round(max_weight_pct, 4),
             )
             with state.portfolio_lab_lock:
                 cached = state.portfolio_lab_cache
@@ -6227,6 +6307,12 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                     allow_short=allow_short, require_selection_pass=require_pass,
                     max_products=max_products, exposure_multiplier=exposure_multiplier,
                     annual_financing_pct=annual_financing_pct,
+                    engine=engine, training_bars=training_bars,
+                    rebalance_bars=rebalance_bars, ensemble_size=ensemble_size,
+                    max_signal_correlation=max_signal_correlation,
+                    require_benchmark_excess=require_benchmark_excess,
+                    weight_mode=weight_mode, volatility_window=volatility_window,
+                    max_weight_pct=max_weight_pct,
                 )
                 payload["run_id"] = save_portfolio_lab_run(payload, db_path=state.db_path)
                 with state.portfolio_lab_lock:

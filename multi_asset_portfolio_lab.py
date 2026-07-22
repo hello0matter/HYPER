@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Select one technical strategy per product and test an equal-weight portfolio.
+"""Walk-forward multi-market portfolio research.
 
-The selector deliberately freezes each product's strategy before the final
-out-of-sample segment.  It is a research tool and never places orders.
+The adaptive engine only uses information available before each rebalance,
+keeps the final segment out of sample, and never places orders.
 """
 
 from __future__ import annotations
@@ -177,6 +177,184 @@ def select_product_strategy(
     }
 
 
+def _ema_values(values, period):
+    output = [None] * len(values)
+    alpha = 2.0 / (period + 1)
+    value = None
+    for index, item in enumerate(values):
+        value = float(item) if value is None else alpha * float(item) + (1 - alpha) * value
+        if index >= period - 1:
+            output[index] = value
+    return output
+
+
+def _target_correlation(left, right, start, end):
+    a = [float(value) for value in left[start:end]]
+    b = [float(value) for value in right[start:end]]
+    if len(a) < 3:
+        return 1.0
+    mean_a, mean_b = statistics.fmean(a), statistics.fmean(b)
+    covariance = sum((x - mean_a) * (y - mean_b) for x, y in zip(a, b))
+    variance_a = sum((x - mean_a) ** 2 for x in a)
+    variance_b = sum((y - mean_b) ** 2 for y in b)
+    denominator = math.sqrt(variance_a * variance_b)
+    return covariance / denominator if denominator > 0 else 1.0
+
+
+def _ensemble_targets(selected, candles, *, allow_short, start, end):
+    output = [0] * len(candles)
+    close = [row["close"] for row in candles]
+    fast_trend, slow_trend = _ema_values(close, 50), _ema_values(close, 200)
+    for index in range(max(1, start), min(len(candles), end)):
+        votes = [int(candidate["targets"][index]) for candidate in selected]
+        vote = sum(votes)
+        bull = slow_trend[index] is not None and fast_trend[index] > slow_trend[index] and close[index] > slow_trend[index]
+        bear = slow_trend[index] is not None and fast_trend[index] < slow_trend[index] and close[index] < slow_trend[index]
+        if vote > 0 and bull:
+            output[index] = 1
+        elif vote < 0 and bear and allow_short:
+            output[index] = -1
+    return output
+
+
+def select_adaptive_product_strategy(
+    symbol,
+    candles,
+    *,
+    round_trip_cost_bps=20.0,
+    selection_ratio=0.70,
+    min_validation_trades=3,
+    max_selection_drawdown_pct=30.0,
+    allow_short=False,
+    training_bars=504,
+    rebalance_bars=63,
+    ensemble_size=3,
+    max_signal_correlation=0.75,
+    require_benchmark_excess=True,
+):
+    if len(candles) < 700:
+        raise ValueError(f"{symbol} 日线不足：{len(candles)}")
+    final_start = max(400, min(len(candles) - 126, int(len(candles) * selection_ratio)))
+    specs = strategy_specs()
+    targets_by_spec = [
+        _apply_direction(strategy_targets(candles, spec), allow_short)
+        for spec in specs
+    ]
+    dynamic_targets = [0] * len(candles)
+    history = []
+    active_scores = []
+    last_early = backtest_targets(candles, [0] * len(candles), start=1, end=final_start, round_trip_cost_bps=0)
+    last_validation = dict(last_early)
+    for test_start in range(final_start, len(candles) - 1, max(21, int(rebalance_bars))):
+        test_end = min(len(candles), test_start + max(21, int(rebalance_bars)))
+        train_start = max(1, test_start - max(252, int(training_bars)))
+        split = train_start + max(126, int((test_start - train_start) * 0.70))
+        split = min(split, test_start - 32)
+        benchmark_targets = [1] * len(candles)
+        validation_benchmark = backtest_targets(
+            candles, benchmark_targets, start=split + 1, end=test_start - 1,
+            round_trip_cost_bps=round_trip_cost_bps,
+        )
+        candidates = []
+        for spec, targets in zip(specs, targets_by_spec):
+            early = backtest_targets(
+                candles, targets, start=train_start, end=split,
+                round_trip_cost_bps=round_trip_cost_bps,
+            )
+            validation = backtest_targets(
+                candles, targets, start=split + 1, end=test_start - 1,
+                round_trip_cost_bps=round_trip_cost_bps,
+            )
+            excess = validation["net_return_pct"] - validation_benchmark["net_return_pct"]
+            valid = (
+                early["net_return_pct"] > 0
+                and validation["net_return_pct"] > 0
+                and validation["trades"] >= int(min_validation_trades)
+                and early["max_drawdown_pct"] >= -abs(float(max_selection_drawdown_pct))
+                and validation["max_drawdown_pct"] >= -abs(float(max_selection_drawdown_pct))
+                and not early["bankrupt"]
+                and not validation["bankrupt"]
+                and (not require_benchmark_excess or excess > 0)
+            )
+            score = (
+                excess * 100
+                + min(early["net_bps"], validation["net_bps"]) * 0.25
+                + validation["max_drawdown_bps"] * 0.20
+                + min(validation["trades"], 20) * 2
+            )
+            candidates.append({
+                "spec": spec, "targets": targets, "early": early,
+                "validation": validation, "excess_pct": excess,
+                "score": score, "valid": valid,
+            })
+        candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
+        selected = []
+        for candidate in candidates:
+            if not candidate["valid"]:
+                continue
+            if all(
+                abs(_target_correlation(
+                    candidate["targets"], existing["targets"], split + 1, test_start,
+                )) <= float(max_signal_correlation)
+                for existing in selected
+            ):
+                selected.append(candidate)
+            if len(selected) >= max(1, int(ensemble_size)):
+                break
+        if selected:
+            quarter_targets = _ensemble_targets(
+                selected, candles, allow_short=allow_short, start=test_start, end=test_end,
+            )
+            dynamic_targets[test_start:test_end] = quarter_targets[test_start:test_end]
+            active_scores.append(statistics.fmean(candidate["score"] for candidate in selected))
+            last_early = selected[0]["early"]
+            last_validation = selected[0]["validation"]
+        history.append({
+            "start_ts": candles[test_start]["ts"],
+            "end_ts": candles[test_end - 1]["ts"],
+            "selected": [candidate["spec"].name for candidate in selected],
+            "components": [{
+                "family": candidate["spec"].family,
+                "name": candidate["spec"].name,
+                "params": candidate["spec"].params,
+                "reference": candidate["spec"].reference,
+                "validation_excess_pct": candidate["excess_pct"],
+            } for candidate in selected],
+            "validation_excess_pct": statistics.fmean(
+                candidate["excess_pct"] for candidate in selected
+            ) if selected else None,
+            "cash": not selected,
+        })
+    test = backtest_targets(
+        candles, dynamic_targets, start=final_start + 1, end=len(candles) - 1,
+        round_trip_cost_bps=round_trip_cost_bps,
+    )
+    active_history = [item for item in history if not item["cash"]]
+    latest_window = history[-1] if history else {"selected": [], "components": [], "cash": True}
+    latest_names = latest_window["selected"]
+    return {
+        "symbol": symbol,
+        "strategy": "滚动组合：" + (" + ".join(latest_names) if latest_names else "现金"),
+        "family": "adaptive_ensemble",
+        "params": {
+            "training_bars": int(training_bars), "rebalance_bars": int(rebalance_bars),
+            "ensemble_size": int(ensemble_size), "max_signal_correlation": float(max_signal_correlation),
+            "require_benchmark_excess": bool(require_benchmark_excess),
+        },
+        "reference": "项目独立实现：滚动走样本外、低相关策略投票、趋势状态过滤",
+        "samples": len(candles), "data_start": candles[0]["ts"], "data_end": candles[-1]["ts"],
+        "selection_end": final_start,
+        "selection_pass": bool(active_history),
+        "selection_failures": [] if active_history else ["滚动选择期没有策略同时盈利并跑赢买入持有"],
+        "selection_score": statistics.fmean(active_scores) if active_scores else -1_000_000.0,
+        "early": last_early, "validation": last_validation, "test": test,
+        "targets": dynamic_targets, "selection_history": history,
+        "active_windows": len(active_history), "total_windows": len(history),
+        "latest_cash": bool(latest_window["cash"]),
+        "latest_components": latest_window["components"],
+    }
+
+
 def _test_return_series(candles, targets, *, start, round_trip_cost_bps):
     one_way_rate = float(round_trip_cost_bps) / 2 / 10_000
     position = 0
@@ -201,6 +379,84 @@ def _test_return_series(candles, targets, *, start, round_trip_cost_bps):
     return series
 
 
+def _underlying_return_series(candles, *, start):
+    series = {}
+    for index in range(max(1, int(start)), len(candles)):
+        previous = float(candles[index - 1]["close"])
+        current = float(candles[index]["close"])
+        if previous <= 0:
+            continue
+        day_ts = int(candles[index]["ts"]) // 86_400_000 * 86_400_000
+        daily_return = current / previous - 1
+        series[day_ts] = (1 + series.get(day_ts, 0.0)) * (1 + daily_return) - 1
+    return series
+
+
+def _cap_weights(raw_weights, cap):
+    symbols = list(raw_weights)
+    if not symbols:
+        return {}
+    cap = max(1 / len(symbols), min(1.0, float(cap)))
+    remaining, weights, budget = set(symbols), {}, 1.0
+    while remaining:
+        total = sum(max(0.0, raw_weights[symbol]) for symbol in remaining)
+        proposed = {
+            symbol: budget * max(0.0, raw_weights[symbol]) / total
+            if total > 0 else budget / len(remaining)
+            for symbol in remaining
+        }
+        oversized = [symbol for symbol, weight in proposed.items() if weight > cap]
+        if not oversized:
+            weights.update(proposed)
+            break
+        for symbol in oversized:
+            weights[symbol] = cap
+            budget -= cap
+            remaining.remove(symbol)
+        if budget <= 0:
+            break
+    return weights
+
+
+def _combine_product_returns(
+    product_series,
+    underlying_series,
+    all_dates,
+    *,
+    weight_mode,
+    exposure_multiplier,
+    annual_financing_pct,
+    volatility_window=60,
+    max_weight_pct=20.0,
+):
+    symbols = list(product_series)
+    history = {symbol: [] for symbol in symbols}
+    output, latest_weights = [], {}
+    financing_daily = (
+        max(0.0, float(exposure_multiplier) - 1)
+        * max(0.0, float(annual_financing_pct)) / 100 / 365
+    )
+    for ts in all_dates:
+        if weight_mode == "risk_parity":
+            raw = {}
+            for symbol in symbols:
+                values = history[symbol][-max(20, int(volatility_window)):]
+                volatility = statistics.pstdev(values) if len(values) >= 20 else 0.0
+                raw[symbol] = 1 / max(volatility, 0.0025)
+            weights = _cap_weights(raw, float(max_weight_pct) / 100)
+        else:
+            weights = {symbol: 1 / len(symbols) for symbol in symbols} if symbols else {}
+        base_return = sum(
+            weights.get(symbol, 0.0) * product_series[symbol].get(ts, 0.0)
+            for symbol in symbols
+        )
+        output.append((ts, float(exposure_multiplier) * base_return - financing_daily))
+        for symbol in symbols:
+            history[symbol].append(underlying_series[symbol].get(ts, 0.0))
+        latest_weights = weights
+    return output, latest_weights
+
+
 def _portfolio_metrics(return_series, *, capital):
     equity, peak, max_drawdown = 1.0, 1.0, 0.0
     equity_curve, values = [], []
@@ -214,15 +470,25 @@ def _portfolio_metrics(return_series, *, capital):
             break
     mean = statistics.fmean(values) if values else 0.0
     stdev = statistics.pstdev(values) if len(values) > 1 else 0.0
-    years = len(values) / 252
-    annualized = equity ** (1 / years) - 1 if equity > 0 and years > 0 else -1.0
+    if len(return_series) > 1:
+        years = max(
+            1 / 365.25,
+            (float(return_series[-1][0]) - float(return_series[0][0]))
+            / 86_400_000 / 365.25,
+        )
+    else:
+        years = len(values) / 365.25
+    if not values:
+        annualized = 0.0
+    else:
+        annualized = equity ** (1 / years) - 1 if equity > 0 and years > 0 else -1.0
     return {
         "initial_capital": capital,
         "final_value": equity * capital,
         "net_return_pct": (equity - 1) * 100,
         "annualized_return_pct": annualized * 100,
         "max_drawdown_pct": max_drawdown * 100,
-        "sharpe": mean / stdev * math.sqrt(252) if stdev > 0 else 0.0,
+        "sharpe": mean / stdev * math.sqrt(365.25) if stdev > 0 else 0.0,
         "days": len(values),
         "bankrupt": equity <= 0,
         "equity_curve": equity_curve,
@@ -243,7 +509,22 @@ def run_multi_asset_portfolio_lab(
     max_products=20,
     exposure_multiplier=1.0,
     annual_financing_pct=8.0,
+    engine="adaptive",
+    training_bars=504,
+    rebalance_bars=63,
+    ensemble_size=3,
+    max_signal_correlation=0.75,
+    require_benchmark_excess=True,
+    weight_mode="risk_parity",
+    volatility_window=60,
+    max_weight_pct=20.0,
 ):
+    engine = str(engine).strip().lower()
+    if engine not in ("adaptive", "fixed"):
+        raise ValueError("engine 只允许 adaptive 或 fixed")
+    weight_mode = str(weight_mode).strip().lower()
+    if weight_mode not in ("risk_parity", "equal"):
+        raise ValueError("weight_mode 只允许 risk_parity 或 equal")
     clean_symbols = tuple(dict.fromkeys(str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()))
     candles_by_symbol, failures = {}, []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, max(1, len(clean_symbols)))) as pool:
@@ -263,29 +544,36 @@ def run_multi_asset_portfolio_lab(
         if not candles:
             continue
         try:
-            row = select_product_strategy(
-                symbol, candles,
-                round_trip_cost_bps=round_trip_cost_bps,
-                selection_ratio=selection_ratio,
-                min_validation_trades=min_validation_trades,
-                max_selection_drawdown_pct=max_selection_drawdown_pct,
-                allow_short=allow_short,
-            )
+            common = {
+                "round_trip_cost_bps": round_trip_cost_bps,
+                "selection_ratio": selection_ratio,
+                "min_validation_trades": min_validation_trades,
+                "max_selection_drawdown_pct": max_selection_drawdown_pct,
+                "allow_short": allow_short,
+            }
+            if engine == "adaptive":
+                row = select_adaptive_product_strategy(
+                    symbol, candles, **common,
+                    training_bars=training_bars,
+                    rebalance_bars=rebalance_bars,
+                    ensemble_size=ensemble_size,
+                    max_signal_correlation=max_signal_correlation,
+                    require_benchmark_excess=require_benchmark_excess,
+                )
+            else:
+                row = select_product_strategy(symbol, candles, **common)
             rows.append(row)
         except Exception as exc:
             failures.append({"symbol": symbol, "error": str(exc)})
-    eligible = [row for row in rows if row["selection_pass"] or not require_selection_pass]
-    eligible.sort(key=lambda row: row["selection_score"], reverse=True)
+    if engine == "adaptive":
+        # Keep input order: ranking products on their completed OOS result would
+        # use future information. Each rolling window already moves to cash when
+        # no strategy passes its then-available validation gate.
+        eligible = list(rows)
+    else:
+        eligible = [row for row in rows if row["selection_pass"] or not require_selection_pass]
+        eligible.sort(key=lambda row: row["selection_score"], reverse=True)
     included = eligible[:max(1, int(max_products))]
-    all_dates = sorted({
-        ts
-        for row in included
-        for ts in _test_return_series(
-            candles_by_symbol[row["symbol"]], row["targets"],
-            start=row["selection_end"] + 1,
-            round_trip_cost_bps=round_trip_cost_bps,
-        )
-    })
     product_series = {
         row["symbol"]: _test_return_series(
             candles_by_symbol[row["symbol"]], row["targets"],
@@ -294,16 +582,22 @@ def run_multi_asset_portfolio_lab(
         )
         for row in included
     }
-    multiplier = max(0.0, float(exposure_multiplier))
-    financing_daily = max(0.0, multiplier - 1) * max(0.0, float(annual_financing_pct)) / 100 / 365
-    portfolio_returns = [
-        (
-            ts,
-            multiplier * statistics.fmean(series.get(ts, 0.0) for series in product_series.values())
-            - financing_daily,
+    underlying_series = {
+        row["symbol"]: _underlying_return_series(
+            candles_by_symbol[row["symbol"]], start=row["selection_end"] + 1,
         )
-        for ts in all_dates
-    ] if product_series else []
+        for row in included
+    }
+    all_dates = sorted({ts for series in product_series.values() for ts in series})
+    multiplier = max(0.0, float(exposure_multiplier))
+    portfolio_returns, latest_weights = _combine_product_returns(
+        product_series, underlying_series, all_dates,
+        weight_mode=weight_mode,
+        exposure_multiplier=multiplier,
+        annual_financing_pct=annual_financing_pct,
+        volatility_window=volatility_window,
+        max_weight_pct=max_weight_pct,
+    ) if product_series else ([], {})
     metrics = _portfolio_metrics(portfolio_returns, capital=float(capital))
     benchmark_series = {
         row["symbol"]: _test_return_series(
@@ -321,7 +615,7 @@ def run_multi_asset_portfolio_lab(
     for row in rows:
         row.pop("targets", None)
         row["included"] = row in included
-        row["weight_pct"] = 100 / len(included) if row in included and included else 0.0
+        row["weight_pct"] = latest_weights.get(row["symbol"], 0.0) * 100 if row in included else 0.0
     rows.sort(key=lambda row: (row["included"], row["test"]["net_return_pct"]), reverse=True)
     return {
         "ok": bool(rows),
@@ -339,6 +633,15 @@ def run_multi_asset_portfolio_lab(
         "max_products": int(max_products),
         "exposure_multiplier": multiplier,
         "annual_financing_pct": float(annual_financing_pct),
+        "engine": engine,
+        "training_bars": int(training_bars),
+        "rebalance_bars": int(rebalance_bars),
+        "ensemble_size": int(ensemble_size),
+        "max_signal_correlation": float(max_signal_correlation),
+        "require_benchmark_excess": bool(require_benchmark_excess),
+        "weight_mode": weight_mode,
+        "volatility_window": int(volatility_window),
+        "max_weight_pct": float(max_weight_pct),
         "strategy_count": len(strategy_specs()),
         "selected_products": len(rows),
         "included_products": len(included),
@@ -348,14 +651,17 @@ def run_multi_asset_portfolio_lab(
         "rows": rows,
         "failures": failures,
         "note": (
-            "每个产品只用前段选择自己的策略，最后约30%为锁定样本外；组合按纳入产品等权。"
-            "这是防止直接拿全历史冠军的第一道保护，仍需滚动复验，禁止自动真实下单。"
+            "V2在最终约30%样本外中每隔一段时间重新选择，且每次只看当时以前的数据；"
+            "无策略同时盈利并跑赢该产品买入持有时自动留现金。组合默认按历史波动分配风险。"
+            "结果仍只是历史研究，禁止自动真实下单。"
+            if engine == "adaptive" else
+            "旧版在前段选定单一策略，最终约30%锁定样本外；组合不连接任何真实账户。"
         ),
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="多产品一品一策等权组合研究")
+    parser = argparse.ArgumentParser(description="多市场滚动组合研究")
     parser.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS))
     parser.add_argument("--years", type=float, default=8)
     parser.add_argument("--capital", type=float, default=20_000)
@@ -363,6 +669,8 @@ def main():
     parser.add_argument("--max-products", type=int, default=20)
     parser.add_argument("--exposure", type=float, default=1)
     parser.add_argument("--financing", type=float, default=8)
+    parser.add_argument("--engine", choices=("adaptive", "fixed"), default="adaptive")
+    parser.add_argument("--weight-mode", choices=("risk_parity", "equal"), default="risk_parity")
     parser.add_argument("--allow-short", action="store_true")
     parser.add_argument("--include-failed", action="store_true")
     args = parser.parse_args()
@@ -376,6 +684,8 @@ def main():
         max_products=args.max_products,
         exposure_multiplier=args.exposure,
         annual_financing_pct=args.financing,
+        engine=args.engine,
+        weight_mode=args.weight_mode,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
