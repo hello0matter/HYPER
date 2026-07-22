@@ -169,6 +169,7 @@ def select_product_strategy(
         "selection_end": selection_end,
         "selection_pass": selected["selection_pass"],
         "selection_failures": selected["selection_failures"],
+        "selection_score": selected["selection_score"],
         "early": selected["early"],
         "validation": selected["validation"],
         "test": test,
@@ -190,11 +191,13 @@ def _test_return_series(candles, targets, *, start, round_trip_cost_bps):
         current_open = float(candles[index]["open"])
         next_open = float(candles[index + 1]["open"])
         equity *= 1 + position * (next_open / current_open - 1)
+        day_ts = int(candles[index + 1]["ts"]) // 86_400_000 * 86_400_000
         if equity <= 0:
             equity = 0.0
-            series[int(candles[index + 1]["ts"])] = -1.0
+            series[day_ts] = -1.0
             break
-        series[int(candles[index + 1]["ts"])] = equity / before - 1 if before > 0 else -1.0
+        daily_return = equity / before - 1 if before > 0 else -1.0
+        series[day_ts] = (1 + series.get(day_ts, 0.0)) * (1 + daily_return) - 1
     return series
 
 
@@ -237,6 +240,9 @@ def run_multi_asset_portfolio_lab(
     max_selection_drawdown_pct=30.0,
     allow_short=False,
     require_selection_pass=True,
+    max_products=20,
+    exposure_multiplier=1.0,
+    annual_financing_pct=8.0,
 ):
     clean_symbols = tuple(dict.fromkeys(str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()))
     candles_by_symbol, failures = {}, []
@@ -268,7 +274,9 @@ def run_multi_asset_portfolio_lab(
             rows.append(row)
         except Exception as exc:
             failures.append({"symbol": symbol, "error": str(exc)})
-    included = [row for row in rows if row["selection_pass"] or not require_selection_pass]
+    eligible = [row for row in rows if row["selection_pass"] or not require_selection_pass]
+    eligible.sort(key=lambda row: row["selection_score"], reverse=True)
+    included = eligible[:max(1, int(max_products))]
     all_dates = sorted({
         ts
         for row in included
@@ -286,11 +294,30 @@ def run_multi_asset_portfolio_lab(
         )
         for row in included
     }
+    multiplier = max(0.0, float(exposure_multiplier))
+    financing_daily = max(0.0, multiplier - 1) * max(0.0, float(annual_financing_pct)) / 100 / 365
     portfolio_returns = [
-        (ts, statistics.fmean(series.get(ts, 0.0) for series in product_series.values()))
+        (
+            ts,
+            multiplier * statistics.fmean(series.get(ts, 0.0) for series in product_series.values())
+            - financing_daily,
+        )
         for ts in all_dates
     ] if product_series else []
     metrics = _portfolio_metrics(portfolio_returns, capital=float(capital))
+    benchmark_series = {
+        row["symbol"]: _test_return_series(
+            candles_by_symbol[row["symbol"]], [1] * len(candles_by_symbol[row["symbol"]]),
+            start=row["selection_end"] + 1,
+            round_trip_cost_bps=round_trip_cost_bps,
+        )
+        for row in included
+    }
+    benchmark_returns = [
+        (ts, statistics.fmean(series.get(ts, 0.0) for series in benchmark_series.values()))
+        for ts in all_dates
+    ] if benchmark_series else []
+    benchmark = _portfolio_metrics(benchmark_returns, capital=float(capital))
     for row in rows:
         row.pop("targets", None)
         row["included"] = row in included
@@ -309,10 +336,15 @@ def run_multi_asset_portfolio_lab(
         "max_selection_drawdown_pct": float(max_selection_drawdown_pct),
         "allow_short": bool(allow_short),
         "require_selection_pass": bool(require_selection_pass),
+        "max_products": int(max_products),
+        "exposure_multiplier": multiplier,
+        "annual_financing_pct": float(annual_financing_pct),
         "strategy_count": len(strategy_specs()),
         "selected_products": len(rows),
         "included_products": len(included),
         "portfolio": metrics,
+        "benchmark": benchmark,
+        "excess_return_pct": metrics["net_return_pct"] - benchmark["net_return_pct"],
         "rows": rows,
         "failures": failures,
         "note": (
@@ -328,6 +360,9 @@ def main():
     parser.add_argument("--years", type=float, default=8)
     parser.add_argument("--capital", type=float, default=20_000)
     parser.add_argument("--cost", type=float, default=20)
+    parser.add_argument("--max-products", type=int, default=20)
+    parser.add_argument("--exposure", type=float, default=1)
+    parser.add_argument("--financing", type=float, default=8)
     parser.add_argument("--allow-short", action="store_true")
     parser.add_argument("--include-failed", action="store_true")
     args = parser.parse_args()
@@ -338,6 +373,9 @@ def main():
         round_trip_cost_bps=args.cost,
         allow_short=args.allow_short,
         require_selection_pass=not args.include_failed,
+        max_products=args.max_products,
+        exposure_multiplier=args.exposure,
+        annual_financing_pct=args.financing,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

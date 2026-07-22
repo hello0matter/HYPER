@@ -40,6 +40,18 @@ class MultiAssetPortfolioLabTests(unittest.TestCase):
         self.assertAlmostEqual(result["rows"][0]["weight_pct"], 50.0)
         self.assertEqual(result["portfolio"]["initial_capital"], 1000.0)
         self.assertIn("equity_curve", result["portfolio"])
+        self.assertIn("benchmark", result)
+
+    def test_risk_multiplier_includes_financing_and_limits_products(self):
+        with patch.object(lab, "fetch_yahoo_ohlcv", side_effect=lambda symbol, years: candles()):
+            result = lab.run_multi_asset_portfolio_lab(
+                ("AAA", "BBB", "CCC"), years=2, capital=1000,
+                round_trip_cost_bps=2, require_selection_pass=False,
+                max_products=2, exposure_multiplier=2, annual_financing_pct=10,
+            )
+        self.assertEqual(result["included_products"], 2)
+        self.assertEqual(result["exposure_multiplier"], 2.0)
+        self.assertEqual(result["annual_financing_pct"], 10.0)
 
 
 if __name__ == "__main__":
