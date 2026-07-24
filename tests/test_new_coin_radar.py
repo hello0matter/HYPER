@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import new_coin_radar as radar
 
@@ -50,6 +51,22 @@ class NewCoinRadarTests(unittest.TestCase):
         score, _, _ = radar._pool_score(row, radar.normalize_config())
         self.assertGreater(score, base_score)
         self.assertLessEqual(score - base_score, 10)
+
+    def test_complete_ton_failure_reuses_snapshot_without_updating_paper(self):
+        now = 1_800_000_000
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "radar.sqlite3"
+            row = radar.score_ton_pool(pool_item(now=now), now=now)
+            radar.save_new_coin_snapshots(db_path, [row], now=now)
+            with (
+                patch.object(radar, "fetch_ton_new_pools", return_value=([], ["HTTP 429"])),
+                patch.object(radar, "fetch_kraken_watchlist", return_value=([], [])),
+                patch.object(radar, "update_new_coin_paper") as update_paper,
+            ):
+                result = radar.run_new_coin_radar(db_path, now=now + 300)
+            self.assertTrue(result["ton_cache_stale"])
+            self.assertEqual(result["rows"], [row])
+            update_paper.assert_not_called()
 
     def test_paper_trade_opens_then_takes_profit(self):
         now = 1_800_000_000

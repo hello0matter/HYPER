@@ -547,20 +547,51 @@ def save_new_coin_snapshots(db_path, rows, *, now=None):
             db.execute("DELETE FROM new_coin_snapshots WHERE ts < ?", (now - 30 * 86_400,))
 
 
+def load_latest_new_coin_rows(db_path):
+    init_new_coin_db(db_path)
+    with closing(sqlite3.connect(db_path)) as db:
+        records = db.execute("""
+            SELECT payload_json FROM new_coin_snapshots
+            WHERE ts=(SELECT MAX(ts) FROM new_coin_snapshots)
+            ORDER BY score DESC
+        """).fetchall()
+    rows = []
+    for (payload_json,) in records:
+        try:
+            row = json.loads(payload_json)
+            if isinstance(row, dict) and row.get("pair_id"):
+                rows.append(row)
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return rows
+
+
 def run_new_coin_radar(db_path, config=None, *, now=None):
     config = save_new_coin_config(db_path, config)
     now = float(now if now is not None else time.time())
     rows, ton_failures = fetch_ton_new_pools(config, now=now)
-    followups, followup_failures = fetch_open_trade_pools(
-        db_path, {row["pair_id"] for row in rows}, config, now=now,
-    )
-    rows.extend(followups)
-    add_snapshot_acceleration(db_path, rows, config)
-    rank = {"candidate": 2, "warming": 1, "filtered": 0}
-    rows.sort(key=lambda row: (rank[row["status"]], row["score"], row["liquidity_usd"]), reverse=True)
+    ton_cache_stale = False
+    followup_failures = []
+    if not rows and ton_failures:
+        rows = load_latest_new_coin_rows(db_path)
+        ton_cache_stale = bool(rows)
+    if not ton_cache_stale:
+        followups, followup_failures = fetch_open_trade_pools(
+            db_path, {row["pair_id"] for row in rows}, config, now=now,
+        )
+        rows.extend(followups)
+        add_snapshot_acceleration(db_path, rows, config)
+        rank = {"candidate": 2, "warming": 1, "filtered": 0}
+        rows.sort(
+            key=lambda row: (rank[row["status"]], row["score"], row["liquidity_usd"]),
+            reverse=True,
+        )
     watch_rows, watch_failures = fetch_kraken_watchlist(config)
-    save_new_coin_snapshots(db_path, rows, now=now)
-    paper = update_new_coin_paper(db_path, rows, config, now=now)
+    if ton_cache_stale:
+        paper = _paper_snapshot(db_path)
+    else:
+        save_new_coin_snapshots(db_path, rows, now=now)
+        paper = update_new_coin_paper(db_path, rows, config, now=now)
     return {
         "ok": bool(rows or watch_rows),
         "ts": now,
@@ -569,11 +600,13 @@ def run_new_coin_radar(db_path, config=None, *, now=None):
         "watch_rows": watch_rows,
         "candidates": sum(row["status"] == "candidate" for row in rows),
         "warming": sum(row["status"] == "warming" for row in rows),
+        "ton_cache_stale": ton_cache_stale,
         "failures": ton_failures + followup_failures + watch_failures,
         **paper,
         "note": (
             "TON新池来自GeckoTerminal公开数据；Kraken自选来自15分钟OHLC。"
             "分数不能识别合约后门、持币集中、撤池或无法卖出，只允许模拟记录。"
+            + (" TON接口本轮失败，池子表保留最后一次成功快照，未用旧价更新模拟交易。" if ton_cache_stale else "")
         ),
     }
 

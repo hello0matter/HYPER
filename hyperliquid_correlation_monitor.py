@@ -5647,7 +5647,7 @@ function renderNewCoinRadar(data){
 }
 async function loadNewCoinRadar(refresh){
   const status=document.getElementById('nrStatus'),q=refresh?newCoinQuery():new URLSearchParams();if(refresh)q.set('refresh','1');status.textContent=refresh?'正在扫描TON最新池子和Kraken自选...':'正在读取后台雷达...';
-  try{const response=await fetch('new_coin_radar?'+q.toString());const data=await response.json();if(!data.ok&&!data.rows?.length)throw new Error(data.error||(data.failures||[]).join('；')||'雷达没有数据');renderNewCoinRadar(data);status.textContent=`已更新：${data.candidates||0} 个启动候选，${data.warming||0} 个预热观察；只模拟。`;}catch(e){status.textContent='新币雷达失败：'+e.message;}
+  try{const response=await fetch('new_coin_radar?'+q.toString());const data=await response.json();if(!data.ok&&!data.rows?.length)throw new Error(data.error||(data.failures||[]).join('；')||'雷达没有数据');renderNewCoinRadar(data);const stale=data.ton_cache_stale?' TON接口限频，池子显示上次成功快照；未用旧价更新模拟盈亏。':'';status.textContent=`已更新：${data.candidates||0} 个启动候选，${data.warming||0} 个预热观察；只模拟。${stale}`;}catch(e){status.textContent='新币雷达失败：'+e.message;}
 }
 function openNewCoinDialog(){newCoinDlg.showModal();loadNewCoinRadar(false)}
 function openStrategyLabDialog(){strategyLabDlg.showModal();updateLabDayLimit();runStrategyLab(false);}
@@ -6082,6 +6082,7 @@ class AltServerState:
         self.new_coin_config = load_new_coin_config(db_path)
         self.new_coin_cache = None
         self.new_coin_error = None
+        self.new_coin_last_refresh_ts = 0.0
         self.realtime_strategy_status = {
             "running": False, "last_eval_ts": None, "last_event_ts": None,
             "last_error": None, "events": 0, "last_revision": 0,
@@ -6246,6 +6247,7 @@ def refresh_new_coin_state(state, config=None):
             state.new_coin_config = dict(payload["config"])
             state.new_coin_cache = payload
             state.new_coin_error = None
+            state.new_coin_last_refresh_ts = time.time()
             return payload
         except Exception as exc:
             state.new_coin_error = str(exc)
@@ -6335,8 +6337,17 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                     cached = state.new_coin_cache
                     current_config = dict(state.new_coin_config)
                     radar_error = state.new_coin_error
-                if refresh:
-                    payload = refresh_new_coin_state(state, new_coin_query_config(query, current_config))
+                    last_refresh_ts = state.new_coin_last_refresh_ts
+                requested_config = new_coin_query_config(query, current_config) if refresh else current_config
+                if (
+                    refresh
+                    and cached
+                    and requested_config == current_config
+                    and time.time() - last_refresh_ts < 60
+                ):
+                    json_response(self, {**cached, "cache_source": "recent", "refresh_wait_seconds": 60})
+                elif refresh:
+                    payload = refresh_new_coin_state(state, requested_config)
                     json_response(self, {**payload, "cache_source": "fresh"})
                 elif cached:
                     json_response(self, {**cached, "cache_source": "memory", "background_error": radar_error})
