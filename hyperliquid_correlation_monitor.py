@@ -33,6 +33,7 @@ import websocket
 from crypto_strategy_lab import run_strategy_lab, strategy_specs
 from crypto_strategy_pine import generate_pine_strategy, pine_filename
 from multi_asset_portfolio_lab import DEFAULT_SYMBOLS, run_multi_asset_portfolio_lab
+from new_coin_radar import load_new_coin_config, run_new_coin_radar
 
 try:
     import tkinter as tk
@@ -3923,7 +3924,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 </style>
 </head>
 <body>
-<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openStrategyLabDialog()">加密策略实验室</button><button onclick="openPortfolioLabDialog()">多市场组合</button><button onclick="window.open('/vibe/','_blank','noopener')">Vibe AI研究</button><button onclick="openLeadlagDialog()">联动传播 V2</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
+<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openStrategyLabDialog()">加密策略实验室</button><button onclick="openPortfolioLabDialog()">多市场组合</button><button onclick="openNewCoinDialog()">新币启动雷达</button><button onclick="window.open('/vibe/','_blank','noopener')">Vibe AI研究</button><button onclick="openLeadlagDialog()">联动传播 V2</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
 <main>
 <section class="topPanel">
 <h2>模拟盘 / 纸面交易</h2>
@@ -4044,6 +4045,58 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
   <canvas id="pfChart" class="mini" width="1000" height="230"></canvas>
   <div class="paperTableWrap" style="max-height:520px"><table id="portfolioLabTbl"><thead><tr><th>状态</th><th>产品</th><th>最新风险仓位</th><th>当前滚动选择</th><th>有效窗口</th><th>最终样本外收益</th><th>最终回撤</th><th>最终交易数</th><th>最近选择段</th><th>最近验证段</th><th>原因</th><th>TV复核</th></tr></thead><tbody></tbody></table></div>
   <p id="pfNote" class="subtle"></p>
+</div>
+</dialog>
+<dialog id="newCoinDlg" class="wideDialog">
+<div class="helpHead"><h2>新币启动雷达 / TON 新池模拟</h2><button onclick="newCoinDlg.close()">关闭</button></div>
+<div class="helpBody">
+  <p><b>目标：</b>寻找“刚建立、流动性尚可、成交突然活跃、买单占优、价格刚转强但还没垂直拉升”的 TON 池子。数据来自 GeckoTerminal；Kraken 自选默认观察 EVAAUSD。这里只模拟，不能用 Hyperliquid 钱包下单。</p>
+  <div class="paperActions"><button onclick="loadNewCoinRadar(true)">立即重新扫描</button><button onclick="loadNewCoinRadar(false)">读取后台结果</button><span id="nrStatus" class="subtle">后台每5分钟扫描一次。</span></div>
+  <div class="settingBand">
+    <h3>发现条件</h3>
+    <div class="paperForm">
+      <label>扫描最新页数<input id="nrPages" type="number" min="1" max="10" value="3" step="1"></label>
+      <label>池子最多年龄/天<input id="nrMaxAgeDays" type="number" min="0.1" max="90" value="7" step="0.5"></label>
+      <label>最低流动性USD<input id="nrMinLiquidity" type="number" min="0" value="5000" step="1000"></label>
+      <label>最低1小时成交USD<input id="nrMinVolumeH1" type="number" min="0" value="500" step="100"></label>
+      <label>最低1小时买单数<input id="nrMinBuys" type="number" min="0" value="5" step="1"></label>
+      <label>最低买单占比<input id="nrMinBuyShare" type="number" min="0" max="1" value="0.58" step="0.01"></label>
+      <label>最低综合分<input id="nrMinScore" type="number" min="0" max="100" value="60" step="1"></label>
+      <label>1小时最多已涨%<input id="nrMaxPump" type="number" min="1" value="35" step="1"></label>
+      <label>Kraken自选交易对<input id="nrWatchlist" value="EVAAUSD" placeholder="EVAAUSD,TONUSD"></label>
+    </div>
+  </div>
+  <div class="settingBand">
+    <h3>自动模拟参数</h3>
+    <div class="paperForm">
+      <label>每笔模拟USD<input id="nrPaperNotional" type="number" min="1" value="20" step="1"></label>
+      <label>最多模拟持仓<input id="nrPaperMaxOpen" type="number" min="0" value="3" step="1"></label>
+      <label>止盈%<input id="nrPaperTakeProfit" type="number" min="0.1" value="25" step="1"></label>
+      <label>止损%<input id="nrPaperStop" type="number" min="0.1" max="100" value="12" step="1"></label>
+      <label>移动止盈启动%<input id="nrPaperTrailStart" type="number" min="0" value="15" step="1"></label>
+      <label>盈利回撤退出%<input id="nrPaperTrailGap" type="number" min="0.1" value="8" step="1"></label>
+      <label>最长持有小时<input id="nrPaperMaxHours" type="number" min="0.1" value="24" step="1"></label>
+      <label>估算往返成本bps<input id="nrPaperCost" type="number" min="0" value="300" step="10"></label>
+    </div>
+  </div>
+  <div class="grid">
+    <div class="metric"><div class="muted">最新池子数</div><div id="nrPools">-</div></div>
+    <div class="metric"><div class="muted">启动候选</div><div id="nrCandidates">-</div></div>
+    <div class="metric"><div class="muted">预热观察</div><div id="nrWarming">-</div></div>
+    <div class="metric"><div class="muted">模拟持仓</div><div id="nrPaperOpen">-</div></div>
+    <div class="metric"><div class="muted">模拟已平仓 / 胜率</div><div id="nrPaperClosed">-</div></div>
+    <div class="metric"><div class="muted">模拟已实现</div><div id="nrPaperRealized">-</div></div>
+    <div class="metric"><div class="muted">模拟浮动</div><div id="nrPaperUnrealized">-</div></div>
+    <div class="metric"><div class="muted">更新时间</div><div id="nrTime">-</div></div>
+  </div>
+  <h3>TON 最新池子</h3>
+  <div class="paperTableWrap" style="max-height:430px"><table id="nrPoolTbl"><thead><tr><th>状态</th><th>池子</th><th>年龄</th><th>综合分</th><th>价格USD</th><th>流动性</th><th>1h/24h成交</th><th>热度加速</th><th>1h换手</th><th>1h买/卖</th><th>买单占比</th><th>1h/24h涨跌</th><th>原因</th><th>看池子</th></tr></thead><tbody></tbody></table></div>
+  <h3>Kraken 自选现货观察</h3>
+  <p class="subtle">这里的721根15分钟K线只覆盖最近约7.5天，不代表币的发行年龄。EVAA不在Hyperliquid，不能从本程序真实下单。</p>
+  <div class="paperTableWrap"><table id="nrWatchTbl"><thead><tr><th>状态</th><th>交易对</th><th>价格</th><th>分数</th><th>1h/6h/24h</th><th>1h成交量倍数</th><th>距离24h前高</th><th>EMA20/60</th><th>原因</th><th>TradingView</th></tr></thead><tbody></tbody></table></div>
+  <h3>新币自动模拟记录</h3>
+  <div class="paperTableWrap" style="max-height:360px"><table id="nrTradeTbl"><thead><tr><th>状态</th><th>池子</th><th>盈亏</th><th>模拟金额</th><th>入场时间</th><th>持有时间</th><th>入场/当前价格</th><th>入场分</th><th>最高浮盈</th><th>退出原因</th></tr></thead><tbody></tbody></table></div>
+  <p id="nrNote" class="scoreMid">新池可能存在合约后门、持币集中、撤池、夹子和只能买不能卖；公开池子数据无法排除这些风险，所以禁止真实自动下单。</p>
 </div>
 </dialog>
 <dialog id="globalDlg">
@@ -4376,6 +4429,18 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>风险平价</code>：波动较小的产品分配更多风险仓位，波动较大的产品分配更少；只使用当天以前的波动。单产品上限防止某个低波动产品占据几乎全部本金。</p>
 <p><code>有效窗口 3/5</code>：五次滚动考试里有三次找到合格组合，另外两次持有现金。数字越高不等于收益一定越高，仍要一起看样本外收益、回撤和买入持有基准。</p>
 <p><code>TV查看组件</code>：V2不是一条固定Pine。弹窗只能逐个复制当前技术组件；完整逻辑还包含滚动重选、投票、趋势过滤和跨产品风险分配，不能把单个组件的TradingView结果冒充整个V2。</p>
+
+<h3>新币启动雷达怎么读</h3>
+<p><code>启动候选</code>：池子年龄、流动性、1小时成交额、买单数量、买单占比、价格转强和综合分同时过门槛，并且1小时涨幅没有超过“过热”上限。它只是允许模拟开仓，不是真实推荐。</p>
+<p><code>预热观察</code>：池子年龄和流动性尚可，也已经有交易，但成交强度、买盘或价格动量还没全部满足。继续观察，不模拟入场。</p>
+<p><code>综合分</code>：年轻程度、流动性、1小时成交额/流动性换手率、买盘占比、交易笔数和温和上涨的合计。分高不等于安全，代码后门和撤池无法从这些数字看出来。</p>
+<p><code>热度加速</code>：本次“滚动1小时成交额”除以上一次约5分钟前保存的“滚动1小时成交额”。例如1.30x表示当前窗口比上次多30%。第一次扫描没有可比历史，会显示“-”；它只是辅助判断热度是否正在加速，不是独立买入信号。</p>
+<p><code>1小时换手</code>：最近1小时成交额除以池子流动性。例如流动性1万U、1小时成交5000U，换手约50%。太低表示没人交易；极高且价格已经暴涨，可能是最后追高阶段。</p>
+<p><code>买单占比</code>：1小时买单数除以买卖总笔数。它只统计笔数，不代表买入金额一定更大，也可能被机器人刷单。</p>
+<p><code>过热不追</code>：默认1小时已经上涨35%以上就不模拟买入。新币可能继续翻倍，也可能立即腰斩；雷达选择错过一部分暴涨，换取少追一次垂直线。</p>
+<p><code>自动模拟</code>：候选按配置金额纸面开仓，扣估算往返成本，然后按止盈、止损、移动止盈、最长时间或流动性坍塌退出。记录保存在SQLite，后台每5分钟继续更新。</p>
+<p><code>EVAAUSD自选</code>：来自Kraken最近721根15分钟K线，用放量倍数、EMA20/60、1小时/6小时动量和是否突破24小时前高来观察。EVAA不在Hyperliquid，页面不会把它发送到Hyperliquid真实交易。</p>
+<p><code>不能识别的风险</code>：合约只能买不能卖、管理员增发/冻结、持币高度集中、开发者撤池、同名假币、夹子和社交账号造假。未接入合约审计与持仓分布前，禁止真实自动下单。</p>
 
 <h3>l2Book 表格怎么读</h3>
 <p><code>买一 bid</code>：现在别人愿意买的最高价。你如果马上卖，通常接近这个价成交。</p>
@@ -5559,6 +5624,32 @@ async function runPortfolioLab(refresh){
   try{const r=await fetch('portfolio_lab?'+q.toString());const data=await r.json();if(!data.ok)throw new Error(data.error||'组合研究失败');renderPortfolioLab(data);status.textContent=`完成：${data.included_products||0} 个产品进入组合框架，${data.weight_mode==='risk_parity'?'按风险平价':'按等金额'}分配；仅研究，不下单。`;}catch(e){status.textContent='组合研究失败：'+e.message;}
 }
 function openPortfolioLabDialog(){portfolioLabDlg.showModal();updatePortfolioEngineHelp();runPortfolioLab(false)}
+function newCoinStatusText(value){return value==='candidate'?'启动候选':value==='warming'?'预热观察':'过滤'}
+function newCoinAgeText(hours){return Number(hours)<48?`${fmt(hours,1)}小时`:`${fmt(Number(hours)/24,1)}天`}
+function fillNewCoinConfig(cfg){
+  if(!cfg)return;const values={nrPages:cfg.pages,nrMaxAgeDays:Number(cfg.max_age_hours||0)/24,nrMinLiquidity:cfg.min_liquidity_usd,nrMinVolumeH1:cfg.min_volume_h1_usd,nrMinBuys:cfg.min_h1_buys,nrMinBuyShare:cfg.min_buy_share,nrMinScore:cfg.min_score,nrMaxPump:cfg.max_h1_pump_pct,nrWatchlist:cfg.watchlist,nrPaperNotional:cfg.paper_notional_usd,nrPaperMaxOpen:cfg.paper_max_open,nrPaperTakeProfit:cfg.paper_take_profit_pct,nrPaperStop:cfg.paper_stop_pct,nrPaperTrailStart:cfg.paper_trail_start_pct,nrPaperTrailGap:cfg.paper_trail_gap_pct,nrPaperMaxHours:cfg.paper_max_hold_hours,nrPaperCost:cfg.paper_cost_bps};
+  Object.entries(values).forEach(([id,value])=>{const el=document.getElementById(id);if(el&&value!==undefined)el.value=value});
+}
+function newCoinQuery(){return new URLSearchParams({pages:document.getElementById('nrPages').value,max_age_hours:Number(document.getElementById('nrMaxAgeDays').value||7)*24,min_liquidity_usd:document.getElementById('nrMinLiquidity').value,min_volume_h1_usd:document.getElementById('nrMinVolumeH1').value,min_h1_buys:document.getElementById('nrMinBuys').value,min_buy_share:document.getElementById('nrMinBuyShare').value,min_score:document.getElementById('nrMinScore').value,max_h1_pump_pct:document.getElementById('nrMaxPump').value,watchlist:document.getElementById('nrWatchlist').value,paper_notional_usd:document.getElementById('nrPaperNotional').value,paper_max_open:document.getElementById('nrPaperMaxOpen').value,paper_take_profit_pct:document.getElementById('nrPaperTakeProfit').value,paper_stop_pct:document.getElementById('nrPaperStop').value,paper_trail_start_pct:document.getElementById('nrPaperTrailStart').value,paper_trail_gap_pct:document.getElementById('nrPaperTrailGap').value,paper_max_hold_hours:document.getElementById('nrPaperMaxHours').value,paper_cost_bps:document.getElementById('nrPaperCost').value})}
+function renderNewCoinRadar(data){
+  fillNewCoinConfig(data.config||{});const rows=data.rows||[],watch=data.watch_rows||[],trades=data.trades||[],stats=data.paper_stats||{};
+  document.getElementById('nrPools').textContent=rows.length;document.getElementById('nrCandidates').textContent=data.candidates??0;document.getElementById('nrWarming').textContent=data.warming??0;document.getElementById('nrPaperOpen').textContent=stats.open_count??0;document.getElementById('nrPaperClosed').textContent=`${stats.closed??0} / ${fmt(Number(stats.win_rate||0)*100,1)}%`;document.getElementById('nrPaperRealized').textContent=`${signed(stats.realized,4)} USD`;document.getElementById('nrPaperUnrealized').textContent=`${signed(stats.unrealized,4)} USD`;document.getElementById('nrTime').textContent=data.ts?fmtBeijingDateTime(data.ts):'-';
+  const poolBody=document.querySelector('#nrPoolTbl tbody');poolBody.innerHTML='';
+  rows.forEach(row=>{const tr=document.createElement('tr'),active=row.status==='candidate',acceleration=row.volume_acceleration==null?'-':`${fmt(row.volume_acceleration,2)}x`;tr.innerHTML=`<td class="${active?'passChip':row.status==='warming'?'scoreMid':'blockChip'}">${newCoinStatusText(row.status)}</td><td style="text-align:left"><b>${esc(row.symbol)}</b></td><td>${newCoinAgeText(row.age_hours)}</td><td class="${active?'scoreGood':''}">${fmt(row.score,1)}</td><td>${fmt(row.price_usd,9)}</td><td>$${fmt(row.liquidity_usd,0)}</td><td>$${fmt(row.volume_h1_usd,0)} / $${fmt(row.volume_h24_usd,0)}</td><td>${acceleration}</td><td>${fmt(Number(row.turnover_h1||0)*100,1)}%</td><td>${row.buys_h1||0} / ${row.sells_h1||0}</td><td>${fmt(Number(row.buy_share_h1||0)*100,1)}%</td><td class="${Number(row.price_change_h1_pct)>=0?'scoreGood':'scoreBad'}">${signed(row.price_change_h1_pct,1)}% / ${signed(row.price_change_h24_pct,1)}%</td><td class="reasonCell">${esc(row.reason||'-')}</td><td><a href="${esc(row.url)}" target="_blank" rel="noopener">打开</a></td>`;poolBody.appendChild(tr)});
+  if(!rows.length)poolBody.innerHTML='<tr><td colspan="14" class="muted">尚未取得TON新池数据</td></tr>';
+  const watchBody=document.querySelector('#nrWatchTbl tbody');watchBody.innerHTML='';
+  watch.forEach(row=>{const candidate=row.status==='candidate',tr=document.createElement('tr');tr.innerHTML=`<td class="${candidate?'passChip':'blockChip'}">${candidate?'放量突破':'继续观察'}</td><td><b>${esc(row.pair)}</b></td><td>$${fmt(row.price_usd,7)}</td><td>${fmt(row.score,1)}</td><td>${signed(row.change_h1_pct,2)}% / ${signed(row.change_h6_pct,2)}% / ${signed(row.change_h24_pct,2)}%</td><td>${fmt(row.volume_ratio,2)}x</td><td>${signed(row.breakout_pct,2)}%</td><td>${fmt(row.ema20,6)} / ${fmt(row.ema60,6)}</td><td class="reasonCell">${esc(row.reason)}</td><td><a href="${esc(row.url)}" target="_blank" rel="noopener">打开</a></td>`;watchBody.appendChild(tr)});
+  if(!watch.length)watchBody.innerHTML='<tr><td colspan="10" class="muted">没有自选现货数据</td></tr>';
+  const tradeBody=document.querySelector('#nrTradeTbl tbody');tradeBody.innerHTML='';
+  trades.forEach(t=>{const open=t.status==='open',tr=document.createElement('tr');tr.innerHTML=`<td class="${open?'passChip':'blockChip'}">${open?'持仓中':'已平仓'}</td><td style="text-align:left">${esc(t.symbol)}</td><td class="${Number(t.pnl_usd)>=0?'scoreGood':'scoreBad'}">${signed(t.pnl_pct,2)}% / ${signed(t.pnl_usd,4)} USD</td><td>${fmt(t.notional_usd,2)} USD</td><td>${fmtBeijingDateTime(t.entry_ts)}</td><td>${fmtDuration(t.entry_ts,open?null:t.exit_ts)}</td><td>${fmt(t.entry_price,9)} / ${fmt(t.exit_price,9)}</td><td>${fmt(t.entry_score,1)}</td><td>${signed(t.max_pnl_pct,2)}%</td><td class="reasonCell">${esc(t.close_reason||'等待止盈/止损/超时')}</td>`;tradeBody.appendChild(tr)});
+  if(!trades.length)tradeBody.innerHTML='<tr><td colspan="10" class="muted">尚未出现达到门槛的模拟入场</td></tr>';
+  document.getElementById('nrNote').textContent=[data.note||'',(data.failures||[]).join('；')].filter(Boolean).join(' 未能读取：');
+}
+async function loadNewCoinRadar(refresh){
+  const status=document.getElementById('nrStatus'),q=refresh?newCoinQuery():new URLSearchParams();if(refresh)q.set('refresh','1');status.textContent=refresh?'正在扫描TON最新池子和Kraken自选...':'正在读取后台雷达...';
+  try{const response=await fetch('new_coin_radar?'+q.toString());const data=await response.json();if(!data.ok&&!data.rows?.length)throw new Error(data.error||(data.failures||[]).join('；')||'雷达没有数据');renderNewCoinRadar(data);status.textContent=`已更新：${data.candidates||0} 个启动候选，${data.warming||0} 个预热观察；只模拟。`;}catch(e){status.textContent='新币雷达失败：'+e.message;}
+}
+function openNewCoinDialog(){newCoinDlg.showModal();loadNewCoinRadar(false)}
 function openStrategyLabDialog(){strategyLabDlg.showModal();updateLabDayLimit();runStrategyLab(false);}
 function openLeadlagDialog(){leadlagDlg.showModal();loadLeadlag();}
 async function saveLeadlagConfig(){
@@ -5663,6 +5754,7 @@ loadLatest(); setInterval(loadLatest,60000);
 setInterval(()=>{if(liveDlg.open) refreshLiveL2Only();},1000);
 setInterval(()=>{if(liveDlg.open) loadLive(true);},15000);
 setInterval(()=>{if(leadlagDlg.open) loadLeadlag();},3000);
+setInterval(()=>{if(newCoinDlg.open) loadNewCoinRadar(false);},60000);
 </script>
 </body></html>"""
 
@@ -5986,6 +6078,10 @@ class AltServerState:
         self.strategy_lab_cache = None
         self.portfolio_lab_lock = threading.Lock()
         self.portfolio_lab_cache = None
+        self.new_coin_lock = threading.Lock()
+        self.new_coin_config = load_new_coin_config(db_path)
+        self.new_coin_cache = None
+        self.new_coin_error = None
         self.realtime_strategy_status = {
             "running": False, "last_eval_ts": None, "last_event_ts": None,
             "last_error": None, "events": 0, "last_revision": 0,
@@ -6141,6 +6237,66 @@ def collector_loop(state):
             time.sleep(0.5)
 
 
+def refresh_new_coin_state(state, config=None):
+    with state.new_coin_lock:
+        if config is not None:
+            state.new_coin_config = dict(config)
+        try:
+            payload = run_new_coin_radar(state.db_path, state.new_coin_config)
+            state.new_coin_config = dict(payload["config"])
+            state.new_coin_cache = payload
+            state.new_coin_error = None
+            return payload
+        except Exception as exc:
+            state.new_coin_error = str(exc)
+            if state.new_coin_cache:
+                return {**state.new_coin_cache, "background_error": str(exc)}
+            raise
+
+
+def new_coin_radar_loop(state):
+    while state.running:
+        started = time.time()
+        try:
+            payload = refresh_new_coin_state(state)
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] new coin radar "
+                f"pools={len(payload.get('rows') or [])} candidates={payload.get('candidates', 0)}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] new coin radar failed: {exc}", flush=True)
+        while state.running and time.time() - started < 300:
+            time.sleep(0.5)
+
+
+def new_coin_query_config(query, current):
+    config = dict(current)
+    fields = {
+        "pages": int,
+        "max_age_hours": float,
+        "min_liquidity_usd": float,
+        "min_volume_h1_usd": float,
+        "min_h1_buys": int,
+        "min_buy_share": float,
+        "min_score": float,
+        "max_h1_pump_pct": float,
+        "watchlist": str,
+        "paper_notional_usd": float,
+        "paper_max_open": int,
+        "paper_take_profit_pct": float,
+        "paper_stop_pct": float,
+        "paper_trail_start_pct": float,
+        "paper_trail_gap_pct": float,
+        "paper_max_hold_hours": float,
+        "paper_cost_bps": float,
+    }
+    for name, converter in fields.items():
+        if name in query:
+            config[name] = converter(query[name][0])
+    return config
+
+
 class AltRequestHandler(BaseHTTPRequestHandler):
     server_version = "AltcoinMonitor/1.0"
 
@@ -6171,6 +6327,24 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                 payload = dict(latest)
                 payload["rows"] = prepare_live_rows(payload.get("rows", []), state.config, state.l2book)
                 json_response(self, {"ok": True, "source": "memory", **payload})
+            return
+        if parsed.path == "/new_coin_radar":
+            refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes", "on")
+            try:
+                with state.new_coin_lock:
+                    cached = state.new_coin_cache
+                    current_config = dict(state.new_coin_config)
+                    radar_error = state.new_coin_error
+                if refresh:
+                    payload = refresh_new_coin_state(state, new_coin_query_config(query, current_config))
+                    json_response(self, {**payload, "cache_source": "fresh"})
+                elif cached:
+                    json_response(self, {**cached, "cache_source": "memory", "background_error": radar_error})
+                else:
+                    payload = refresh_new_coin_state(state)
+                    json_response(self, {**payload, "cache_source": "fresh"})
+            except (RuntimeError, ValueError, TypeError, OSError, sqlite3.Error) as exc:
+                json_response(self, {"ok": False, "error": str(exc)}, status=500)
             return
         if parsed.path == "/paper":
             limit = int((query.get("limit") or ["200"])[0])
@@ -7751,6 +7925,7 @@ def run_server(args):
     threading.Thread(target=reconcile_live_trade_costs, args=(state,), daemon=True).start()
     threading.Thread(target=collector_loop, args=(state,), daemon=True).start()
     threading.Thread(target=realtime_strategy_loop, args=(state,), daemon=True).start()
+    threading.Thread(target=new_coin_radar_loop, args=(state,), daemon=True).start()
     server = ThreadingHTTPServer((args.host, int(args.port)), AltRequestHandler)
     server.state = state
     print("Hyperliquid 小币联动采集服务器已启动", flush=True)
