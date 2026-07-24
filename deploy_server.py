@@ -15,6 +15,7 @@ DEPLOY_FILES = (
     "crypto_strategy_pine.py",
     "multi_asset_portfolio_lab.py",
     "new_coin_radar.py",
+    "hotspot_sentiment_lab.py",
 )
 SERVICE = "hyperliquid-alt-monitor.service"
 

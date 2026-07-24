@@ -32,6 +32,9 @@ import websocket
 
 from crypto_strategy_lab import run_strategy_lab, strategy_specs
 from crypto_strategy_pine import generate_pine_strategy, pine_filename
+from hotspot_sentiment_lab import DEFAULT_PARAMS as HOTSPOT_DEFAULT_PARAMS
+from hotspot_sentiment_lab import fetch_google_hotspots, load_latest_hotspot_run
+from hotspot_sentiment_lab import load_latest_hotspot_topics, run_hotspot_backtest, save_hotspot_topics
 from multi_asset_portfolio_lab import DEFAULT_SYMBOLS, run_multi_asset_portfolio_lab
 from new_coin_radar import load_new_coin_config, run_new_coin_radar
 
@@ -3910,6 +3913,7 @@ button,input{font-size:13px;padding:6px 8px}button{cursor:pointer}
 .filter{width:110px}
 .paperForm{display:grid;grid-template-columns:repeat(5,minmax(90px,1fr));gap:6px;margin:8px 0}
 .paperForm label{font-size:12px;color:#475569}.paperForm input,.paperForm select{width:100%;box-sizing:border-box;margin-top:2px}
+.wideInput{width:100%;box-sizing:border-box;min-height:64px;padding:7px;font:13px Arial,"Microsoft YaHei",sans-serif;resize:vertical}
 .paperActions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0 8px}.paperActions input{width:220px}
 .tokenBox{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}.tokenBox input{width:190px}
 .dangerBtn{background:#dc2626;color:white;border-color:#991b1b}
@@ -3924,7 +3928,7 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 </style>
 </head>
 <body>
-<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openStrategyLabDialog()">加密策略实验室</button><button onclick="openPortfolioLabDialog()">多市场组合</button><button onclick="openNewCoinDialog()">新币启动雷达</button><button onclick="window.open('/vibe/','_blank','noopener')">Vibe AI研究</button><button onclick="openLeadlagDialog()">联动传播 V2</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
+<header><h1>Hyperliquid 小币联动监控</h1><span id="status">加载中...</span><button onclick="openStrategyLabDialog()">加密策略实验室</button><button onclick="openPortfolioLabDialog()">多市场组合</button><button onclick="openNewCoinDialog()">新币启动雷达</button><button onclick="openHotspotDialog()">热点情绪研究</button><button onclick="window.open('/vibe/','_blank','noopener')">Vibe AI研究</button><button onclick="openLeadlagDialog()">联动传播 V2</button><button onclick="openNotifyDialog()">推送设置</button><button onclick="openGlobalDialog()">全局设置</button><button onclick="help.showModal()">? 说明</button></header>
 <main>
 <section class="topPanel">
 <h2>模拟盘 / 纸面交易</h2>
@@ -4045,6 +4049,58 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
   <canvas id="pfChart" class="mini" width="1000" height="230"></canvas>
   <div class="paperTableWrap" style="max-height:520px"><table id="portfolioLabTbl"><thead><tr><th>状态</th><th>产品</th><th>最新风险仓位</th><th>当前滚动选择</th><th>有效窗口</th><th>最终样本外收益</th><th>最终回撤</th><th>最终交易数</th><th>最近选择段</th><th>最近验证段</th><th>原因</th><th>TV复核</th></tr></thead><tbody></tbody></table></div>
   <p id="pfNote" class="subtle"></p>
+</div>
+</dialog>
+<dialog id="hotspotDlg" class="wideDialog">
+<div class="helpHead"><h2>热点情绪研究 / 先回测再监听</h2><button onclick="hotspotDlg.close()">关闭</button></div>
+<div class="helpBody">
+  <p><b>研究思路：</b>先发现新闻热度相对过去突然加速，再要求价格站上EMA20、成交量放大且最近5天没有过度暴涨；当天收盘确认，下一交易日开盘分批进入。当前只做历史研究，不下真实单，也不加入现有模拟盘。</p>
+  <div class="paperActions">
+    <label>填词模式<select id="hsMode" onchange="updateHotspotMode()"><option value="auto" selected>自动发现热点（默认）</option><option value="manual">只用手动填词</option></select></label>
+    <label>Google地区<input id="hsGeos" value="US,HK" style="width:90px"></label>
+    <button onclick="loadHotspotTopics(true)">刷新今日热点</button><button onclick="loadHotspotTopics(false)">读取缓存</button>
+    <span id="hsTopicStatus" class="subtle">自动模式仅建议能明确对应的资产，无法确认的热点不会乱配币。</span>
+  </div>
+  <div id="hsAutoBand" class="settingBand">
+    <h3>今天正在热什么</h3>
+    <div class="paperTableWrap" style="max-height:260px"><table id="hsTopicTbl"><thead><tr><th>地区</th><th>热点词</th><th>搜索量级</th><th>建议资产</th><th>相关新闻</th><th>选择</th></tr></thead><tbody></tbody></table></div>
+    <div class="paperActions"><input id="hsPickKeyword" placeholder="选中或填写热点词"><input id="hsPickAssets" placeholder="资产代码，例如 BABA,BTC-USD" style="width:300px"><button onclick="addHotspotMapping()">加入研究映射</button></div>
+  </div>
+  <div class="settingBand">
+    <h3>当前研究中的热点词与资产</h3>
+    <textarea id="hsMappings" class="wideInput">Qwen=BABA,9988.HK; Bitcoin=BTC-USD; Solana=SOL-USD</textarea>
+    <p class="subtle">格式：热点词=资产1,资产2；多组用分号或换行。美股如 BABA，港股如 9988.HK，币如 BTC-USD。一个热点可同时研究多个资产。</p>
+    <div class="paperForm">
+      <label>开始日期<input id="hsStart" type="date" value="2025-01-01"></label>
+      <label>结束日期<input id="hsEnd" type="date" value="2025-06-30"></label>
+      <label>假设每组本金<input id="hsCapital" type="number" min="100" value="10000" step="1000"></label>
+      <label>历史基线天数<input id="hsBaseline" type="number" min="7" max="120" value="20"></label>
+      <label>热点异常Z<input id="hsHeatZ" type="number" min="0" value="2" step="0.1"></label>
+      <label>热度至少放大<input id="hsHeatAccel" type="number" min="0" value="1.8" step="0.1"></label>
+      <label>成交量至少放大<input id="hsVolumeRatio" type="number" min="0" value="1.2" step="0.1"></label>
+      <label>5天最多已涨%<input id="hsMaxPump" type="number" min="0" value="20" step="1"></label>
+      <label>分批次数<input id="hsSlices" type="number" min="1" max="10" value="3"></label>
+      <label>分批窗口天数<input id="hsScaleDays" type="number" min="1" max="20" value="3"></label>
+      <label>止损%<input id="hsStop" type="number" min="0.1" value="8" step="0.5"></label>
+      <label>止盈%<input id="hsTakeProfit" type="number" min="0.1" value="18" step="1"></label>
+      <label>盈利回撤退出%<input id="hsTrail" type="number" min="0.1" value="7" step="0.5"></label>
+      <label>最长持有天数<input id="hsMaxHold" type="number" min="1" value="12"></label>
+      <label>降温退出Z<input id="hsExitHeat" type="number" value="0.5" step="0.1"></label>
+      <label>估算往返成本bps<input id="hsCost" type="number" min="0" value="30" step="1"></label>
+    </div>
+    <div class="paperActions"><button onclick="runHotspotBacktest(true)">运行历史热点回测</button><button onclick="runHotspotBacktest(false)">读取上次结果</button><span id="hsStatus" class="subtle">多个不同热点词会按GDELT限频依次下载，可能需要几十秒。</span></div>
+  </div>
+  <div class="grid">
+    <div class="metric"><div class="muted">完成的词/资产组</div><div id="hsGroups">-</div></div>
+    <div class="metric"><div class="muted">总交易次数</div><div id="hsTrades">-</div></div>
+    <div class="metric"><div class="muted">平均收益率</div><div id="hsAvgReturn">-</div></div>
+    <div class="metric"><div class="muted">盈利组数</div><div id="hsWinningGroups">-</div></div>
+  </div>
+  <h3 id="hsChartTitle">选择结果查看曲线</h3>
+  <canvas id="hsChart" class="mini" width="1100" height="220"></canvas>
+  <canvas id="hsHeatChart" class="mini" width="1100" height="180"></canvas>
+  <div class="paperTableWrap" style="max-height:430px"><table id="hsResultTbl"><thead><tr><th>热点词</th><th>资产</th><th>约赚/亏</th><th>收益率</th><th>最大回撤</th><th>买入持有</th><th>交易数</th><th>胜率</th><th>热点爆发次数</th><th>查看</th></tr></thead><tbody></tbody></table></div>
+  <p id="hsNote" class="scoreMid">新闻热度与价格可能互相影响；历史相关不代表下次热点一定能赚钱。</p>
 </div>
 </dialog>
 <dialog id="newCoinDlg" class="wideDialog">
@@ -4430,6 +4486,17 @@ dialog{border:0;border-radius:8px;max-width:820px;width:92%;padding:0;box-shadow
 <p><code>有效窗口 3/5</code>：五次滚动考试里有三次找到合格组合，另外两次持有现金。数字越高不等于收益一定越高，仍要一起看样本外收益、回撤和买入持有基准。</p>
 <p><code>TV查看组件</code>：V2不是一条固定Pine。弹窗只能逐个复制当前技术组件；完整逻辑还包含滚动重选、投票、趋势过滤和跨产品风险分配，不能把单个组件的TradingView结果冒充整个V2。</p>
 
+<h3>热点情绪研究怎么读</h3>
+<p><code>Google今日热点</code>：用于发现现在大量用户正在搜索什么。Google没有向本程序提供完整稳定的官方历史搜索API，所以历史回测改用GDELT全球新闻数量。</p>
+<p><code>热点异常Z</code>：今天的单位新闻量比过去基线高多少个标准差。2表示明显异常，但不是“上涨概率”；它只说明关注度异常。</p>
+<p><code>热度放大</code>：今天单位新闻量除以过去基线，例如1.8表示约为平时的1.8倍。必须和Z、价格、成交量一起通过。</p>
+<p><code>价格确认</code>：收盘价站上EMA20、当天成交量相对过去20天放大，并且5天涨幅未超过上限。它用于避开“只有新闻没有资金”和已经垂直拉升的末端。</p>
+<p><code>次日开盘执行</code>：当天新闻、收盘价和成交量全部确定后，程序只能在下一根日K开盘计入交易，防止回测偷看当天尚未结束的信息。</p>
+<p><code>分批进入</code>：满足信号后先投入一份；热点和价格继续满足时，在配置窗口内补剩余份数。它能降低一次追在最高点的影响，但不能消除跳空和流动性风险。</p>
+<p><code>热点降温退出</code>：持有至少两天后，新闻Z低于设定值，下一交易日开盘退出。止损、止盈、移动止盈和最长持有也会产生退出信号。</p>
+<p><code>约赚/亏</code>：按“每一组词/资产的假设本金”单独计算，并扣估算往返成本；不是把所有结果同时投入后的组合收益。</p>
+<p><code>自动模式</code>：自动读取US/HK等地区今日热搜，并只对明确规则匹配的词建议资产。热点与金融资产之间的语义关系容易误判，所以不让程序凭名字自动真实交易。</p>
+
 <h3>新币启动雷达怎么读</h3>
 <p><code>启动候选</code>：池子年龄、流动性、1小时成交额、买单数量、买单占比、价格转强和综合分同时过门槛，并且1小时涨幅没有超过“过热”上限。它只是允许模拟开仓，不是真实推荐。</p>
 <p><code>预热观察</code>：池子年龄和流动性尚可，也已经有交易，但成交强度、买盘或价格动量还没全部满足。继续观察，不模拟入场。</p>
@@ -4518,6 +4585,9 @@ let selectedStrategyPine=null;
 let latestPortfolioLabData=null;
 let selectedPortfolioLabRow=null;
 let portfolioChartMode='strategy';
+let latestHotspotTopics=[];
+let latestHotspotData=null;
+let selectedHotspotRow=null;
 let sortKey='score', sortDir=-1;
 const charts={};
 let liveL2Coins=[];
@@ -5624,6 +5694,52 @@ async function runPortfolioLab(refresh){
   try{const r=await fetch('portfolio_lab?'+q.toString());const data=await r.json();if(!data.ok)throw new Error(data.error||'组合研究失败');renderPortfolioLab(data);status.textContent=`完成：${data.included_products||0} 个产品进入组合框架，${data.weight_mode==='risk_parity'?'按风险平价':'按等金额'}分配；仅研究，不下单。`;}catch(e){status.textContent='组合研究失败：'+e.message;}
 }
 function openPortfolioLabDialog(){portfolioLabDlg.showModal();updatePortfolioEngineHelp();runPortfolioLab(false)}
+function updateHotspotMode(){document.getElementById('hsAutoBand').style.display=document.getElementById('hsMode').value==='auto'?'block':'none'}
+function renderHotspotTopics(data){
+  latestHotspotTopics=data.rows||[];const body=document.querySelector('#hsTopicTbl tbody');body.innerHTML='';
+  latestHotspotTopics.forEach((row,index)=>{const tr=document.createElement('tr'),assets=(row.suggested_assets||[]).join(',');tr.innerHTML=`<td>${esc(row.geo)}</td><td style="text-align:left"><b>${esc(row.title)}</b></td><td>${esc(row.traffic||'-')}</td><td>${esc(assets||'需要手动指定')}</td><td class="reasonCell">${esc((row.news_titles||[]).join('；')||'-')}</td><td><button>选择</button></td>`;tr.querySelector('button').onclick=event=>{event.stopPropagation();pickHotspotTopic(index)};tr.onclick=()=>pickHotspotTopic(index);body.appendChild(tr)});
+  if(!latestHotspotTopics.length)body.innerHTML='<tr><td colspan="6" class="muted">尚未取得今日热点；可以切换手动模式直接填词。</td></tr>';
+  const autoRows=latestHotspotTopics.filter(row=>(row.suggested_assets||[]).length);if(document.getElementById('hsMode').value==='auto'&&autoRows.length){const editor=document.getElementById('hsMappings'),end=new Date(),start=new Date(end);start.setUTCFullYear(start.getUTCFullYear()-1);editor.value=autoRows.map(row=>`${row.title}=${row.suggested_assets.join(',')}`).join('; ');editor.dataset.autoFilled='1';document.getElementById('hsStart').value=start.toISOString().slice(0,10);document.getElementById('hsEnd').value=end.toISOString().slice(0,10);}
+  document.getElementById('hsTopicStatus').textContent=`${latestHotspotTopics.length} 个今日热点，${autoRows.length} 个有明确资产映射${autoRows.length&&document.getElementById('hsMode').value==='auto'?'，已自动填入研究列表':''}；${(data.failures||[]).join('；')||'Google Trends读取正常'}。`;
+}
+function pickHotspotTopic(index){const row=latestHotspotTopics[index];if(!row)return;document.getElementById('hsPickKeyword').value=row.title;document.getElementById('hsPickAssets').value=(row.suggested_assets||[]).join(',');}
+function addHotspotMapping(){
+  const keyword=document.getElementById('hsPickKeyword').value.trim(),assets=document.getElementById('hsPickAssets').value.trim(),status=document.getElementById('hsTopicStatus');
+  if(!keyword||!assets){status.textContent='先填写热点词和对应资产代码；无法确认资产的热点不能直接加入。';return}
+  const editor=document.getElementById('hsMappings'),entry=`${keyword}=${assets}`;editor.value=editor.value.trim()?`${editor.value.trim()}; ${entry}`:entry;status.textContent=`已加入：${entry}`;
+}
+async function loadHotspotTopics(refresh){
+  const status=document.getElementById('hsTopicStatus'),q=new URLSearchParams({geos:document.getElementById('hsGeos').value});if(refresh)q.set('refresh','1');status.textContent=refresh?'正在读取Google今日热点...':'正在读取热点缓存...';
+  try{const r=await fetch('hotspot_topics?'+q.toString());const data=await r.json();if(!data.ok&&!data.rows?.length)throw new Error(data.error||(data.failures||[]).join('；')||'没有热点数据');renderHotspotTopics(data)}catch(e){status.textContent='热点读取失败：'+e.message}
+}
+function hotspotParams(){return {capital:document.getElementById('hsCapital').value,baseline_days:document.getElementById('hsBaseline').value,heat_z:document.getElementById('hsHeatZ').value,heat_acceleration:document.getElementById('hsHeatAccel').value,volume_ratio:document.getElementById('hsVolumeRatio').value,max_5d_pump_pct:document.getElementById('hsMaxPump').value,entry_slices:document.getElementById('hsSlices').value,scale_days:document.getElementById('hsScaleDays').value,stop_pct:document.getElementById('hsStop').value,take_profit_pct:document.getElementById('hsTakeProfit').value,trail_pct:document.getElementById('hsTrail').value,max_hold_days:document.getElementById('hsMaxHold').value,exit_heat_z:document.getElementById('hsExitHeat').value,round_trip_cost_bps:document.getElementById('hsCost').value}}
+function fillHotspotParams(data){
+  if(!data)return;const mappingEditor=document.getElementById('hsMappings'),autoReady=document.getElementById('hsMode').value==='auto'&&mappingEditor.dataset.autoFilled==='1';if(data.start_date&&!autoReady)document.getElementById('hsStart').value=data.start_date;if(data.end_date&&!autoReady)document.getElementById('hsEnd').value=data.end_date;
+  if(data.mappings&&!autoReady)mappingEditor.value=[...new Map(data.mappings.map(x=>[x.keyword,(data.mappings.filter(y=>y.keyword===x.keyword).map(y=>y.asset))])).entries()].map(([k,v])=>`${k}=${[...new Set(v)].join(',')}`).join('; ');
+  const p=data.params||{},ids={capital:'hsCapital',baseline_days:'hsBaseline',heat_z:'hsHeatZ',heat_acceleration:'hsHeatAccel',volume_ratio:'hsVolumeRatio',max_5d_pump_pct:'hsMaxPump',entry_slices:'hsSlices',scale_days:'hsScaleDays',stop_pct:'hsStop',take_profit_pct:'hsTakeProfit',trail_pct:'hsTrail',max_hold_days:'hsMaxHold',exit_heat_z:'hsExitHeat',round_trip_cost_bps:'hsCost'};Object.entries(ids).forEach(([key,id])=>{if(p[key]!==undefined)document.getElementById(id).value=p[key]});
+}
+function selectHotspotResult(row){
+  selectedHotspotRow=row;const capital=Number(latestHotspotData?.params?.capital||10000),curve=(row.equity_curve||[]).map(x=>({...x,ts:Number(x.ts)/1000,strategyPct:(Number(x.equity)/capital-1)*100})),base=curve.length?Number(curve[0].price):1;
+  document.getElementById('hsChartTitle').textContent=`${row.keyword} → ${row.asset}：蓝线策略，橙线直接持有`;
+  makeChart('hsChart',curve,[{label:'热点策略收益%',color:'#2563eb',value:x=>x.strategyPct,digits:2},{label:'资产涨跌%',color:'#f97316',value:x=>(Number(x.price)/base-1)*100,digits:2}],{marks:[0],footer:`${row.trade_count||0}笔交易；点击或滚轮可缩放，移动鼠标看数值`,reset:true});
+  makeChart('hsHeatChart',curve,[{label:'新闻热度Z',color:'#7c3aed',value:x=>Number(x.heat_z||0),digits:2}],{marks:[0,Number(latestHotspotData?.params?.heat_z||2)],footer:'紫线越高表示当天新闻量相对过去越异常；红色门槛不等于必涨',reset:true});
+}
+function showHotspotDetail(row){
+  const trades=row.trades||[];document.getElementById('detailTitle').textContent=`热点交易：${row.keyword} → ${row.asset}`;
+  document.getElementById('detailBody').innerHTML=`<div class="detailText">假设本金 ${fmt(latestHotspotData?.params?.capital,0)}，累计约 ${signed(row.net_pnl,2)}，收益 ${signed(row.net_return_pct,2)}%，最大回撤 ${signed(row.max_drawdown_pct,2)}%。信号在收盘后确认，所有进出按下一根日K开盘或回测末日收盘计算。</div><div class="paperTableWrap"><table><thead><tr><th>入场</th><th>出场</th><th>分批数</th><th>实际投入比例</th><th>入场/出场价</th><th>净收益</th><th>约赚亏</th><th>原因</th></tr></thead><tbody>${trades.map(t=>`<tr><td>${esc(t.entry_date)}</td><td>${esc(t.exit_date)}</td><td>${t.slices}</td><td>${fmt(t.exposure_pct,1)}%</td><td>${fmt(t.entry_price,5)} / ${fmt(t.exit_price,5)}</td><td class="${Number(t.return_pct)>=0?'scoreGood':'scoreBad'}">${signed(t.return_pct,2)}%</td><td>${signed(t.pnl,2)}</td><td>${esc(t.reason)}</td></tr>`).join('')||'<tr><td colspan="8">该区间没有同时满足新闻、趋势和成交量的入场。</td></tr>'}</tbody></table></div>`;detailDlg.showModal();
+}
+function renderHotspotBacktest(data){
+  latestHotspotData=data;fillHotspotParams(data);const rows=data.rows||[],body=document.querySelector('#hsResultTbl tbody');body.innerHTML='';
+  document.getElementById('hsGroups').textContent=rows.length;document.getElementById('hsTrades').textContent=rows.reduce((n,x)=>n+Number(x.trade_count||0),0);document.getElementById('hsAvgReturn').textContent=rows.length?`${signed(rows.reduce((n,x)=>n+Number(x.net_return_pct||0),0)/rows.length,2)}%`:'-';document.getElementById('hsWinningGroups').textContent=`${rows.filter(x=>Number(x.net_return_pct)>0).length} / ${rows.length}`;
+  rows.forEach(row=>{const tr=document.createElement('tr');tr.innerHTML=`<td style="text-align:left">${esc(row.keyword)}</td><td>${esc(row.asset)}</td><td class="${Number(row.net_pnl)>=0?'scoreGood':'scoreBad'}">${signed(row.net_pnl,2)}</td><td>${signed(row.net_return_pct,2)}%</td><td class="scoreBad">${signed(row.max_drawdown_pct,2)}%</td><td>${signed(row.buy_hold_pct,2)}%</td><td>${row.trade_count||0}</td><td>${fmt(Number(row.win_rate||0)*100,1)}%</td><td>${row.signals||0}</td><td><button>逐笔</button></td>`;tr.onclick=()=>selectHotspotResult(row);tr.querySelector('button').onclick=event=>{event.stopPropagation();selectHotspotResult(row);showHotspotDetail(row)};body.appendChild(tr)});
+  if(!rows.length)body.innerHTML='<tr><td colspan="10" class="muted">尚无回测结果</td></tr>';if(rows.length)selectHotspotResult(rows[0]);
+  document.getElementById('hsNote').textContent=[data.source,data.note,(data.failures||[]).map(x=>`${x.keyword}/${x.asset}: ${x.error}`).join('；')].filter(Boolean).join(' ');
+}
+async function runHotspotBacktest(refresh){
+  const status=document.getElementById('hsStatus'),q=new URLSearchParams();if(refresh){q.set('refresh','1');q.set('mappings',document.getElementById('hsMappings').value);q.set('start_date',document.getElementById('hsStart').value);q.set('end_date',document.getElementById('hsEnd').value);Object.entries(hotspotParams()).forEach(([k,v])=>q.set(k,v));}status.textContent=refresh?'正在按时间下载新闻热度和价格日线；每个不同热点词至少间隔5秒...':'正在读取上次研究...';
+  try{const r=await fetch('hotspot_backtest?'+q.toString());const data=await r.json();if(!data.ok&&!data.rows?.length)throw new Error(data.error||'回测失败');renderHotspotBacktest(data);status.textContent=`完成：${(data.rows||[]).length}组，${(data.rows||[]).reduce((n,x)=>n+Number(x.trade_count||0),0)}笔历史交易；只研究，不下单。`;}catch(e){status.textContent='热点回测失败：'+e.message}
+}
+function openHotspotDialog(){hotspotDlg.showModal();updateHotspotMode();loadHotspotTopics(false);runHotspotBacktest(false)}
 function newCoinStatusText(value){return value==='candidate'?'启动候选':value==='warming'?'预热观察':'过滤'}
 function newCoinAgeText(hours){return Number(hours)<48?`${fmt(hours,1)}小时`:`${fmt(Number(hours)/24,1)}天`}
 function fillNewCoinConfig(cfg){
@@ -6083,6 +6199,11 @@ class AltServerState:
         self.new_coin_cache = None
         self.new_coin_error = None
         self.new_coin_last_refresh_ts = 0.0
+        self.hotspot_lock = threading.Lock()
+        self.hotspot_topics_cache = load_latest_hotspot_topics(db_path)
+        self.hotspot_topics_failures = []
+        self.hotspot_topics_ts = 0.0
+        self.hotspot_backtest_cache = load_latest_hotspot_run(db_path)
         self.realtime_strategy_status = {
             "running": False, "last_eval_ts": None, "last_event_ts": None,
             "last_error": None, "events": 0, "last_revision": 0,
@@ -6299,6 +6420,62 @@ def new_coin_query_config(query, current):
     return config
 
 
+def refresh_hotspot_topics(state, geos):
+    with state.hotspot_lock:
+        rows, failures = fetch_google_hotspots(geos)
+        if rows:
+            save_hotspot_topics(state.db_path, rows)
+            state.hotspot_topics_cache = rows
+            state.hotspot_topics_ts = time.time()
+        state.hotspot_topics_failures = failures
+        return {
+            "ok": bool(state.hotspot_topics_cache),
+            "ts": state.hotspot_topics_ts,
+            "rows": list(state.hotspot_topics_cache),
+            "failures": failures,
+        }
+
+
+def hotspot_topics_loop(state):
+    while state.running:
+        started = time.time()
+        try:
+            payload = refresh_hotspot_topics(state, ("US", "HK"))
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] hotspot topics "
+                f"rows={len(payload.get('rows') or [])} failures={len(payload.get('failures') or [])}",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] hotspot topics failed: {exc}", flush=True)
+        while state.running and time.time() - started < 21_600:
+            time.sleep(1)
+
+
+def hotspot_query_params(query):
+    params = dict(HOTSPOT_DEFAULT_PARAMS)
+    converters = {
+        "capital": float,
+        "baseline_days": int,
+        "heat_z": float,
+        "heat_acceleration": float,
+        "volume_ratio": float,
+        "max_5d_pump_pct": float,
+        "entry_slices": int,
+        "scale_days": int,
+        "stop_pct": float,
+        "take_profit_pct": float,
+        "trail_pct": float,
+        "max_hold_days": int,
+        "exit_heat_z": float,
+        "round_trip_cost_bps": float,
+    }
+    for name, converter in converters.items():
+        if name in query:
+            params[name] = converter(query[name][0])
+    return params
+
+
 class AltRequestHandler(BaseHTTPRequestHandler):
     server_version = "AltcoinMonitor/1.0"
 
@@ -6329,6 +6506,51 @@ class AltRequestHandler(BaseHTTPRequestHandler):
                 payload = dict(latest)
                 payload["rows"] = prepare_live_rows(payload.get("rows", []), state.config, state.l2book)
                 json_response(self, {"ok": True, "source": "memory", **payload})
+            return
+        if parsed.path == "/hotspot_topics":
+            refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes", "on")
+            geos = split_symbols((query.get("geos") or ["US,HK"])[0])[:5]
+            try:
+                with state.hotspot_lock:
+                    cached = list(state.hotspot_topics_cache)
+                    failures = list(state.hotspot_topics_failures)
+                    cached_ts = state.hotspot_topics_ts
+                if refresh or not cached:
+                    payload = refresh_hotspot_topics(state, geos or ("US", "HK"))
+                    json_response(self, {**payload, "cache_source": "fresh"})
+                else:
+                    json_response(self, {
+                        "ok": True, "ts": cached_ts, "rows": cached,
+                        "failures": failures, "cache_source": "sqlite_or_memory",
+                    })
+            except (RuntimeError, ValueError, TypeError, OSError, sqlite3.Error) as exc:
+                json_response(self, {"ok": False, "error": str(exc)}, status=500)
+            return
+        if parsed.path == "/hotspot_backtest":
+            refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes", "on")
+            if not refresh:
+                payload = state.hotspot_backtest_cache or load_latest_hotspot_run(state.db_path)
+                if payload:
+                    json_response(self, {**payload, "cache_source": "sqlite_or_memory"})
+                else:
+                    json_response(self, {
+                        "ok": True, "rows": [], "cache_source": "empty",
+                        "params": HOTSPOT_DEFAULT_PARAMS,
+                        "note": "填写热点词与资产后，点击运行历史热点回测。",
+                    })
+                return
+            mappings = (query.get("mappings") or [""])[0]
+            start_date = (query.get("start_date") or ["2025-01-01"])[0]
+            end_date = (query.get("end_date") or [datetime.now(timezone.utc).date().isoformat()])[0]
+            try:
+                with state.hotspot_lock:
+                    payload = run_hotspot_backtest(
+                        state.db_path, mappings, start_date, end_date, hotspot_query_params(query),
+                    )
+                    state.hotspot_backtest_cache = payload
+                json_response(self, {**payload, "cache_source": "fresh"})
+            except (RuntimeError, ValueError, KeyError, IndexError, TypeError, OSError, sqlite3.Error) as exc:
+                json_response(self, {"ok": False, "error": str(exc)}, status=500)
             return
         if parsed.path == "/new_coin_radar":
             refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes", "on")
@@ -7937,6 +8159,7 @@ def run_server(args):
     threading.Thread(target=collector_loop, args=(state,), daemon=True).start()
     threading.Thread(target=realtime_strategy_loop, args=(state,), daemon=True).start()
     threading.Thread(target=new_coin_radar_loop, args=(state,), daemon=True).start()
+    threading.Thread(target=hotspot_topics_loop, args=(state,), daemon=True).start()
     server = ThreadingHTTPServer((args.host, int(args.port)), AltRequestHandler)
     server.state = state
     print("Hyperliquid 小币联动采集服务器已启动", flush=True)
